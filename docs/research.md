@@ -1,12 +1,33 @@
 # Research work based on syzkaller
 
+Dear researchers, feel free to contact us at syzkaller@googlegroups.com if you need any assistance.
+
 _newer first_
+* [Unlocking Low Frequency Syscalls in Kernel Fuzzing with Dependency-Based RAG](https://dl.acm.org/doi/abs/10.1145/3728913) ([pdf](https://dl.acm.org/doi/pdf/10.1145/3728913), [source code](https://github.com/QGrain/SyzGPT))
+* [A Little Goes a Long Way: Tuning Configuration Selection for Continuous Kernel Fuzzing](https://www.computer.org/csdl/proceedings-article/icse/2025/056900a521/215aWUHqo9i)
+* [SyzDirect: Directed Greybox Fuzzing for Linux Kernel](https://dl.acm.org/doi/abs/10.1145/3576915.3623146)
+* [KIT: Testing OS-Level Virtualization for Functional Interference Bugs](https://doi.org/10.1145/3575693.3575731)
+* [SyzDescribe: Principled, Automated, Static Generation of Syscall Descriptions for Kernel Drivers](https://github.com/seclab-ucr/SyzDescribe)
+* [GREBE: Unveiling Exploitation Potential for Linux Kernel Bugs](https://zplin.me/papers/GREBE.pdf)
+* [Precise Detection of Kernel Data Races with Probabilistic Lockset Analysis](https://www.cs.columbia.edu/~gabe/files/oakland2023_pla.pdf)
+* [Linux Kernel Enriched Corpus](https://github.com/cmu-pasta/linux-kernel-enriched-corpus) : [corpus.db](https://github.com/cmu-pasta/linux-kernel-enriched-corpus/raw/main/corpus.db)
+* [HotBPF - An On-demand and On-the-fly Memory Protection](https://www.youtube.com/watch?v=1KSLTsgxaSU)
+* [KASPER: Scanning for Generalized Transient Execution Gadgets in the Linux Kernel](https://www.vusec.net/projects/kasper/)
+* [VaultFuzzer: A state-based approach for Linux kernel](https://hardenedvault.net/blog/2021-09-13-vaultfuzzer/)
+* [Demystifying the Dependency Challenge in Kernel Fuzzing](https://conf.researchr.org/details/icse-2022/icse-2022-papers/89/Demystifying-the-Dependency-Challenge-in-Kernel-Fuzzing)
+* [SyzVegas: Beating Kernel Fuzzing Odds with Reinforcement Learning](https://www.usenix.org/conference/usenixsecurity21/presentation/wang-daimeng)
+* [SyzScope: Revealing High-Risk Security Impacts of Fuzzer-Exposed Bugs in Linux kernel](https://www.usenix.org/conference/usenixsecurity22/presentation/zou)
+* [Rtkaller: State-aware Task Generation for RTOS Fuzzing](http://www.wingtecher.com/themes/WingTecherResearch/assets/papers/emsoft21.pdf)
+* [BSOD: Binary-only Scalable fuzzing Of device Drivers](https://dmnk.co/raid21-bsod.pdf)
+* [Torpedo: A Fuzzing Framework for Discovering Adversarial Container Workloads](https://vtechworks.lib.vt.edu/handle/10919/104159)
+* [Healer](https://github.com/SunHao-0/healer) is a kernel fuzzer inspired by syzkaller. ([pdf](http://www.wingtecher.com/themes/WingTecherResearch/assets/papers/healer-sosp21.pdf))
+* [SyzGen: Automated Generation of Syscall Specification of Closed-Source macOS Drivers](https://www.cs.ucr.edu/~zhiyunq/pub/ccs21_syzgen.pdf) ([source code](https://github.com/seclab-ucr/SyzGen_setup))
+* [Snowboard: Finding Kernel Concurrency Bugs through Systematic Inter-thread Communication Analysis](https://dl.acm.org/doi/10.1145/3477132.3483549)
 * [Undo Workarounds for Kernel Bugs](https://www.usenix.org/system/files/sec21fall-talebi.pdf) ([source code](https://trusslab.github.io/hecaton))
 * [HFL: Hybrid Fuzzing on the Linux Kernel](https://www.ndss-symposium.org/wp-content/uploads/2020/02/24018-paper.pdf)
 * [A Novel Dynamic Analysis Infrastructure to Instrument Untrusted Execution Flow Across User-Kernel Spaces](https://www.computer.org/csdl/proceedings-article/sp/2021/893400a402/1mbmHSlbmvK)
 * [Industry Practice of Coverage-Guided Enterprise Linux Kernel Fuzzing](http://wingtecher.com/themes/WingTecherResearch/assets/papers/fse19-linux-kernel.pdf)
 * [Agamotto: Accelerating Kernel Driver Fuzzing with Lightweight Virtual Machine Checkpoints](https://www.usenix.org/conference/usenixsecurity20/presentation/song) ([source code](https://github.com/securesystemslab/agamotto))
-* [Task selection and seed selection for Syzkaller using reinforcement learning](https://groups.google.com/d/msg/syzkaller/eKPD4ZpJ66o/UqO_K-SMFwAJ) (announce only)
 * [Empirical Notes on the Interaction Between Continuous Kernel Fuzzing and Development](http://users.utu.fi/kakrind/publications/19/vulnfuzz_camera.pdf)
 * [FastSyzkaller: Improving Fuzz Efficiency for Linux Kernel Fuzzing](https://iopscience.iop.org/article/10.1088/1742-6596/1176/2/022013)
 * [Charm: Facilitating Dynamic Analysis of Device Drivers of Mobile Systems](https://www.usenix.org/system/files/conference/usenixsecurity18/sec18-talebi.pdf)
@@ -26,7 +47,9 @@ _newer first_
 
 # Other kernel fuzzing work
 
-* [Healer](https://github.com/SunHao-0/healer) is a kernel fuzzer inspired by syzkaller.
+* [Hydra: Finding Semantic Bugs in File Systems with an Extensible Fuzzing Framework](https://squizz617.github.io/pubs/hydra-sosp19.pdf) ([github](https://github.com/sslab-gatech/hydra))
+* [Janus: Fuzzing File Systems via Two-Dimensional Input Space Exploration](https://gts3.org/assets/papers/2019/xu:janus.pdf) ([github](https://github.com/sslab-gatech/janus))
+* [CoLaFUZE: Coverage-Guided and Layout-Aware Fuzzing for Android Drivers](https://www.jstage.jst.go.jp/article/transinf/E104.D/11/E104.D_2021NGP0005/_pdf)
 * [KRACE: Data Race Fuzzing for Kernel File Systems](https://www.cc.gatech.edu/~mxu80/pubs/xu:krace.pdf)
 * [trinity](https://github.com/kernelslacker/trinity)
 * [kAFL: Hardware-Assisted Feedback Fuzzing for OS Kernels](https://www.usenix.org/system/files/conference/usenixsecurity17/sec17-schumilo.pdf) (bridges AFL and Intel PT)

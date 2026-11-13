@@ -4,14 +4,13 @@
 package ast
 
 import (
-	"bytes"
-	"io/ioutil"
+	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/google/syzkaller/sys/targets"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestParseAll(t *testing.T) {
@@ -21,7 +20,7 @@ func TestParseAll(t *testing.T) {
 	}
 	files = append(files, filepath.FromSlash("testdata/all.txt"))
 	for _, file := range files {
-		data, err := ioutil.ReadFile(file)
+		data, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatalf("failed to read file: %v", err)
 		}
@@ -47,14 +46,9 @@ func TestParseAll(t *testing.T) {
 				if n1 == nil {
 					t.Fatalf("got nil node")
 				}
-				if !reflect.DeepEqual(n1, n2) {
-					t.Fatalf("formatting changed code:\n%#v\nvs:\n%#v", n1, n2)
-				}
+				assert.Equal(t, n1, n2, "formating changed code")
 			}
-			data3 := Format(desc.Clone())
-			if !bytes.Equal(data, data3) {
-				t.Fatalf("Clone lost data")
-			}
+			assert.Equal(t, string(data), string(Format(desc.Clone())))
 			nodes0 := 0
 			desc.Walk(func(n Node) {
 				nodes0++
@@ -63,12 +57,13 @@ func TestParseAll(t *testing.T) {
 				}
 			})
 			nodes1 := 0
-			desc.Walk(Recursive(func(n Node) {
+			desc.Walk(Recursive(func(n Node) bool {
 				nodes1++
 				pos, typ, _ := n.Info()
 				if typ == "" {
 					t.Fatalf("%v: node has empty typ=%q: %#v", pos, typ, n)
 				}
+				return true
 			}))
 			nodes2 := 0
 			desc.Walk(PostRecursive(func(n Node) {
@@ -81,7 +76,7 @@ func TestParseAll(t *testing.T) {
 			desc4 := desc.Filter(func(n Node) bool { return true })
 			desc5 := desc.Filter(func(n Node) bool { return false })
 			if len(desc4.Nodes) != len(desc.Nodes) || len(desc5.Nodes) != 0 {
-				t.Fatalf("Filter is broken: desc=%v desc4=%v desc5=%v",
+				t.Fatalf("filter is broken: desc=%v desc4=%v desc5=%v",
 					len(desc.Nodes), len(desc4.Nodes), len(desc5.Nodes))
 			}
 		})
@@ -102,29 +97,29 @@ func TestParse(t *testing.T) {
 var parseTests = []struct {
 	name   string
 	input  string
-	result []interface{}
+	result []any
 }{
 	{
 		"empty",
 		``,
-		[]interface{}{},
+		[]any{},
 	},
 	{
 		"new-line",
 		`
 
 `,
-		[]interface{}{},
+		[]any{},
 	},
 	{
 		"nil",
 		"\x00",
-		[]interface{}{},
+		[]any{},
 	},
 }
 
 func TestErrors(t *testing.T) {
-	files, err := ioutil.ReadDir("testdata")
+	files, err := os.ReadDir("testdata")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -8,12 +8,12 @@
 // The kernel checkout given to the tool will be cleaned and used for in-tree builds.
 // Example invocation:
 //
-// sudo syz-testbuild -kernel_src $LINUX_CHECKOUT \
-//	-config dashboard/config/upstream-kasan.config \
-//	-sysctl dashboard/config/upstream.sysctl \
-//	-cmdline dashboard/config/upstream-apparmor.cmdline \
-//	-userspace $WHEEZY_USERSPACE \
-//	-bisect_bin $BISECT_BIN
+//	sudo syz-testbuild -kernel_src $LINUX_CHECKOUT \
+//		-config dashboard/config/upstream-kasan.config \
+//		-sysctl dashboard/config/upstream.sysctl \
+//		-cmdline dashboard/config/upstream-apparmor.cmdline \
+//		-userspace $WHEEZY_USERSPACE \
+//		-bisect_bin $BISECT_BIN
 //
 // A suitable wheezy userspace can be downloaded from:
 // https://storage.googleapis.com/syzkaller/wheezy.tar.gz
@@ -23,14 +23,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"runtime"
 
-	"github.com/google/syzkaller/pkg/build"
 	"github.com/google/syzkaller/pkg/instance"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
@@ -49,6 +48,10 @@ var (
 	flagBisectBin     = flag.String("bisect_bin", "", "path to bisection binaries")
 	flagSyzkaller     = flag.String("syzkaller", ".", "path to built syzkaller")
 	flagSandbox       = flag.String("sandbox", "namespace", "sandbox to use for testing")
+	flagSandboxArg    = flag.Int("sandbox_arg", 0, "an argument for sandbox runner")
+	flagCompiler      = flag.String("compiler", "clang", "compiler to use")
+	flagCompilerType  = flag.String("compiler_type", "clang", "compiler to use")
+	flagLinker        = flag.String("linker", "ld.lld", "linker to use")
 )
 
 const (
@@ -62,29 +65,39 @@ func main() {
 		tool.Failf("image build will fail, run under root")
 	}
 	os.Setenv("SYZ_DISABLE_SANDBOXING", "yes")
-	dir, err := ioutil.TempDir("", "syz-testbuild")
+	dir, err := os.MkdirTemp("", "syz-testbuild")
 	if err != nil {
 		tool.Fail(err)
 	}
 	defer os.RemoveAll(dir)
 	cfg := &mgrconfig.Config{
-		RawTarget: *flagOS + "/" + *flagArch,
-		HTTP:      ":0",
-		Workdir:   dir,
-		KernelSrc: *flagKernelSrc,
-		KernelObj: *flagKernelSrc,
-		Syzkaller: *flagSyzkaller,
-		Sandbox:   *flagSandbox,
-		SSHUser:   "root",
-		Procs:     1,
-		Cover:     false,
-		Type:      vmType,
-		VM:        json.RawMessage([]byte(fmt.Sprintf(`{ "count": %v, "cpu": 2, "mem": 2048 }`, numTests))),
+		RawTarget:  *flagOS + "/" + *flagArch,
+		HTTP:       ":0",
+		Workdir:    dir,
+		KernelSrc:  *flagKernelSrc,
+		KernelObj:  *flagKernelSrc,
+		Syzkaller:  *flagSyzkaller,
+		Sandbox:    *flagSandbox,
+		SandboxArg: int64(*flagSandboxArg),
+		SSHUser:    "root",
+		Procs:      1,
+		Cover:      false,
+		Type:       vmType,
+		VM: json.RawMessage([]byte(fmt.Sprintf(`{"count": %v,
+			"cpu": 2,
+			"mem": 2048,
+			"cmdline": "root=/dev/sda1"}`, numTests))),
 		Derived: mgrconfig.Derived{
 			TargetOS:     *flagOS,
 			TargetArch:   *flagArch,
 			TargetVMArch: *flagArch,
 		},
+		Experimental: mgrconfig.Experimental{
+			DescriptionsMode: "manual",
+		},
+	}
+	if err := mgrconfig.SetTargets(cfg); err != nil {
+		tool.Fail(err)
 	}
 	if err := mgrconfig.Complete(cfg); err != nil {
 		tool.Fail(err)
@@ -94,21 +107,21 @@ func main() {
 		tool.Fail(err)
 	}
 	bisecter := repo.(vcs.Bisecter)
-	head, err := repo.HeadCommit()
+	head, err := repo.Commit(vcs.HEAD)
 	if err != nil {
 		tool.Fail(err)
 	}
 	log.Printf("HEAD is on %v %v", head.Hash, head.Title)
-	tags, err := bisecter.PreviousReleaseTags(head.Hash)
+	tags, err := bisecter.PreviousReleaseTags(head.Hash, "gcc")
 	if err != nil {
 		tool.Fail(err)
 	}
 	log.Printf("tags: %v", tags)
-	kernelConfig, err := ioutil.ReadFile(*flagKernelConfig)
+	kernelConfig, err := os.ReadFile(*flagKernelConfig)
 	if err != nil {
 		tool.Fail(err)
 	}
-	env, err := instance.NewEnv(cfg)
+	env, err := instance.NewEnv(cfg, nil, nil)
 	if err != nil {
 		tool.Fail(err)
 	}
@@ -123,19 +136,27 @@ func main() {
 }
 
 func test(repo vcs.Repo, bisecter vcs.Bisecter, kernelConfig []byte, env instance.Env, com *vcs.Commit) {
-	bisectEnv, err := bisecter.EnvForCommit(*flagBisectBin, com.Hash, kernelConfig)
+	bisectEnv, err := bisecter.EnvForCommit(*flagCompiler, *flagCompilerType, *flagBisectBin, com.Hash, kernelConfig, nil)
 	if err != nil {
 		tool.Fail(err)
 	}
 	log.Printf("testing: %v %v using %v", com.Hash, com.Title, bisectEnv.Compiler)
-	if err := build.Clean(*flagOS, *flagArch, vmType, *flagKernelSrc); err != nil {
+	buildCfg := &instance.BuildKernelConfig{
+		CompilerBin:  bisectEnv.Compiler,
+		LinkerBin:    *flagLinker,
+		CcacheBin:    "",
+		UserspaceDir: *flagUserspace,
+		CmdlineFile:  *flagKernelCmdline,
+		SysctlFile:   *flagKernelSysctl,
+		KernelConfig: bisectEnv.KernelConfig,
+	}
+	if err := env.CleanKernel(buildCfg); err != nil {
 		tool.Fail(err)
 	}
-	_, _, err = env.BuildKernel(bisectEnv.Compiler, "", *flagUserspace,
-		*flagKernelCmdline, *flagKernelSysctl, bisectEnv.KernelConfig)
+	_, _, err = env.BuildKernel(buildCfg)
 	if err != nil {
-		if verr, ok := err.(*osutil.VerboseError); ok {
-			log.Printf("BUILD BROKEN: %v", verr.Title)
+		if verr, ok := errors.AsType[*osutil.VerboseError](err); ok {
+			log.Printf("BUILD BROKEN: %s", verr)
 			saveLog(com.Hash, 0, verr.Output)
 		} else {
 			log.Printf("BUILD BROKEN: %v", err)
@@ -143,33 +164,36 @@ func test(repo vcs.Repo, bisecter vcs.Bisecter, kernelConfig []byte, env instanc
 		return
 	}
 	log.Printf("build OK")
-	results, err := env.Test(numTests, nil, nil, nil)
+	results, err := env.Test(numTests, nil, nil, nil, false)
 	if err != nil {
 		tool.Fail(err)
 	}
 	var verdicts []string
 	for i, res := range results {
-		if res == nil {
+		if res.Error == nil {
 			verdicts = append(verdicts, "OK")
 			continue
 		}
-		switch err := res.(type) {
-		case *instance.TestError:
-			if err.Boot {
-				verdicts = append(verdicts, fmt.Sprintf("boot failed: %v", err))
+
+		var testError *instance.TestError
+		var crashError *instance.CrashError
+		switch {
+		case errors.As(res.Error, &testError):
+			if testError.Boot {
+				verdicts = append(verdicts, fmt.Sprintf("boot failed: %v", testError))
 			} else {
-				verdicts = append(verdicts, fmt.Sprintf("basic kernel testing failed: %v", err))
+				verdicts = append(verdicts, fmt.Sprintf("basic kernel testing failed: %v", testError))
 			}
-			output := err.Output
-			if err.Report != nil {
-				output = err.Report.Output
+			output := testError.Output
+			if testError.Report != nil {
+				output = testError.Report.Output
 			}
 			saveLog(com.Hash, i, output)
-		case *instance.CrashError:
-			verdicts = append(verdicts, fmt.Sprintf("crashed: %v", err))
-			output := err.Report.Report
+		case errors.As(res.Error, &crashError):
+			verdicts = append(verdicts, fmt.Sprintf("crashed: %v", crashError))
+			output := crashError.Report.Report
 			if len(output) == 0 {
-				output = err.Report.Output
+				output = crashError.Report.Output
 			}
 			saveLog(com.Hash, i, output)
 		default:

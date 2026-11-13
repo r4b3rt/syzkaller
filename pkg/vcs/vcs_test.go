@@ -4,11 +4,78 @@
 package vcs
 
 import (
+	"fmt"
 	"net/mail"
+	"os"
+	"path/filepath"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
+	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/stretchr/testify/require"
 )
+
+func TestPatch(t *testing.T) {
+	osutil.RequireSandbox(t)
+	for _, repo := range []bool{false, true} {
+		t.Run(fmt.Sprintf("repo=%v", repo), func(t *testing.T) {
+			dir := osutil.SandboxTempDir(t)
+			if repo {
+				MakeTestRepo(t, dir)
+			}
+			file := filepath.Join(dir, "file.txt")
+			osutil.WriteSandboxFile(t, file, []byte("line1\nline2\n"))
+			require.NoError(t, osutil.SandboxChown(dir))
+
+			patch := []byte("--- a/file.txt\n+++ b/file.txt\n@@ -1,2 +1,3 @@\n line1\n+injected\n line2\n")
+			err := Patch(dir, patch)
+			require.NoError(t, err)
+
+			content, err := os.ReadFile(file)
+			require.NoError(t, err)
+			require.Equal(t, "line1\ninjected\nline2\n", string(content))
+
+			err = Patch(dir, patch)
+			require.ErrorContains(t, err, "patch is already applied")
+		})
+	}
+}
+
+func TestPatchForbidden(t *testing.T) {
+	osutil.RequireSandbox(t)
+	dir := osutil.SandboxTempDir(t)
+	MakeTestRepo(t, dir)
+
+	// Modification of .git/ directory must be blocked.
+	patch1 := []byte("--- /dev/null\n+++ b/.git/file.txt\n@@ -0,0 +1 @@\n+injected\n")
+	require.Error(t, Patch(dir, patch1))
+
+	// Path traversal must be blocked.
+	patch2 := []byte("--- a/../file.txt\n+++ b/../file.txt\n@@ -0,0 +1 @@\n+injected\n")
+	require.Error(t, Patch(dir, patch2))
+}
+
+func TestGitIgnoreFsmonitor(t *testing.T) {
+	osutil.RequireSandbox(t)
+	dir := osutil.SandboxTempDir(t)
+	repo := MakeTestRepo(t, dir)
+	repo.CommitChange("init")
+
+	marker := filepath.Join(dir, "fsmonitor-ran")
+	helper := filepath.Join(dir, "fsmonitor.sh")
+	require.NoError(t, osutil.WriteExecFile(helper, []byte("#!/bin/sh\ntouch "+marker+"\n")))
+	require.NoError(t, osutil.SandboxChown(helper))
+	repo.Git("config", "core.fsmonitor", helper)
+	// Git forbids ext:: by default, but the repo config may re-enable it.
+	repo.Git("config", "protocol.ext.allow", "always")
+
+	_, err := SandboxedGit(dir).Run("status")
+	require.NoError(t, err)
+	require.NoFileExists(t, marker)
+
+	_, err = SandboxedGit(dir).Run("fetch", "ext::sh -c touch% "+marker)
+	require.Error(t, err)
+	require.NoFileExists(t, marker)
+}
 
 func TestCanonicalizeCommit(t *testing.T) {
 	tests := map[string]string{
@@ -65,6 +132,13 @@ func TestCheckBranch(t *testing.T) {
 		"@":                       false,
 		"":                        false,
 	})
+	// A leading '-' must be rejected: such a value would be passed to git as a
+	// positional argument and interpreted as a command-line option.
+	for _, branch := range []string{"-oProxyCommand", "--dry-run", "--upload-pack", "-fkv"} {
+		if CheckBranch(branch) {
+			t.Errorf("%v: got true, want false", branch)
+		}
+	}
 }
 
 func TestCheckCommitHash(t *testing.T) {
@@ -183,6 +257,11 @@ func TestCommitLink(t *testing.T) {
 			"06690d5c6466b604f674477b522a809673c17eff",
 			"https://git.breakpoint.cc/cgit/fw/net-next.git/commit/?id=06690d5c6466b604f674477b522a809673c17eff",
 		},
+		{
+			"git@github.com:torvalds/linux.git",
+			"ccd1cdca5cd433c8a5dff78b69a79b31d9b77ee1",
+			"https://github.com/torvalds/linux/commit/ccd1cdca5cd433c8a5dff78b69a79b31d9b77ee1",
+		},
 	}
 	for _, test := range tests {
 		link := CommitLink(test.URL, test.Hash)
@@ -192,36 +271,98 @@ func TestCommitLink(t *testing.T) {
 	}
 }
 
-func TestParse(t *testing.T) {
-	// nolint: lll
-	test1 := []byte(`Foo (Maintainer) Bar <a@email.com> (maintainer:KERNEL)
-	Foo Bar(Reviewer) <b@email.com> (reviewer:KERNEL)
-	<somelist@list.com> (open list:FOO)
-	"Supporter Foo" <c@email.com> (supporter:KERNEL)
-	linux-kernel@vger.kernel.org (open list)`)
-	// nolint: lll
-	test2 := []byte(`Foo (Maintainer) Bar <a@email.com> (maintainer:KERNEL)
-	Foo Bar(Reviewer) <b@email.com> (reviewer:KERNEL)
-	"Supporter Foo" <c@email.com> (supporter:KERNEL)
-	linux-kernel@vger.kernel.org (open list)`)
-
-	maintainers1 := Recipients{{mail.Address{Name: "Foo (Maintainer) Bar", Address: "a@email.com"}, To},
-		{mail.Address{Name: "Foo Bar(Reviewer)", Address: "b@email.com"}, Cc},
-		{mail.Address{Name: "Supporter Foo", Address: "c@email.com"}, To},
-		{mail.Address{Name: "", Address: "linux-kernel@vger.kernel.org"}, Cc},
-		{mail.Address{Name: "", Address: "somelist@list.com"}, To}}
-	maintainers2 := Recipients{{mail.Address{Name: "Foo (Maintainer) Bar", Address: "a@email.com"}, To},
-		{mail.Address{Name: "Foo Bar(Reviewer)", Address: "b@email.com"}, Cc},
-		{mail.Address{Name: "Supporter Foo", Address: "c@email.com"}, To},
-		{mail.Address{Name: "", Address: "linux-kernel@vger.kernel.org"}, To}}
-
-	if diff := cmp.Diff(ParseMaintainersLinux(test1), maintainers1); diff != "" {
-		t.Fatal(diff)
+func TestFileLink(t *testing.T) {
+	type Test struct {
+		URL      string
+		Hash     string
+		File     string
+		Line     int
+		FileLink string
 	}
-	if diff := cmp.Diff(ParseMaintainersLinux(test2), maintainers2); diff != "" {
-		t.Fatal(diff)
+	tests := []Test{
+		{
+			"https://github.com/google/syzkaller",
+			"76dd003f1b102b791d8b342a1f92a6486ff56a1e",
+			"Makefile",
+			42,
+			"https://github.com/google/syzkaller/blob/76dd003f1b102b791d8b342a1f92a6486ff56a1e/Makefile#L42",
+		},
+		{
+			"https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+			"8fe28cb58bcb",
+			"Makefile",
+			42,
+			"https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/Makefile?id=8fe28cb58bcb#n42",
+		},
+		{
+			"https://android.googlesource.com/kernel/common",
+			"d0c3914ffbe4c00f0a131bae83f811d5606699bc",
+			"Makefile",
+			42,
+			"https://android.googlesource.com/kernel/common/+/d0c3914ffbe4c00f0a131bae83f811d5606699bc/Makefile#42",
+		},
+		{
+			"git@github.com:torvalds/linux.git",
+			"ccd1cdca5cd433c8a5dff78b69a79b31d9b77ee1",
+			"Makefile",
+			42,
+			"https://github.com/torvalds/linux/blob/ccd1cdca5cd433c8a5dff78b69a79b31d9b77ee1/Makefile#L42",
+		},
 	}
-	if diff := cmp.Diff(ParseMaintainersLinux([]byte("")), Recipients(nil)); diff != "" {
-		t.Fatal(diff)
+	for _, test := range tests {
+		link := FileLink(test.URL, test.Hash, test.File, test.Line)
+		if link != test.FileLink {
+			t.Errorf("test: %+v\ngot:  %v", test, link)
+		}
+	}
+}
+
+func TestParseMaintainersLinux(t *testing.T) {
+	type Test struct {
+		Input string
+		Want  Recipients
+	}
+	tests := []Test{
+		{
+			"",
+			Recipients(nil),
+		},
+		{
+			`
+Foo Bar <a@email.com> (maintainer:KERNEL)
+Foo Bar<b@email.com> (reviewer:KERNEL)
+<somelist@list.com> (open list:FOO)
+"Supporter Foo (Company)" <c@email.com> (supporter:KERNEL)
+linux-kernel@vger.kernel.org (open list)
+linux-input@vger.kernel.org (open list:INPUT (KEYBOARD, MOUSE, JOYSTICK, TOUCHSCREEN)...)
+		`,
+			Recipients{
+				{mail.Address{Name: "Foo Bar", Address: "a@email.com"}, To},
+				{mail.Address{Name: "Foo Bar", Address: "b@email.com"}, Cc},
+				{mail.Address{Name: "Supporter Foo (Company)", Address: "c@email.com"}, To},
+				{mail.Address{Name: "", Address: "linux-input@vger.kernel.org"}, To},
+				{mail.Address{Name: "", Address: "linux-kernel@vger.kernel.org"}, Cc},
+				{mail.Address{Name: "", Address: "somelist@list.com"}, To},
+			},
+		},
+		{
+			`
+Foo Bar <a@email.com> (maintainer:KERNEL)
+Foo Bar<b@email.com> (reviewer:KERNEL)
+"Supporter Foo" <c@email.com> (supporter:KERNEL)
+linux-kernel@vger.kernel.org (open list)
+			`,
+			Recipients{
+				{mail.Address{Name: "Foo Bar", Address: "a@email.com"}, To},
+				{mail.Address{Name: "Foo Bar", Address: "b@email.com"}, Cc},
+				{mail.Address{Name: "Supporter Foo", Address: "c@email.com"}, To},
+				{mail.Address{Name: "", Address: "linux-kernel@vger.kernel.org"}, To},
+			},
+		},
+	}
+	for i, test := range tests {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			require.Equal(t, test.Want, ParseMaintainersLinux([]byte(test.Input)), test.Input)
+		})
 	}
 }

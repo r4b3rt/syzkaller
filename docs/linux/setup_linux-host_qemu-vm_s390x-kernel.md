@@ -83,16 +83,16 @@ $KERNEL/arch/s390/boot/bzImage
 
 ### Debian
 
-To create a Debian Buster Linux image with the minimal set of required packages do:
+To create a Debian Linux image with the minimal set of required packages do:
 
 ```
 cd $IMAGE/
 wget https://raw.githubusercontent.com/google/syzkaller/master/tools/create-image.sh -O create-image.sh
 chmod +x create-image.sh
-./create-image.sh -a s390x -d buster
+./create-image.sh -a s390x
 ```
 
-The result should be `$IMAGE/buster.img` disk image.
+The result should be `$IMAGE/trixie.img` disk image.
 
 For additional options of `create-image.sh`, please refer to `./create-image.sh -h`
 
@@ -106,7 +106,7 @@ Run:
 qemu-system-s390x \
 	-M s390-ccw-virtio -cpu max,zpci=on -m 4G -smp 2 \
 	-kernel $KERNEL/arch/s390/boot/bzImage \
-	-drive file=$IMAGE/buster.img,if=virtio,format=raw \
+	-drive file=$IMAGE/trixie.img,if=virtio,format=raw \
 	-append "rootwait root=/dev/vda net.ifnames=0 biosdevname=0" \
 	-net nic,model=virtio -net user,host=10.0.2.10,hostfwd=tcp:127.0.0.1:10021-:22 \
 	-display none -serial mon:stdio \
@@ -116,7 +116,7 @@ qemu-system-s390x \
 After that you should be able to ssh to QEMU instance in another terminal:
 
 ``` bash
-ssh -i $IMAGE/buster.id_rsa -p 10021 -o "StrictHostKeyChecking no" root@localhost
+ssh -i $IMAGE/trixie.id_rsa -p 10021 -o "StrictHostKeyChecking no" root@localhost
 ```
 
 If this fails with "too many tries", ssh may be passing default keys before
@@ -147,8 +147,8 @@ variables `$GOPATH`, `$KERNEL` and `$IMAGE` with their actual values.
 	"http": "127.0.0.1:56741",
 	"workdir": "$GOPATH/src/github.com/google/syzkaller/workdir",
 	"kernel_obj": "$KERNEL",
-	"image": "$IMAGE/buster.img",
-	"sshkey": "$IMAGE/buster.id_rsa",
+	"image": "$IMAGE/trixie.img",
+	"sshkey": "$IMAGE/trixie.id_rsa",
 	"syzkaller": "$GOPATH/src/github.com/google/syzkaller",
 	"procs": 8,
 	"type": "qemu",

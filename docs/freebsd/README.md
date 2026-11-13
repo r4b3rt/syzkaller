@@ -22,11 +22,11 @@ When using bhyve as the VM backend, a DHCP server must also be installed:
 ```
 To checkout the syzkaller sources, run:
 ```console
-$ go get -u -d github.com/google/syzkaller/prog
+$ git clone https://github.com/google/syzkaller
 ```
 and the binaries can be built by running:
 ```console
-$ cd go/src/github.com/google/syzkaller/
+$ cd syzkaller
 $ gmake
 ```
 
@@ -34,15 +34,46 @@ Once this completes, a `syz-manager` executable should be available under `bin/`
 
 ### Setting up a Linux host
 
-To build Go binaries do:
+On an `amd64` Linux host, you can cross-compile FreeBSD userspace binaries (`syz-executor`, C reproducers) and build FreeBSD `amd64` kernels without a separate FreeBSD host machine.
+
+Prerequisites on Debian/Ubuntu: `clang`, `lld`, `llvm`, `cpp`, `qemu-system-x86`, `openssh-client`, `expect`, `curl`, `xz-utils`, and `/dev/kvm` access.
+
+1. Prepare a base FreeBSD VM image (`userspace/image` + `userspace/key`) and userspace sysroot (`sysroot/`) from official FreeBSD snapshots:
+```console
+$ ./tools/create-freebsd-image.sh -o ~/freebsd-env
 ```
-make manager fuzzer execprog TARGETOS=freebsd
+Pass `-k` if you want a keyless/passwordless VM image (for example, to use as a reusable QEMU `builder_image`), and `-S` to skip extracting `sysroot/`.
+
+2. Build host binaries (`syz-manager`, `syz-repro`, etc.) and cross-compile FreeBSD target binaries (`syz-execprog`, `syz-executor`) using the extracted sysroot (`SOURCEDIR_FREEBSD` or `SOURCEDIR`):
+```console
+$ export SOURCEDIR_FREEBSD=~/freebsd-env/sysroot
+$ make host target TARGETOS=freebsd TARGETARCH=amd64
 ```
-To build C `syz-executor` binary, copy `executor/*` files to a FreeBSD machine and build there with:
+
+3. Build a `SYZKALLER` FreeBSD kernel (`KCOV` + `KASAN` + `COVERAGE`) and install it into a bootable VM image inside an isolated ephemeral QEMU VM:
+```console
+$ git clone --depth=1 --branch=main https://github.com/freebsd/freebsd-src.git ~/freebsd-src
+$ make syz-build
+$ mkdir -p ~/freebsd-build && cd ~/freebsd-build
+$ /path/to/syzkaller/bin/syz-build \
+	-os freebsd -arch amd64 -vm qemu \
+	-kernel_src ~/freebsd-src \
+	-userspace ~/freebsd-env/userspace \
+	-trace
 ```
-c++ executor/executor_freebsd.cc -o syz-executor -O1 -lpthread -DGOOS=\"freebsd\" -DGIT_REVISION=\"CURRENT_GIT_REVISION\"
+This produces `~/freebsd-build/image`, `~/freebsd-build/key` (if present in `userspace`), `~/freebsd-build/kernel.config`, and `~/freebsd-build/obj/kernel.full` (used by `syz-manager` via `"kernel_obj": "~/freebsd-build/obj"` and `"kernel_src": "~/freebsd-src"`).
+
+For `syz-ci` on a Linux host (e.g. targeting GCE or QEMU where `userspace/image` may not carry a prebaked SSH key), create a keyless builder image once with `./tools/create-freebsd-image.sh -k -S -o ~/freebsd-builder` and set `"kernel_builder_image"` in the manager config (or pass `-builder_image` to `bin/syz-build`):
+```json
+	"kernel_builder_image": "/path/to/freebsd-builder/userspace/image"
 ```
-Then, copy out the binary back to host into `bin/freebsd_amd64` dir.
+
+Requirements for the `syz-ci` host itself:
+- `clang`, `lld`, `llvm`, `cpp` and `qemu-system-x86` must be installed, and the `syz-ci` process must have access to `/dev/kvm` (the kernel is built inside a local KVM-accelerated QEMU VM requiring 8 GiB of available RAM and up to 16 vCPUs).
+- `SOURCEDIR_FREEBSD` must be set in the environment of the `syz-ci` process (e.g. in its systemd unit), otherwise `syz-ci` refuses to start since it cannot build `syz-executor` for the target.
+- Infrastructure failures of the build VM (QEMU/KVM/SSH problems, disk setup, packaging of the results) are classified as `build.InfraError` and are not reported to the dashboard as kernel build errors; only failures of the kernel toolchain/kernel build steps inside the VM are.
+
+**Warning:** images created with `-k` have an empty root password and must only be used as a local QEMU `kernel_builder_image` (where the VM has no network access). Never use them as a fuzzing `userspace/image` on GCE or any other network-reachable VM.
 
 ## Setting up the FreeBSD VM
 
@@ -61,7 +92,7 @@ This will create a memory device for the VM file and allow host to install the c
 To get a copy of the current development sources:
 ```console
 # pkg install git
-# git clone --depth=1 --branch=master https://github.com/freebsd/freebsd /usr/src
+# git clone --depth=1 --branch=main https://github.com/freebsd/freebsd-src /usr/src
 ```
 To create a custom kernel configuration file for syzkaller and build a new kernel, run:
 
@@ -117,12 +148,12 @@ If you plan to run the syscall executor as root, ensure that root SSH logins are
 
 ### Running Under bhyve
 
-Some additional steps are required on the host in order to use bhyve.  First, ensure that the host system is at r346550 or later.  Second, since bhyve currently does not support disk image snapshots, ZFS must be used to provide equivalent functionality.  Create a ZFS data set and copy the VM image there.  The data set can also be used to store the syzkaller workdir.  For example, with a zpool named `data` mounted at `/data`, write:
+Some additional steps are required on the host in order to use bhyve.  First, since bhyve currently does not support disk image snapshots, ZFS must be used to provide equivalent functionality.  Create a ZFS data set and copy the VM image there.  The data set can also be used to store the syzkaller workdir.  For example, with a zpool named `data` mounted at `/data`, write:
 ```console
 # zfs create data/syzkaller
-# cp FreeBSD-13.0-CURRENT-amd64.raw /data/syzkaller
+# cp FreeBSD-13.3-CURRENT-amd64.raw /data/syzkaller
 ```
-Third, configure networking and DHCP for the VM instances:
+Third, configure bridged networking and DHCP for the VM instances.  This is no longer required on FreeBSD 14.1 and 15.0-CURRENT, as bhyve now supports libslirp-based user networking similar to the QEMU backend.
 
 ```console
 # ifconfig bridge create
@@ -190,9 +221,17 @@ For bhyve, we need to specify the VM image snapshot name and networking info (al
 	"type": "bhyve",
 	"vm": {
 		"count": 10,
-		"bridge": "bridge0",
 		"hostip": "169.254.0.1",
 		"dataset": "data/syzkaller"
+	}
+```
+If using bridged networking, the name of the bridge interface needs to be included in the "vm" block:
+```
+	"vm": {
+		"count": 10,
+		"hostip": "169.254.0.1",
+		"dataset": "data/syzkaller",
+        "bridge": "bridge0"
 	}
 ```
 
@@ -218,5 +257,5 @@ If something does not work, try adding the `-debug` flag to `syz-manager`.
 - We should support fuzzing the Linux compatibility subsystem.
 - We should provide instructions for fuzzing a FreeBSD system on ZFS
 - `pkg/host` needs to be taught how to detect supported syscalls/devices.
-- KASAN and KCSAN for FreeBSD would be useful.
-- On Linux we have emission of exernal networking/USB traffic into kernel using tun/gadgetfs. Implementing these for FreeBSD could uncover a number of high-profile bugs.
+- KCSAN for FreeBSD would be useful.
+- On Linux we have emission of external networking/USB traffic into kernel using tun/gadgetfs. Implementing these for FreeBSD could uncover a number of high-profile bugs.

@@ -1,6 +1,11 @@
-# Tech talks and articles
+# Tech talks
 
 _newer first_
+
+* [Head First Reporting of Linux Kernel CVEs: Practical Use of the Kernel Fuzzer](https://static.sched.com/hosted_files/sosscdjapan2024/7a/Head%20First%20Reporting%20of%20Linux%20Kernel%20CVEs%20-%20sosscj24.pdf) at [SOSS Community Day (Japan, 2024)](https://events.linuxfoundation.org/soss-community-day-japan/program/schedule/)
+* [Syzbot: 7 years of continuous kernel fuzzing](https://lpc.events/event/17/contributions/1521/attachments/1272/2698/LPC'23_%20Syzbot_%207%20years%20of%20continuous%20kernel%20fuzzing.pdf) at [Linux Plumbers 2023](https://lpc.events/event/17/contributions/1521/)
+* [Designing UAPI for Fuzz-ability](https://lpc.events/event/16/contributions/1309/attachments/988/1979/Designing%20subsystems%20for%20testability_fuzzing%20%28PDF%20version%29.pdf) at [Linux Plumbers 2022](https://lpc.events/event/16/contributions/1309/)
+* [Making syzbot reports more developer-friendly](https://lpc.events/event/16/contributions/1311/attachments/1013/1951/Making%20syzbot%20reports%20more%20developer-friendly.pdf) at [Linux Plumbers 2022](https://lpc.events/event/16/contributions/1311/)
 * [syzkaller: adventures in continuous coverage-guided kernel fuzzing](https://www.youtube.com/watch?v=YwX4UyXnhz0)
 at [BlueHatIL 2020](https://www.bluehatil.com)
 [[presentation]](https://docs.google.com/presentation/d/e/2PACX-1vRWjOOL45BclKsCPMzdWmvH12hu-Ld1cU5MbB1tqcBhjVIr1M_qxZRE-ObKcVmqpCyqRAO62Sxm0_aW/pub?start=false&loop=false&delayms=3000)
@@ -39,8 +44,10 @@ at GeeKon 2015
 * [AddressSanitizer/ThreadSanitizer for Linux Kernel](https://www.youtube.com/watch?v=capbD_aRz40)
 at Linux Collaboration Summit 2013
 
-## Articles
+# Articles
 
+* [Your NVMe Had Been Syz’ed: Fuzzing NVMe-oF/TCP Driver for Linux with Syzkaller](https://www.cyberark.com/resources/threat-research-blog/your-nvme-had-been-syzed-fuzzing-nvme-of-tcp-driver-for-linux-with-syzkaller)
+* [Looking for Remote Code Execution bugs in the Linux kernel](https://xairy.io/articles/syzkaller-external-network)
 * From [Collabora](https://twitter.com/Collabora):
   * [syzkaller: fuzzing the kernel](https://www.collabora.com/news-and-blog/blog/2020/03/26/syzkaller-fuzzing-the-kernel/)
   * [Using syzkaller to detect programming bugs in the Linux kernel](https://www.collabora.com/news-and-blog/blog/2020/04/17/using-syzkaller-to-detect-programming-bugs-in-linux/)

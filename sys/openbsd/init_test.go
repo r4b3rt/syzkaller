@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/syzkaller/prog"
-	_ "github.com/google/syzkaller/sys/openbsd/gen"
+	_ "github.com/google/syzkaller/sys"
 	"github.com/google/syzkaller/sys/targets"
 )
 
@@ -91,6 +91,11 @@ func TestNeutralize(t *testing.T) {
 		{
 			// Test for sysctl kern.maxproc.
 			In:  `sysctl$kern(&(0x7f0000000300)={0x1, 0x6}, 0x2, 0x0, 0x0, &(0x7f0000000300)="ff0380c5", 0x4)`,
+			Out: `sysctl$kern(&(0x7f0000000300)={0x0}, 0x0, 0x0, 0x0, &(0x7f0000000300)="ff0380c5", 0x4)`,
+		},
+		{
+			// Test for sysctl kern.maxfiles.
+			In:  `sysctl$kern(&(0x7f0000000300)={0x1, 0x7}, 0x2, 0x0, 0x0, &(0x7f0000000300)="ff0380c5", 0x4)`,
 			Out: `sysctl$kern(&(0x7f0000000300)={0x0}, 0x0, 0x0, 0x0, &(0x7f0000000300)="ff0380c5", 0x4)`,
 		},
 		{

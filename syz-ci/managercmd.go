@@ -19,22 +19,24 @@ import (
 type ManagerCmd struct {
 	name    string
 	log     string
+	bench   string
 	errorf  Errorf
 	bin     string
 	args    []string
 	closing chan bool
 }
 
-type Errorf func(msg string, args ...interface{})
+type Errorf func(msg string, args ...any)
 
 // NewManagerCmd starts new syz-manager process.
 // name - name for logging.
 // log - manager log file with stdout/stderr.
 // bin/args - process binary/args.
-func NewManagerCmd(name, log string, errorf Errorf, bin string, args ...string) *ManagerCmd {
+func NewManagerCmd(name, log, bench string, errorf Errorf, bin string, args ...string) *ManagerCmd {
 	mc := &ManagerCmd{
 		name:    name,
 		log:     log,
+		bench:   bench,
 		errorf:  errorf,
 		bin:     bin,
 		args:    args,
@@ -75,6 +77,7 @@ func (mc *ManagerCmd) loop() {
 			if time.Since(started) > restartPeriod {
 				started = time.Now()
 				osutil.Rename(mc.log, mc.log+".old")
+				osutil.Rename(mc.bench, mc.bench+".old") // or else syz-manager will complain
 				logfile, err := os.Create(mc.log)
 				if err != nil {
 					mc.errorf("failed to create manager log: %v", err)

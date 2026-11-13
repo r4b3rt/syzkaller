@@ -1,6 +1,6 @@
 # Setup: Ubuntu host, QEMU vm, x86-64 kernel
 
-These are the instructions on how to fuzz the x86-64 kernel in a QEMU with Ubuntu on the host machine and Debian Stretch in the QEMU instances.
+These are the instructions on how to fuzz the x86-64 kernel in a QEMU with Ubuntu on the host machine and Debian Trixie in the QEMU instances.
 
 In the instructions below, the `$VAR` notation (e.g. `$GCC`, `$KERNEL`, etc.) is used to denote paths to directories that are either created when executing the instructions (e.g. when unpacking GCC archive, a directory will be created), or that you have to create yourself before running the instructions. Substitute the values for those variables manually.
 
@@ -16,7 +16,7 @@ sudo apt install make gcc flex bison libncurses-dev libelf-dev libssl-dev
 
 ## GCC
 
-If your distro's GCC is older, it's preferable to get the lastest GCC from [this](/docs/syzbot.md#crash-does-not-reproduce) list. Download and unpack into `$GCC`, and you should have GCC binaries in `$GCC/bin/`
+If your distro's GCC is older, it's preferable to get the latest GCC from [this](/docs/syzbot.md#crash-does-not-reproduce) list. Download and unpack into `$GCC`, and you should have GCC binaries in `$GCC/bin/`
 
 >**Ubuntu 20.04 LTS**: You can ignore this section. GCC is up-to-date.
 
@@ -36,10 +36,10 @@ ls $GCC/bin/
 
 Command:
 ``` bash
-git clone --branch v5.14 git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git $KERNEL
+git clone --branch v6.2 git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git $KERNEL
 ```
 
->We recommend to start with the latest stable version. v5.14 is an example here.
+>We recommend to start with the latest stable version. v6.2 is an example here.
 
 ### Generate default configs
 
@@ -69,13 +69,13 @@ It's not required to enable all of them, but at the very least you need:
 CONFIG_KCOV=y
 
 # Debug info for symbolization.
-CONFIG_DEBUG_INFO=y
+CONFIG_DEBUG_INFO_DWARF4=y
 
 # Memory bug detector
 CONFIG_KASAN=y
 CONFIG_KASAN_INLINE=y
 
-# Required for Debian Stretch
+# Required for Debian Stretch and later
 CONFIG_CONFIGFS_FS=y
 CONFIG_SECURITYFS=y
 ```
@@ -106,14 +106,14 @@ CONFIG_CMDLINE="net.ifnames=0"
 ### Build the Kernel
 
 Command:
-```
+``` bash
 make -j`nproc`
 ```
 
 Or if you want to specify a compiler.
 
 Command:
-```
+``` bash
 make CC="$GCC/bin/gcc" -j`nproc`
 ```
 
@@ -136,12 +136,12 @@ Command:
 sudo apt install debootstrap
 ```
 
-### Create Debian Stretch Linux image
+### Create Debian Trixie Linux image
 
-Create a Debian Stretch Linux image with the minimal set of required packages.
+Create a Debian Trixie Linux image with the minimal set of required packages.
 
 Command:
-```
+``` bash
 mkdir $IMAGE
 cd $IMAGE/
 wget https://raw.githubusercontent.com/google/syzkaller/master/tools/create-image.sh -O create-image.sh
@@ -149,16 +149,18 @@ chmod +x create-image.sh
 ./create-image.sh
 ```
 
-The result should be `$IMAGE/stretch.img` disk image.
+The result should be `$IMAGE/trixie.img` disk image.
 
-### OR Create Debian Buster Linux image
+### OR Create Debian Linux image with a different version
+
+To create a Debian image with a different version (e.g. bookworm, bullseye, sid), specify the `--distribution` option.
 
 Command:
 ``` bash
-./create-image.sh --distribution buster
+./create-image.sh --distribution bookworm
 ```
 
-### Image exatra tools
+### Image extra tools
 
 Sometimes it's useful to have some additional packages and tools available in the VM even though they are not required to run syzkaller. To install a set of tools we find useful do (feel free to edit the list of tools in the script):
 
@@ -196,7 +198,7 @@ qemu-system-x86_64 \
 	-smp 2 \
 	-kernel $KERNEL/arch/x86/boot/bzImage \
 	-append "console=ttyS0 root=/dev/sda earlyprintk=serial net.ifnames=0" \
-	-drive file=$IMAGE/stretch.img,format=raw \
+	-drive file=$IMAGE/trixie.img,format=raw \
 	-net user,host=10.0.2.10,hostfwd=tcp:127.0.0.1:10021-:22 \
 	-net nic,model=e1000 \
 	-enable-kvm \
@@ -205,7 +207,7 @@ qemu-system-x86_64 \
 	2>&1 | tee vm.log
 ```
 
-```
+``` text
 early console in setup code
 early console in extract_kernel
 input_data: 0x0000000005d9e276
@@ -228,7 +230,7 @@ After that you should be able to ssh to QEMU instance in another terminal.
 
 Command:
 ``` bash
-ssh -i $IMAGE/stretch.id_rsa -p 10021 -o "StrictHostKeyChecking no" root@localhost
+ssh -i $IMAGE/trixie.id_rsa -p 10021 -o "StrictHostKeyChecking no" root@localhost
 ```
 
 ### Troubleshooting
@@ -251,14 +253,14 @@ Build syzkaller as described [here](/docs/linux/setup.md#go-and-syzkaller).
 Then create a manager config like the following, replacing the environment
 variables `$GOPATH`, `$KERNEL` and `$IMAGE` with their actual values.
 
-```
+``` json
 {
 	"target": "linux/amd64",
 	"http": "127.0.0.1:56741",
 	"workdir": "$GOPATH/src/github.com/google/syzkaller/workdir",
 	"kernel_obj": "$KERNEL",
-	"image": "$IMAGE/stretch.img",
-	"sshkey": "$IMAGE/stretch.id_rsa",
+	"image": "$IMAGE/trixie.img",
+	"sshkey": "$IMAGE/trixie.id_rsa",
 	"syzkaller": "$GOPATH/src/github.com/google/syzkaller",
 	"procs": 8,
 	"type": "qemu",

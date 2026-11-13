@@ -5,36 +5,51 @@ package prog
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
+	"maps"
 	"math"
 	"math/rand"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/google/syzkaller/pkg/ifuzz"
+	"github.com/google/syzkaller/pkg/image"
 )
 
 const (
 	// "Recommended" number of calls in programs that we try to aim at during fuzzing.
-	RecommendedCalls = 20
+	RecommendedCalls = 30
 	// "Recommended" max number of calls in programs.
 	// If we receive longer programs from hub/corpus we discard them.
 	MaxCalls = 40
+	// "Recommended" number of calls in KFuzzTest mode. These targets test the behavior
+	// of internal kernel functions rather than system behavior, and for this reason
+	// it is more sensible to generate a smaller number of calls instead of long chains.
+	RecommendedCallsKFuzzTest = 5
+
+	// Limits for recursion pruning during program generation.
+	arrayRecursionLimit   = 2
+	pointerRecursionLimit = 3
 )
 
 type randGen struct {
 	*rand.Rand
-	target             *Target
-	inGenerateResource bool
-	recDepth           map[string]int
+	target                *Target
+	inGenerateResource    bool
+	patchConditionalDepth int
+	genKFuzzTest          bool
+	recDepth              map[Type]int
+	genDefaultResource    bool
 }
 
 func newRand(target *Target, rs rand.Source) *randGen {
 	return &randGen{
 		Rand:     rand.New(rs),
 		target:   target,
-		recDepth: make(map[string]int),
+		recDepth: make(map[Type]int),
 	}
 }
 
@@ -65,22 +80,22 @@ func (r *randGen) rand64() uint64 {
 var (
 	// Some potentially interesting integers.
 	specialInts = []uint64{
-		0, 1, 31, 32, 63, 64, 127, 128,
-		129, 255, 256, 257, 511, 512,
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+		64, 127, 128, 129, 255, 256, 257, 511, 512,
 		1023, 1024, 1025, 2047, 2048, 4095, 4096,
 		(1 << 15) - 1, (1 << 15), (1 << 15) + 1,
 		(1 << 16) - 1, (1 << 16), (1 << 16) + 1,
 		(1 << 31) - 1, (1 << 31), (1 << 31) + 1,
 		(1 << 32) - 1, (1 << 32), (1 << 32) + 1,
+		(1 << 63) - 1, (1 << 63), (1 << 63) + 1,
+		(1 << 64) - 1,
 	}
 	// The indexes (exclusive) for the maximum specialInts values that fit in 1, 2, ... 8 bytes.
 	specialIntIndex [9]int
 )
 
 func init() {
-	sort.Slice(specialInts, func(i, j int) bool {
-		return specialInts[i] < specialInts[j]
-	})
+	slices.Sort(specialInts)
 	for i := range specialIntIndex {
 		bitSize := uint64(8 * i)
 		specialIntIndex[i] = sort.Search(len(specialInts), func(i int) bool {
@@ -150,11 +165,12 @@ func (r *randGen) biasedRand(n, k int) int {
 	return int(bf)
 }
 
+const maxArrayLen = 10
+
 func (r *randGen) randArrayLen() uint64 {
-	const maxLen = 10
 	// biasedRand produces: 10, 9, ..., 1, 0,
 	// we want: 1, 2, ..., 9, 10, 0
-	return uint64(maxLen-r.biasedRand(maxLen+1, 10)+1) % (maxLen + 1)
+	return uint64(maxArrayLen-r.biasedRand(maxArrayLen+1, 10)+1) % (maxArrayLen + 1)
 }
 
 func (r *randGen) randBufLen() (n uint64) {
@@ -223,7 +239,7 @@ func (r *randGen) flags(vv []uint64, bitmask bool, oldVal uint64) uint64 {
 	}
 	// Flip rand bits. Do this for non-bitmask sometimes
 	// because we may have detected bitmask incorrectly for complex cases
-	// (e.g. part of the vlaue is bitmask and another is not).
+	// (e.g. part of the value is bitmask and another is not).
 	v := oldVal
 	if v != 0 && r.oneOf(10) {
 		v = 0 // Ignore the old value sometimes.
@@ -276,6 +292,8 @@ func escapingFilename(file string) bool {
 
 var specialFiles = []string{"", "."}
 
+const specialFileLenPad = "a"
+
 func (r *randGen) filenameImpl(s *state) string {
 	if r.oneOf(100) {
 		return specialFiles[r.Intn(len(specialFiles))]
@@ -294,6 +312,15 @@ func (r *randGen) filenameImpl(s *state) string {
 		}
 		for i := 0; ; i++ {
 			f := fmt.Sprintf("%v/file%v", dir, i)
+			if r.oneOf(100) {
+				// Make file name very long using target.SpecialFileLengths consts.
+				// Add/subtract some small const to account for our file name prefix
+				// and potential kernel off-by-one's.
+				fileLen := r.randFilenameLength()
+				if add := fileLen - len(f); add > 0 {
+					f += strings.Repeat(specialFileLenPad, add)
+				}
+			}
 			if !s.files[f] {
 				return f
 			}
@@ -302,12 +329,17 @@ func (r *randGen) filenameImpl(s *state) string {
 	return r.randFromMap(s.files)
 }
 
-func (r *randGen) randFromMap(m map[string]bool) string {
-	files := make([]string, 0, len(m))
-	for f := range m {
-		files = append(files, f)
+func (r *randGen) randFilenameLength() int {
+	off := r.biasedRand(10, 5)
+	if r.bin() {
+		off = -off
 	}
-	sort.Strings(files)
+	lens := r.target.SpecialFileLengths
+	return max(lens[r.Intn(len(lens))]+off, 0)
+}
+
+func (r *randGen) randFromMap(m map[string]bool) string {
+	files := slices.Sorted(maps.Keys(m))
 	return files[r.Intn(len(files))]
 }
 
@@ -330,14 +362,16 @@ func (r *randGen) randString(s *state, t *BufferType) []byte {
 			buf.Write([]byte{byte(r.Intn(256))})
 		}
 	}
-	if r.oneOf(100) == t.NoZ {
+	// We always null-terminate strings that are inputs to KFuzzTest calls to
+	// avoid false-positive buffer overflow reports.
+	if r.oneOf(100) == t.NoZ || r.genKFuzzTest {
 		buf.Write([]byte{0})
 	}
 	return buf.Bytes()
 }
 
 func (r *randGen) allocAddr(s *state, typ Type, dir Dir, size uint64, data Arg) *PointerArg {
-	return MakePointerArg(typ, dir, s.ma.alloc(r, size, data.Type().Alignment()), data)
+	return MakePointerArg(typ, dir, s.ma.alloc(size, data.Type().Alignment()), data)
 }
 
 func (r *randGen) allocVMA(s *state, typ Type, dir Dir, numPages uint64) *PointerArg {
@@ -345,8 +379,48 @@ func (r *randGen) allocVMA(s *state, typ Type, dir Dir, numPages uint64) *Pointe
 	return MakeVmaPointerArg(typ, dir, page*r.target.PageSize, numPages*r.target.PageSize)
 }
 
-func (r *randGen) createResource(s *state, res *ResourceType, dir Dir) (arg Arg, calls []*Call) {
+func (r *randGen) pruneRecursion(typ Type, limit int) (bool, func()) {
+	lt := leafType(typ)
+	if lt == nil {
+		return true, func() {}
+	}
+	if r.recDepth[lt] >= limit {
+		return false, nil
+	}
+	r.recDepth[lt]++
+	return true, func() {
+		r.recDepth[lt]--
+		if r.recDepth[lt] == 0 {
+			delete(r.recDepth, lt)
+		}
+	}
+}
+
+// leafType unwraps pointers and arrays to find the underlying named struct or union.
+// By tracking the leaf type, we share limits among identical cyclic structures (like
+// linked lists with multiple pointer fields) and prevent exponential tree explosions.
+func leafType(typ Type) Type {
+	for {
+		switch t := typ.(type) {
+		case *PtrType:
+			typ = t.Elem
+		case *ArrayType:
+			typ = t.Elem
+		case *StructType, *UnionType:
+			return t
+		default:
+			return nil
+		}
+	}
+}
+
+func (r *randGen) createResource(s *state, res *ResourceType, dir Dir) (Arg, []*Call) {
+	if !r.inGenerateResource {
+		panic("inGenerateResource is not set")
+	}
 	kind := res.Desc.Name
+	// Find calls that produce the necessary resources.
+	ctors := r.enabledCtors(s, kind)
 	// We may have no resources, but still be in createResource due to ANYRES.
 	if len(r.target.resourceMap) != 0 && r.oneOf(1000) {
 		// Spoof resource subkind.
@@ -360,65 +434,72 @@ func (r *randGen) createResource(s *state, res *ResourceType, dir Dir) (arg Arg,
 			panic(fmt.Sprintf("got no spoof resources for %v in %v/%v",
 				kind, r.target.OS, r.target.Arch))
 		}
-		sort.Strings(all)
-		kind = all[r.Intn(len(all))]
-	}
-	// Find calls that produce the necessary resources.
-	metas0 := r.target.resourceCtors[kind]
-	// TODO: reduce priority of less specialized ctors.
-	var metas []*Syscall
-	for _, meta := range metas0 {
-		if s.ct.Enabled(meta.ID) {
-			metas = append(metas, meta)
+		slices.Sort(all)
+		kind1 := all[r.Intn(len(all))]
+		ctors1 := r.enabledCtors(s, kind1)
+		if len(ctors1) != 0 {
+			// Don't use the resource for which we don't have any ctors.
+			// It's fine per-se because below we just return nil in such case.
+			// But in TestCreateResource tests we want to ensure that we don't fail
+			// to create non-optional resources, and if we spoof a non-optional
+			// resource with ctors with a optional resource w/o ctors, then that check will fail.
+			kind, ctors = kind1, ctors1
 		}
 	}
-	if len(metas) == 0 {
-		return res.DefaultArg(dir), nil
+	if len(ctors) == 0 {
+		// We may not have any constructors for optional input resources because we don't disable
+		// syscalls based on optional inputs resources w/o ctors in TransitivelyEnabledCalls.
+		return nil, nil
+	}
+	// Now we have a set of candidate calls that can create the necessary resource.
+	// Generate one of them.
+	var meta *Syscall
+	// Prefer precise constructors.
+	var precise []*Syscall
+	for _, info := range ctors {
+		if info.Precise {
+			precise = append(precise, info.Call)
+		}
+	}
+	if len(precise) > 0 {
+		// If the argument is optional, it's not guaranteed that there'd be a
+		// precise constructor.
+		meta = precise[r.Intn(len(precise))]
+	}
+	if meta == nil || r.oneOf(3) {
+		// Sometimes just take a random one.
+		meta = ctors[r.Intn(len(ctors))].Call
 	}
 
-	// Now we have a set of candidate calls that can create the necessary resource.
-	for i := 0; i < 1e3; i++ {
-		// Generate one of them.
-		meta := metas[r.Intn(len(metas))]
-		calls := r.generateParticularCall(s, meta)
-		s1 := newState(r.target, s.ct, nil)
-		s1.analyze(calls[len(calls)-1])
-		// Now see if we have what we want.
-		var allres []*ResultArg
-		for kind1, res1 := range s1.resources {
-			if r.target.isCompatibleResource(kind, kind1) {
-				allres = append(allres, res1...)
-			}
-		}
-		sort.SliceStable(allres, func(i, j int) bool {
-			return allres[i].Type().Name() < allres[j].Type().Name()
-		})
-		if len(allres) != 0 {
-			// Bingo!
-			arg := MakeResultArg(res, dir, allres[r.Intn(len(allres))], 0)
-			return arg, calls
-		}
-		// Discard unsuccessful calls.
-		// Note: s.ma/va have already noted allocations of the new objects
-		// in discarded syscalls, ideally we should recreate state
-		// by analyzing the program again.
-		for _, c := range calls {
-			ForeachArg(c, func(arg Arg, _ *ArgCtx) {
-				if a, ok := arg.(*ResultArg); ok && a.Res != nil {
-					delete(a.Res.uses, a)
-				}
-			})
+	calls := r.generateParticularCall(s, meta)
+	s1 := newState(r.target, s.ct, nil)
+	s1.analyze(calls[len(calls)-1])
+	// Now see if we have what we want.
+	var allres []*ResultArg
+	for kind1, res1 := range s1.resources {
+		if r.target.isCompatibleResource(kind, kind1) {
+			allres = append(allres, res1...)
 		}
 	}
-	// Generally we can loop several times, e.g. when we choose a call that returns
-	// the resource in an array, but then generateArg generated that array of zero length.
-	// But we must succeed eventually.
-	var ctors []string
-	for _, meta := range metas {
-		ctors = append(ctors, meta.Name)
+	sort.SliceStable(allres, func(i, j int) bool {
+		return allres[i].Type().Name() < allres[j].Type().Name()
+	})
+	if len(allres) == 0 {
+		panic(fmt.Sprintf("failed to create a resource %v (%v) with %v",
+			res.Desc.Kind[0], kind, meta.Name))
 	}
-	panic(fmt.Sprintf("failed to create a resource %v with %v",
-		res.Desc.Kind[0], strings.Join(ctors, ", ")))
+	arg := MakeResultArg(res, dir, allres[r.Intn(len(allres))], 0)
+	return arg, calls
+}
+
+func (r *randGen) enabledCtors(s *state, kind string) []ResourceCtor {
+	var ret []ResourceCtor
+	for _, info := range r.target.resourceCtors[kind] {
+		if s.ct.Generatable(info.Call.ID) {
+			ret = append(ret, info)
+		}
+	}
+	return ret
 }
 
 func (r *randGen) generateText(kind TextKind) []byte {
@@ -427,9 +508,6 @@ func (r *randGen) generateText(kind TextKind) []byte {
 		if cfg := createTargetIfuzzConfig(r.target); cfg != nil {
 			return ifuzz.Generate(cfg, r.Rand)
 		}
-		fallthrough
-	case TextArm64:
-		// Just a stub, need something better.
 		text := make([]byte, 50)
 		for i := range text {
 			text[i] = byte(r.Intn(256))
@@ -447,8 +525,6 @@ func (r *randGen) mutateText(kind TextKind, text []byte) []byte {
 		if cfg := createTargetIfuzzConfig(r.target); cfg != nil {
 			return ifuzz.Mutate(cfg, r.Rand, text)
 		}
-		fallthrough
-	case TextArm64:
 		return mutateData(r, text, 40, 60)
 	default:
 		cfg := createIfuzzConfig(kind)
@@ -467,7 +543,8 @@ func createTargetIfuzzConfig(target *Target) *ifuzz.Config {
 	}
 	for _, p := range target.SpecialPointers {
 		cfg.MemRegions = append(cfg.MemRegions, ifuzz.MemRegion{
-			Start: p & ^target.PageSize, Size: p & ^target.PageSize + target.PageSize,
+			Start: p & ^target.PageSize,
+			Size:  p & ^target.PageSize + target.PageSize,
 		})
 	}
 	switch target.Arch {
@@ -480,6 +557,9 @@ func createTargetIfuzzConfig(target *Target) *ifuzz.Config {
 	case "ppc64":
 		cfg.Mode = ifuzz.ModeLong64
 		cfg.Arch = ifuzz.ArchPowerPC
+	case "arm64":
+		cfg.Mode = ifuzz.ModeLong64
+		cfg.Arch = ifuzz.ArchArm64
 	default:
 		return nil
 	}
@@ -521,8 +601,18 @@ func createIfuzzConfig(kind TextKind) *ifuzz.Config {
 	case TextPpc64:
 		cfg.Mode = ifuzz.ModeLong64
 		cfg.Arch = ifuzz.ArchPowerPC
+	case TextArm64:
+		cfg.Mode = ifuzz.ModeLong64
+		cfg.Arch = ifuzz.ArchArm64
+	case TextRiscv64:
+		cfg.Mode = ifuzz.ModeLong64
+		cfg.Arch = ifuzz.ArchRiscv64
+		// For riscv64, ifuzz currently has no pseudo-instructions
+		// and does not handle privileged instructions.
+		cfg.Priv = false
+		cfg.Exec = false
 	default:
-		panic("unknown text kind")
+		panic(fmt.Sprintf("unknown text kind: %v", kind))
 	}
 	return cfg
 }
@@ -540,7 +630,11 @@ func (r *randGen) generateCall(s *state, p *Prog, insertionPoint int) []*Call {
 	biasCall := -1
 	if insertionPoint > 0 {
 		// Choosing the base call is based on the insertion point of the new calls sequence.
-		biasCall = p.Calls[r.Intn(insertionPoint)].Meta.ID
+		insertionCall := p.Calls[r.Intn(insertionPoint)].Meta
+		if !insertionCall.Attrs.NoGenerate {
+			// We must be careful not to bias towards a non-generatable call.
+			biasCall = insertionCall.ID
+		}
 	}
 	idx := s.ct.choose(r.Rand, biasCall)
 	meta := r.target.Syscalls[idx]
@@ -551,26 +645,39 @@ func (r *randGen) generateParticularCall(s *state, meta *Syscall) (calls []*Call
 	if meta.Attrs.Disabled {
 		panic(fmt.Sprintf("generating disabled call %v", meta.Name))
 	}
+	if meta.Attrs.NoGenerate {
+		panic(fmt.Sprintf("generating no_generate call: %v", meta.Name))
+	}
+	return r.generateParticularCallUnsafe(s, meta)
+}
+
+func (r *randGen) generateParticularCallUnsafe(s *state, meta *Syscall) (calls []*Call) {
 	c := MakeCall(meta, nil)
+	// KFuzzTest calls restrict mutation and generation. Since calls to
+	// generateParticularCall can be recursive, we save the previous value, and
+	// set it true.
+	if c.Meta.Attrs.KFuzzTest {
+		tmp := r.genKFuzzTest
+		r.genKFuzzTest = true
+		defer func() {
+			r.genKFuzzTest = tmp
+		}()
+	}
 	c.Args, calls = r.generateArgs(s, meta.Args, DirIn)
+	moreCalls, _ := r.patchConditionalFields(c, s)
 	r.target.assignSizesCall(c)
-	return append(calls, c)
+	return append(append(calls, moreCalls...), c)
 }
 
 // GenerateAllSyzProg generates a program that contains all pseudo syz_ calls for testing.
-func (target *Target) GenerateAllSyzProg(rs rand.Source) *Prog {
+func (target *Target) GenerateAllSyzProg(rs rand.Source, ct *ChoiceTable) *Prog {
 	p := &Prog{
 		Target: target,
 	}
 	r := newRand(target, rs)
-	s := newState(target, target.DefaultChoiceTable(), nil)
-	handled := make(map[string]bool)
-	for _, meta := range target.Syscalls {
-		if !strings.HasPrefix(meta.CallName, "syz_") || handled[meta.CallName] || meta.Attrs.Disabled {
-			continue
-		}
-		handled[meta.CallName] = true
-		calls := r.generateParticularCall(s, meta)
+	s := newState(target, ct, nil)
+	for _, meta := range target.PseudoSyscalls() {
+		calls := r.generateParticularCallUnsafe(s, meta)
 		for _, c := range calls {
 			s.analyze(c)
 			p.Calls = append(p.Calls, c)
@@ -582,12 +689,48 @@ func (target *Target) GenerateAllSyzProg(rs rand.Source) *Prog {
 	return p
 }
 
+// PseudoSyscalls selects one *Syscall for each pseudosyscall.
+func (target *Target) PseudoSyscalls() []*Syscall {
+	handled := make(map[string]bool)
+	var ret []*Syscall
+	for _, meta := range target.Syscalls {
+		if !strings.HasPrefix(meta.CallName, "syz_") ||
+			handled[meta.CallName] ||
+			meta.Attrs.Disabled {
+			continue
+		}
+		ret = append(ret, meta)
+		handled[meta.CallName] = true
+	}
+	return ret
+}
+
+// GenSampleProg generates a single sample program for the call.
+func (target *Target) GenSampleProg(meta *Syscall, rs rand.Source, ct *ChoiceTable) *Prog {
+	r := newRand(target, rs)
+	// Make sure no additional calls are created to provide the resources used by meta.
+	r.genDefaultResource = true
+	s := newState(target, ct, nil)
+	p := &Prog{
+		Target: target,
+	}
+	for _, c := range r.generateParticularCallUnsafe(s, meta) {
+		s.analyze(c)
+		p.Calls = append(p.Calls, c)
+	}
+	if err := p.validate(); err != nil {
+		panic(err)
+	}
+	return p
+}
+
 // DataMmapProg creates program that maps data segment.
 // Also used for testing as the simplest program.
 func (target *Target) DataMmapProg() *Prog {
 	return &Prog{
-		Target: target,
-		Calls:  target.MakeDataMmap(),
+		Target:   target,
+		Calls:    target.MakeDataMmap(),
+		isUnsafe: true,
 	}
 }
 
@@ -632,24 +775,6 @@ func (r *randGen) generateArgImpl(s *state, typ Type, dir Dir, ignoreSpecial boo
 		return typ.DefaultArg(dir), nil
 	}
 
-	// Allow infinite recursion for optional pointers.
-	if pt, ok := typ.(*PtrType); ok && typ.Optional() {
-		switch pt.Elem.(type) {
-		case *StructType, *ArrayType, *UnionType:
-			name := pt.Elem.Name()
-			r.recDepth[name]++
-			defer func() {
-				r.recDepth[name]--
-				if r.recDepth[name] == 0 {
-					delete(r.recDepth, name)
-				}
-			}()
-			if r.recDepth[name] >= 3 {
-				return MakeSpecialPointerArg(typ, dir, 0), nil
-			}
-		}
-	}
-
 	if !ignoreSpecial && dir != DirOut {
 		switch typ.(type) {
 		case *StructType, *UnionType:
@@ -663,30 +788,36 @@ func (r *randGen) generateArgImpl(s *state, typ Type, dir Dir, ignoreSpecial boo
 }
 
 func (a *ResourceType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call) {
+	canRecurse := false
 	if !r.inGenerateResource {
 		// Don't allow recursion for resourceCentric/createResource.
 		// That can lead to generation of huge programs and may be very slow
 		// (esp. if we are generating some failing attempts in createResource already).
 		r.inGenerateResource = true
 		defer func() { r.inGenerateResource = false }()
-
+		canRecurse = true
+	}
+	if (canRecurse && r.nOutOf(8, 10) ||
+		!canRecurse && r.nOutOf(19, 20)) && !r.genDefaultResource {
+		arg = r.existingResource(s, a, dir)
+		if arg != nil {
+			return
+		}
+	}
+	if canRecurse && !r.genDefaultResource {
 		if r.oneOf(4) {
 			arg, calls = r.resourceCentric(s, a, dir)
 			if arg != nil {
 				return
 			}
 		}
-		if r.oneOf(3) {
+		if r.nOutOf(4, 5) {
+			// If we could not reuse a resource, let's prefer resource creation over
+			// random int substitution.
 			arg, calls = r.createResource(s, a, dir)
 			if arg != nil {
 				return
 			}
-		}
-	}
-	if r.nOutOf(9, 10) {
-		arg = r.existingResource(s, a, dir)
-		if arg != nil {
-			return
 		}
 	}
 	special := a.SpecialValues()
@@ -723,10 +854,8 @@ func (a *BufferType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*
 				sz = a.Size()
 			case r.nOutOf(1, 3):
 				sz = r.rand(100)
-			case r.nOutOf(1, 2):
-				sz = 108 // UNIX_PATH_MAX
 			default:
-				sz = 4096 // PATH_MAX
+				sz = uint64(r.randFilenameLength())
 			}
 			return MakeOutDataArg(a, dir, sz), nil
 		}
@@ -738,6 +867,19 @@ func (a *BufferType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*
 			return MakeOutDataArg(a, dir, uint64(r.Intn(100))), nil
 		}
 		return MakeDataArg(a, dir, r.generateText(a.Text)), nil
+	case BufferCompressed:
+		// Not super useful data, but we need something for pkg/csource tests.
+		// During fuzzing, such syscalls are marked as no_generate and we only take
+		// the compressed data from the seeds or corpus.
+		sz := r.randBufLen()
+		if dir == DirOut {
+			return MakeOutDataArg(a, dir, sz), nil
+		}
+		data := make([]byte, sz)
+		for i := range data {
+			data[i] = byte(r.Intn(256))
+		}
+		return MakeDataArg(a, dir, image.Compress(data)), nil
 	default:
 		panic("unknown buffer kind")
 	}
@@ -774,12 +916,21 @@ func (a *ProcType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Ca
 }
 
 func (a *ArrayType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call) {
+	ok, release := r.pruneRecursion(a.Elem, arrayRecursionLimit)
+	if !ok {
+		return MakeGroupArg(a, dir, nil), nil
+	}
+	defer release()
 	var count uint64
 	switch a.Kind {
 	case ArrayRandLen:
 		count = r.randArrayLen()
 	case ArrayRangeLen:
 		count = r.randRange(a.RangeBegin, a.RangeEnd)
+	}
+	// The resource we are trying to generate may be in the array elements, so create at least 1.
+	if r.inGenerateResource && count == 0 {
+		count = 1
 	}
 	var inner []Arg
 	for i := uint64(0); i < count; i++ {
@@ -797,6 +948,11 @@ func (a *StructType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*
 }
 
 func (a *UnionType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call) {
+	if a.isConditional() {
+		// Conditions may reference other fields that may not have already
+		// been generated. We'll fill them in later.
+		return a.DefaultArg(dir), nil
+	}
 	index := r.Intn(len(a.Fields))
 	optType, optDir := a.Fields[index].Type, a.Fields[index].Dir(dir)
 	opt, calls := r.generateArg(s, optType, optDir)
@@ -804,7 +960,17 @@ func (a *UnionType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*C
 }
 
 func (a *PtrType) generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call) {
-	if r.oneOf(1000) {
+	// Restrict infinite recursion even for optional pointers.
+	if a.Optional() {
+		ok, release := r.pruneRecursion(a.Elem, pointerRecursionLimit)
+		if !ok {
+			return MakeSpecialPointerArg(a, dir, 0), nil
+		}
+		defer release()
+	}
+	// The resource we are trying to generate may be in the pointer,
+	// so don't try to create an empty special pointer during resource generation.
+	if !r.inGenerateResource && r.oneOf(1000) {
 		index := r.rand(len(r.target.SpecialPointers))
 		return MakeSpecialPointerArg(a, dir, index), nil
 	}
@@ -828,8 +994,8 @@ func (r *randGen) existingResource(s *state, res *ResourceType, dir Dir) Arg {
 	for _, res1 := range s.resources {
 		alltypes = append(alltypes, res1)
 	}
-	sort.Slice(alltypes, func(i, j int) bool {
-		return alltypes[i][0].Type().Name() < alltypes[j][0].Type().Name()
+	slices.SortFunc(alltypes, func(a, b []*ResultArg) int {
+		return cmp.Compare(a[0].Type().Name(), b[0].Type().Name())
 	})
 	var allres []*ResultArg
 	for _, res1 := range alltypes {
@@ -849,13 +1015,16 @@ func (r *randGen) existingResource(s *state, res *ResourceType, dir Dir) Arg {
 func (r *randGen) resourceCentric(s *state, t *ResourceType, dir Dir) (arg Arg, calls []*Call) {
 	var p *Prog
 	var resource *ResultArg
-	for idx := range r.Perm(len(s.corpus)) {
-		p = s.corpus[idx].Clone()
-		resources := getCompatibleResources(p, t.TypeName, r)
-		if len(resources) > 0 {
-			resource = resources[r.Intn(len(resources))]
-			break
+	for _, idx := range r.Perm(len(s.corpus)) {
+		corpusProg := s.corpus[idx]
+		resources := getCompatibleResources(corpusProg, t.TypeName, r)
+		if len(resources) == 0 {
+			continue
 		}
+		argMap := make(map[*ResultArg]*ResultArg)
+		p = corpusProg.cloneWithMap(argMap)
+		resource = argMap[resources[r.Intn(len(resources))]]
+		break
 	}
 
 	// No compatible resource was found.
@@ -867,10 +1036,10 @@ func (r *randGen) resourceCentric(s *state, t *ResourceType, dir Dir) (arg Arg, 
 	relatedRes := map[*ResultArg]bool{resource: true}
 
 	// Remove unrelated calls from the program.
-	for idx := len(p.Calls) - 1; idx >= 0; idx-- {
+	for idx, v := range slices.Backward(p.Calls) {
 		includeCall := false
 		var newResources []*ResultArg
-		ForeachArg(p.Calls[idx], func(arg Arg, _ *ArgCtx) {
+		ForeachArg(v, func(arg Arg, _ *ArgCtx) {
 			if a, ok := arg.(*ResultArg); ok {
 				if a.Res != nil && !relatedRes[a.Res] {
 					newResources = append(newResources, a.Res)
@@ -889,13 +1058,11 @@ func (r *randGen) resourceCentric(s *state, t *ResourceType, dir Dir) (arg Arg, 
 		}
 	}
 
-	// Selects a biased random length of the returned calls (more calls could offer more
-	// interesting programs). The values returned (n = len(calls): n, n-1, ..., 2.
-	biasedLen := 2 + r.biasedRand(len(calls)-1, 10)
-
-	// Removes the references that are not used anymore.
-	for i := biasedLen; i < len(calls); i++ {
-		p.RemoveCall(i)
+	// TODO: consider trimming some of the trailing calls to keep programs smaller.
+	// The call that produces the resource (and everything before it) must be kept,
+	// but it's unclear which of the following calls the new call depends on.
+	for _, c := range p.Calls {
+		s.relocateCall(c)
 	}
 
 	return MakeResultArg(t, dir, resource, 0), p.Calls

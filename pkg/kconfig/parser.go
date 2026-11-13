@@ -68,7 +68,7 @@ func (p *parser) skipSpaces() {
 
 func (p *parser) identLevel() int {
 	level := 0
-	for i := 0; i < p.col; i++ {
+	for i := range p.col {
 		level++
 		if p.current[i] == '\t' {
 			level = (level + 7) & ^7
@@ -77,7 +77,7 @@ func (p *parser) identLevel() int {
 	return level
 }
 
-func (p *parser) failf(msg string, args ...interface{}) {
+func (p *parser) failf(msg string, args ...any) {
 	if p.err == nil {
 		p.err = fmt.Errorf("%v:%v:%v: %v\n%v", p.file, p.line, p.col, fmt.Sprintf(msg, args...), p.current)
 	}
@@ -142,7 +142,7 @@ func (p *parser) QuotedString() string {
 		if ch == '\\' {
 			ch = p.char()
 			switch ch {
-			case '\'', '"', '\\':
+			case '\'', '"', '\\', 'n':
 				str = append(str, ch)
 			default:
 				p.failf("bad quoted character")

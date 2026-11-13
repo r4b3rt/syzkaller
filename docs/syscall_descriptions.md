@@ -38,7 +38,7 @@ The in-memory representation can be [transformed](/prog/encoding.go) to/from
 textual form to store in on-disk corpus, show to humans, etc.
 
 There is also another [binary representation](/prog/decodeexec.go)
-of the programs (called `exec`), that is much simpler, does not contains rich type information (irreversible)
+of the programs (called `exec`), that is much simpler, does not contain rich type information (irreversible)
 and is used for actual execution (interpretation) of programs by [executor](/executor/executor.cc).
 
 ## Describing new system calls
@@ -51,7 +51,7 @@ Currently all syscall descriptions are manually-written. There is an
 for this process and some ongoing work, but we are not there yet to have a
 fully-automated way to generate descriptions.
 There is a helper [headerparser](headerparser_usage.md) utility that can auto-generate
-some parts of descriptions from header files.
+some parts of descriptions from header files. Visual Studio Code has [syz-lang extension](https://marketplace.visualstudio.com/items?itemName=AndreyArtemiev.syzlang-extension&ssr=false#overview) for highlighting syntax.
 
 To enable fuzzing of a new kernel interface:
 
@@ -145,11 +145,8 @@ with [syz-check](/tools/syz-check/check.go).
 
 For example, if there is an existing enum `v4l2_buf_type` in the kernel headers,
 use this name for flags in descriptions as well. The same for structs, unions,
-fields, etc. For syscall variants, use the command name after the `$` sign.
+fields, etc. For syscall and struct variants, append the variant name after the `$` sign.
 For example, `fcntl$F_GET_RW_HINT`, `ioctl$FIOCLEX`, `setsockopt$SO_TIMESTAMP`.
-
-If you need to describe several variants of the same kernel struct, the naming
-convention understood by `syz-check` is `<ORIGINAL_KERNEL_NAME>_some_suffix`.
 
 <div id="ordering"/>
 
@@ -171,7 +168,7 @@ close(r0)
 Syscall arguments are always `in`, return values are `out` and pointer indirections
 have explicit direction as `ptr` type attribute. Also, it is possible to specify
 direction attribute individually for struct fields to account for more complex
-producer/consumer scenarious with structs that include both input/output resources.
+producer/consumer scenarios with structs that include both input/output resources.
 
 <div id="values"/>
 
@@ -236,7 +233,7 @@ The second step is translation of descriptions into Go code using
 [pkg/ast](/pkg/ast/) and [pkg/compiler](/pkg/compiler/)).
 This step uses syscall descriptions and the const files generated during the first step
 and produces instantiations of `Syscall` and `Type` types defined in [prog/types.go](/prog/types.go).
-You can see an example of the compiler output for Akaros in `sys/akaros/gen/amd64.go`.
+You can see an example of the compiler output for Linux/AMD64 in `sys/linux/gen/amd64.go`.
 This step also generates some minimal syscall metadata for C++ code in `executor/syscalls.h`.
 
 ## Non-mainline subsystems
@@ -255,7 +252,7 @@ make
 
 `$ARCH` is one of `amd64`, `386` `arm64`, `arm`, `ppc64le`, `mips64le`.
 If the subsystem is supported on several architectures, then run `syz-extract` for each arch.
-`$LINUX` should point to kernel source checkout, which is configured for the
+`$KSRC` should point to kernel source checkout, which is configured for the
 corresponding arch (i.e. you need to run `make ARCH=arch someconfig && make ARCH=arch` there first,
 remember to add `CROSS_COMPILE=arm-linux-gnueabi-/aarch64-linux-gnu-/powerpc64le-linux-gnu-` if needed).
 If the kernel was built into a separate directory (with `make O=output_dir`, remember to put .config
@@ -283,13 +280,13 @@ It's always good to add a test at least for "the main successful scenario" for t
 It will ensure that the descriptions are actually correct and that it's possible for the fuzzer
 to come up with the successful scenario. See [io_uring test](/sys/linux/test/io_uring) as a good example.
 
-The tests can be run with the `syz-runtest` utility as:
+The tests can be run with the `run-tests` functionality of `syz-manager`:
 ```
-make runtest && bin/syz-runtest -config manager.config
+make && bin/syz-manager -config manager.config -mode run-tests
 ```
-`syz-runtest` boots multiple VMs and runs these tests in different execution modes inside of the VMs.
+It will boot multiple VMs and runs these tests in different execution modes inside of the VMs.
 
-However, full `syz-runtest` run takes time, so while developing the test, it's more handy to run it
+However, the full run takes significant time, so while developing the test, it's more handy to run it
 using the `syz-execprog` utility. To run the test, copy `syz-execprog`, `syz-executor` and the test
 into a manually booted VM and then run the following command inside of the VM:
 ```

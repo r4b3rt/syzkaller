@@ -13,17 +13,19 @@
 
 #if GOOS_netbsd
 
-#if SYZ_EXECUTOR || __NR_syz_usb_connect
+#if SYZ_EXECUTOR || __NR_syz_usb_connect || __NR_syz_usb_disconnect
 #include "common_usb_netbsd.h"
 #endif
 #if SYZ_EXECUTOR || SYZ_USB
 #include <dirent.h>
-static void setup_usb(void)
+
+static const char* setup_usb(void)
 {
 	DIR* dir = opendir("/dev");
 	if (dir == NULL)
-		fail("failed to open /dev");
+		return "failed to open /dev";
 
+	bool have_vhci = false;
 	struct dirent* ent = NULL;
 	while ((ent = readdir(dir)) != NULL) {
 		if (ent->d_type != DT_CHR)
@@ -32,11 +34,14 @@ static void setup_usb(void)
 			continue;
 		char path[1024];
 		snprintf(path, sizeof(path), "/dev/%s", ent->d_name);
-		if (chmod(path, 0666))
-			failmsg("failed to chmod vhci", "path=%s", path);
+		if (chmod(path, 0666)) {
+			closedir(dir);
+			return "failed to chmod /dev/vhci";
+		}
+		have_vhci = true;
 	}
-
 	closedir(dir);
+	return have_vhci ? NULL : "don't have any /dev/vhci devices";
 }
 #endif
 
@@ -44,11 +49,14 @@ static void setup_usb(void)
 #include <fcntl.h>
 #include <sys/fault.h>
 #include <sys/stat.h>
-static void setup_fault(void)
+
+static const char* setup_fault(void)
 {
 	if (chmod("/dev/fault", 0666))
-		fail("failed to chmod /dev/fault");
+		return "failed to chmod /dev/fault";
+	return NULL;
 }
+
 static int inject_fault(int nth)
 {
 	struct fault_ioc_enable en;
@@ -67,6 +75,7 @@ static int inject_fault(int nth)
 	return fd;
 }
 #endif
+
 #if SYZ_EXECUTOR
 static int fault_injected(int fd)
 {
@@ -91,27 +100,9 @@ static int fault_injected(int fd)
 
 #endif
 
-#if GOOS_openbsd || GOOS_darwin
+#if GOOS_darwin
 #define __syscall syscall
-#endif // GOOS_openbsd || GOOS_darwin
-
-#if GOOS_openbsd && (SYZ_EXECUTOR || __NR_syz_open_pts)
-#include <termios.h>
-#include <util.h>
-
-static uintptr_t syz_open_pts(void)
-{
-	int master, slave;
-
-	if (openpty(&master, &slave, NULL, NULL, NULL) == -1)
-		return -1;
-	// Move the master fd up in order to reduce the chances of the fuzzer
-	// generating a call to close(2) with the same fd.
-	if (dup2(master, master + 100) != -1)
-		close(master);
-	return slave;
-}
-#endif // GOOS_openbsd && (SYZ_EXECUTOR || __NR_syz_open_pts)
+#endif //  GOOS_darwin
 
 #if SYZ_EXECUTOR || SYZ_NET_INJECTION
 
@@ -130,22 +121,33 @@ static int tunfd = -1;
 #if GOOS_netbsd
 // Increased number of tap and tun devices if image script is used
 #define MAX_TUN 64
-
+#elif GOOS_freebsd
+// The maximum number of tun devices is limited by the way IP addresses
+// are assigned. Based on this, the limit is 256.
+#define MAX_TUN 256
 #else
 // Maximum number of tun devices in the default install.
 #define MAX_TUN 4
 #endif
 
-// All patterns are non-expanding given values < MAX_TUN.
+// Because the interface and device name contain an int, use MAXINT to determine
+// the maximum size of the string.
+// Since on *BSD  sizeof(int) is 4, MAXINT is 2147483647.
 #define TUN_IFACE "tap%d"
+#define MAX_TUN_IFACE_SIZE sizeof("tap2147483647")
 #define TUN_DEVICE "/dev/tap%d"
+#define MAX_TUN_DEVICE_SIZE sizeof("/dev/tap2147483647")
 
 #define LOCAL_MAC "aa:aa:aa:aa:aa:aa"
 #define REMOTE_MAC "aa:aa:aa:aa:aa:bb"
 #define LOCAL_IPV4 "172.20.%d.170"
+#define MAX_LOCAL_IPV4_SIZE sizeof("172.20.255.170")
 #define REMOTE_IPV4 "172.20.%d.187"
-#define LOCAL_IPV6 "fe80::%02hxaa"
-#define REMOTE_IPV6 "fe80::%02hxbb"
+#define MAX_REMOTE_IPV4_SIZE sizeof("172.20.255.187")
+#define LOCAL_IPV6 "fe80::%02xaa"
+#define MAX_LOCAL_IPV6_SIZE sizeof("fe80::ffaa")
+#define REMOTE_IPV6 "fe80::%02xbb"
+#define MAX_REMOTE_IPV6_SIZE sizeof("fe80::ffbb")
 
 static void vsnprintf_check(char* str, size_t size, const char* format, va_list args)
 {
@@ -198,10 +200,10 @@ static void initialize_tun(int tun_id)
 	if (tun_id < 0 || tun_id >= MAX_TUN)
 		failmsg("tun_id out of range", "tun_id=%d", tun_id);
 
-	char tun_device[sizeof(TUN_DEVICE)];
+	char tun_device[MAX_TUN_DEVICE_SIZE];
 	snprintf_check(tun_device, sizeof(tun_device), TUN_DEVICE, tun_id);
 
-	char tun_iface[sizeof(TUN_IFACE)];
+	char tun_iface[MAX_TUN_IFACE_SIZE];
 	snprintf_check(tun_iface, sizeof(tun_iface), TUN_IFACE, tun_id);
 
 #if GOOS_netbsd
@@ -230,7 +232,7 @@ static void initialize_tun(int tun_id)
 	}
 	// Remap tun onto higher fd number to hide it from fuzzer and to keep
 	// fd numbers stable regardless of whether tun is opened or not (also see kMaxFd).
-	const int kTunFd = 240;
+	const int kTunFd = 200;
 	if (dup2(tunfd, kTunFd) < 0)
 		fail("dup2(tunfd, kTunFd) failed");
 	close(tunfd);
@@ -240,33 +242,31 @@ static void initialize_tun(int tun_id)
 	snprintf_check(local_mac, sizeof(local_mac), LOCAL_MAC);
 
 	// Set the MAC address of the interface to LOCAL_MAC
-#if GOOS_openbsd
-	execute_command(1, "ifconfig %s lladdr %s", tun_iface, local_mac);
-#elif GOOS_netbsd
+#if GOOS_netbsd
 	execute_command(1, "ifconfig %s link %s", tun_iface, local_mac);
 #else
 	execute_command(1, "ifconfig %s ether %s", tun_iface, local_mac);
 #endif
 
 	// Setting up a static ip for the interface
-	char local_ipv4[sizeof(LOCAL_IPV4)];
+	char local_ipv4[MAX_LOCAL_IPV4_SIZE];
 	snprintf_check(local_ipv4, sizeof(local_ipv4), LOCAL_IPV4, tun_id);
 	execute_command(1, "ifconfig %s inet %s netmask 255.255.255.0", tun_iface, local_ipv4);
 
 	// Creates an ARP table entry for the remote ip and MAC address
 	char remote_mac[sizeof(REMOTE_MAC)];
-	char remote_ipv4[sizeof(REMOTE_IPV4)];
+	char remote_ipv4[MAX_REMOTE_IPV4_SIZE];
 	snprintf_check(remote_mac, sizeof(remote_mac), REMOTE_MAC);
 	snprintf_check(remote_ipv4, sizeof(remote_ipv4), REMOTE_IPV4, tun_id);
 	execute_command(0, "arp -s %s %s", remote_ipv4, remote_mac);
 
 	// Set up a static ipv6 address for the interface
-	char local_ipv6[sizeof(LOCAL_IPV6)];
+	char local_ipv6[MAX_LOCAL_IPV6_SIZE];
 	snprintf_check(local_ipv6, sizeof(local_ipv6), LOCAL_IPV6, tun_id);
 	execute_command(1, "ifconfig %s inet6 %s", tun_iface, local_ipv6);
 
 	// Registers an NDP entry for the remote MAC with the remote ipv6 address
-	char remote_ipv6[sizeof(REMOTE_IPV6)];
+	char remote_ipv6[MAX_REMOTE_IPV6_SIZE];
 	snprintf_check(remote_ipv6, sizeof(remote_ipv6), REMOTE_IPV6, tun_id);
 	execute_command(0, "ndp -s %s%%%s %s", remote_ipv6, tun_iface, remote_mac);
 }
@@ -387,6 +387,7 @@ static long syz_extract_tcp_res(volatile long a0, volatile long a1, volatile lon
 
 #if SYZ_EXECUTOR || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NONE
 
+#include <errno.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -396,16 +397,13 @@ static void sandbox_common()
 #if SYZ_EXECUTOR
 	if (!flag_threaded)
 #endif
-		if (setsid() == -1)
+		if (setsid() == -1 && errno != EPERM)
 			fail("setsid failed");
 #endif
 
 	// Some minimal sandboxing.
 	struct rlimit rlim;
 #ifdef GOOS_freebsd
-	// Documented bug in OpenBSD.
-	// This causes frequent random aborts. Reason unknown.
-
 	// This also causes ENOMEM on NetBSD during early init.
 	rlim.rlim_cur = rlim.rlim_max = 128 << 20;
 	setrlimit(RLIMIT_AS, &rlim);

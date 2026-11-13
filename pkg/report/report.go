@@ -6,15 +6,19 @@
 package report
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
+	"github.com/google/syzkaller/pkg/cover/backend"
 	"github.com/google/syzkaller/pkg/mgrconfig"
+	"github.com/google/syzkaller/pkg/report/crash"
 	"github.com/google/syzkaller/pkg/vcs"
+	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/sys/targets"
+	"github.com/ianlancetaylor/demangle"
 )
 
 type reporterImpl interface {
@@ -30,9 +34,10 @@ type reporterImpl interface {
 }
 
 type Reporter struct {
+	typ          string
 	impl         reporterImpl
 	suppressions []*regexp.Regexp
-	typ          string
+	interests    []*regexp.Regexp
 }
 
 type Report struct {
@@ -42,7 +47,7 @@ type Report struct {
 	// If two crashes have a non-empty intersection of Title/AltTitles, they are considered the same bug.
 	AltTitles []string
 	// Bug type (e.g. hang, memory leak, etc).
-	Type Type
+	Type crash.Type
 	// The indicative function name.
 	Frame string
 	// Report contains whole oops text.
@@ -62,43 +67,42 @@ type Report struct {
 	CorruptedReason string
 	// Recipients is a list of RecipientInfo with Email, Display Name, and type.
 	Recipients vcs.Recipients
-	// guiltyFile is the source file that we think is to blame for the crash  (filled in by Symbolize).
-	guiltyFile string
+	// GuiltyFile is the source file that we think is to blame for the crash  (filled in by Symbolize).
+	GuiltyFile string
+	// Arbitrary information about the test VM, may be attached to the report by users of the package.
+	MachineInfo []byte
+	// If the crash happened in the context of the syz-executor process, Executor will hold more info.
+	Executor *ExecutorInfo
+	// Whether the kernel has panicked after the report (Linux-specific).
+	Panicked bool
 	// reportPrefixLen is length of additional prefix lines that we added before actual crash report.
 	reportPrefixLen int
+	// symbolized is set if the report is symbolized. It prevents double symbolization.
+	symbolized bool
 }
 
-type Type int
+type ExecutorInfo struct {
+	ProcID int // ID of the syz-executor proc mentioned in the crash report.
+	ExecID int // The program the syz-executor was executing.
+}
 
-const (
-	Unknown Type = iota
-	Hang
-	MemoryLeak
-	DataRace
-	UnexpectedReboot
-)
-
-func (t Type) String() string {
-	switch t {
-	case Unknown:
-		return "UNKNOWN"
-	case Hang:
-		return "HANG"
-	case MemoryLeak:
-		return "LEAK"
-	case DataRace:
-		return "DATARACE"
-	case UnexpectedReboot:
-		return "REBOOT"
-	default:
-		panic("unknown report type")
-	}
+func (rep *Report) String() string {
+	return fmt.Sprintf("crash: %v\n%s", rep.Title, rep.Report)
 }
 
 // NewReporter creates reporter for the specified OS/Type.
 func NewReporter(cfg *mgrconfig.Config) (*Reporter, error) {
+	var localModules []*vminfo.KernelModule
+	if cfg.KernelObj != "" && cfg.Type != targets.GVisor {
+		var err error
+		localModules, err = backend.DiscoverModules(cfg.SysTarget, cfg.KernelObj, cfg.ModuleObj)
+		if err != nil {
+			return nil, err
+		}
+		cfg.LocalModules = localModules
+	}
 	typ := cfg.TargetOS
-	if cfg.Type == "gvisor" {
+	if cfg.Type == targets.GVisor || cfg.Type == targets.Starnix {
 		typ = cfg.Type
 	}
 	ctor := ctors[typ]
@@ -109,35 +113,52 @@ func NewReporter(cfg *mgrconfig.Config) (*Reporter, error) {
 	if err != nil {
 		return nil, err
 	}
+	interests, err := compileRegexps(cfg.Interests)
+	if err != nil {
+		return nil, err
+	}
 	config := &config{
-		target:         cfg.SysTarget,
-		kernelSrc:      cfg.KernelSrc,
-		kernelBuildSrc: cfg.KernelBuildSrc,
-		kernelObj:      cfg.KernelObj,
-		ignores:        ignores,
+		target:        cfg.SysTarget,
+		vmType:        cfg.Type,
+		kernelDirs:    *cfg.KernelDirs(),
+		ignores:       ignores,
+		kernelModules: localModules,
 	}
 	rep, suppressions, err := ctor(config)
 	if err != nil {
 		return nil, err
 	}
-	supps, err := compileRegexps(append(suppressions, cfg.Suppressions...))
+	suppressions = append(suppressions, []string{
+		// Go runtime OOM messages:
+		"fatal error: runtime: out of memory",
+		"fatal error: runtime: cannot allocate memory",
+		"fatal error: out of memory",
+		"fatal error: newosproc",
+		// Panic with ENOMEM err:
+		"panic: .*cannot allocate memory",
+	}...)
+	suppressions = append(suppressions, cfg.Suppressions...)
+	supps, err := compileRegexps(suppressions)
 	if err != nil {
 		return nil, err
 	}
-	return &Reporter{rep, supps, typ}, nil
+	reporter := &Reporter{
+		typ:          typ,
+		impl:         rep,
+		suppressions: supps,
+		interests:    interests,
+	}
+	return reporter, nil
 }
 
 const (
-	unexpectedKernelReboot = "unexpected kernel reboot"
-	memoryLeakPrefix       = "memory leak in "
-	dataRacePrefix         = "KCSAN: data-race"
-	corruptedNoFrames      = "extracted no frames"
+	corruptedNoFrames = "extracted no frames"
 )
 
 var ctors = map[string]fn{
-	targets.Akaros:  ctorAkaros,
 	targets.Linux:   ctorLinux,
-	"gvisor":        ctorGvisor,
+	targets.Starnix: ctorFuchsia,
+	targets.GVisor:  ctorGvisor,
 	targets.FreeBSD: ctorFreebsd,
 	targets.Darwin:  ctorDarwin,
 	targets.NetBSD:  ctorNetbsd,
@@ -147,11 +168,11 @@ var ctors = map[string]fn{
 }
 
 type config struct {
-	target         *targets.Target
-	kernelSrc      string
-	kernelBuildSrc string
-	kernelObj      string
-	ignores        []*regexp.Regexp
+	target        *targets.Target
+	vmType        string
+	kernelDirs    mgrconfig.KernelDirs
+	ignores       []*regexp.Regexp
+	kernelModules []*vminfo.KernelModule
 }
 
 type fn func(cfg *config) (reporterImpl, []string, error)
@@ -161,7 +182,7 @@ func compileRegexps(list []string) ([]*regexp.Regexp, error) {
 	for i, str := range list {
 		re, err := regexp.Compile(str)
 		if err != nil {
-			return nil, fmt.Errorf("failed to compile %q: %v", str, err)
+			return nil, fmt.Errorf("failed to compile %q: %w", str, err)
 		}
 		compiled[i] = re
 	}
@@ -188,7 +209,6 @@ func (reporter *Reporter) ParseFrom(output []byte, minReportPos int) *Report {
 	if bytes.Contains(rep.Output, gceConsoleHangup) {
 		rep.Corrupted = true
 	}
-	rep.Type = extractReportType(rep)
 	if match := reportFrameRe.FindStringSubmatch(rep.Title); match != nil {
 		rep.Frame = match[1]
 	}
@@ -196,11 +216,9 @@ func (reporter *Reporter) ParseFrom(output []byte, minReportPos int) *Report {
 	if pos := bytes.IndexByte(rep.Output[rep.StartPos:], '\n'); pos != -1 {
 		rep.SkipPos = rep.StartPos + pos
 	}
-	if rep.EndPos < rep.SkipPos {
-		// This generally should not happen.
-		// But openbsd does some hacks with /r/n which may lead to off-by-one EndPos.
-		rep.EndPos = rep.SkipPos
-	}
+	// This generally should not happen.
+	// But openbsd does some hacks with /r/n which may lead to off-by-one EndPos.
+	rep.EndPos = max(rep.EndPos, rep.SkipPos)
 	return rep
 }
 
@@ -209,29 +227,60 @@ func (reporter *Reporter) ContainsCrash(output []byte) bool {
 }
 
 func (reporter *Reporter) Symbolize(rep *Report) error {
-	return reporter.impl.Symbolize(rep)
+	if rep.symbolized {
+		panic("Symbolize is called twice")
+	}
+	rep.symbolized = true
+	if err := reporter.impl.Symbolize(rep); err != nil {
+		return err
+	}
+	if !reporter.isInteresting(rep) {
+		rep.Suppressed = true
+	}
+	return nil
 }
 
-func extractReportType(rep *Report) Type {
-	// Type/frame extraction logic should be integrated with oops types.
-	// But for now we do this more ad-hoc analysis here to at least isolate
-	// the rest of the code base from report parsing.
-	if rep.Title == unexpectedKernelReboot {
-		return UnexpectedReboot
+func (reporter *Reporter) ExtractFaultInjectionInfo(output []byte) (string, error) {
+	linux, ok := reporter.impl.(*linux)
+	if !ok {
+		return "", nil
 	}
-	if strings.HasPrefix(rep.Title, memoryLeakPrefix) {
-		return MemoryLeak
+	return linux.extractFaultInjectionInfo(reporter, output)
+}
+
+func (reporter *Reporter) isInteresting(rep *Report) bool {
+	if len(reporter.interests) == 0 {
+		return true
 	}
-	if strings.HasPrefix(rep.Title, dataRacePrefix) {
-		return DataRace
+	if matchesAnyString(rep.Title, reporter.interests) ||
+		matchesAnyString(rep.GuiltyFile, reporter.interests) {
+		return true
 	}
-	if strings.HasPrefix(rep.Title, "INFO: rcu detected stall") ||
-		strings.HasPrefix(rep.Title, "INFO: task hung") ||
-		strings.HasPrefix(rep.Title, "BUG: soft lockup") ||
-		strings.HasPrefix(rep.Title, "INFO: task can't die") {
-		return Hang
+	for _, title := range rep.AltTitles {
+		if matchesAnyString(title, reporter.interests) {
+			return true
+		}
 	}
-	return Unknown
+	for _, recipient := range rep.Recipients {
+		if matchesAnyString(recipient.Address.Address, reporter.interests) {
+			return true
+		}
+	}
+	return false
+}
+
+// ReportToGuiltyFile does its best to extract the guilty file data.
+// There are cases when we need to extract a guilty file, but have no ability to do it the
+// proper way -- parse and symbolize the raw console output log. One of such cases is
+// the syz-fillreports tool, which only has access to the already symbolized logs.
+func (reporter *Reporter) ReportToGuiltyFile(title string, report []byte) string {
+	ii, ok := reporter.impl.(interface {
+		extractGuiltyFileRaw(title string, report []byte) string
+	})
+	if !ok {
+		return ""
+	}
+	return ii.extractGuiltyFileRaw(title, report)
 }
 
 func IsSuppressed(reporter *Reporter, output []byte) bool {
@@ -290,13 +339,18 @@ var dynamicTitleReplacement = []replacement{
 	{
 		// Replace that everything looks like an address with "ADDR",
 		// addresses in descriptions can't be good regardless of the oops regexps.
-		regexp.MustCompile(`([^a-zA-Z0])(?:0x)?[0-9a-f]{6,}`),
+		regexp.MustCompile(`([^a-zA-Z0-9])(?:0x)?[0-9a-f]{6,}`),
 		"${1}ADDR",
 	},
 	{
 		// Replace IP addresses.
 		regexp.MustCompile(`([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})`),
 		"IP",
+	},
+	{
+		// Replace IPv6 addresses.
+		regexp.MustCompile(`(^|\W)([0-9a-f:]*::[0-9a-f:]*|(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4})(\W|$)`),
+		"${1}IPV6ADDR${3}",
 	},
 	{
 		// Replace that everything looks like a file line number with "LINE".
@@ -320,6 +374,13 @@ var dynamicTitleReplacement = []replacement{
 		// matching substrings may overlap (e.g. "0,1,2").
 		regexp.MustCompile(`(\W)(\d+)(\W|$)`),
 		"${1}NUM${3}",
+	},
+	{
+		// Some decimal numbers can be a part of a function name,
+		// we need to preserve them (e.g. cfg80211* or nl802154*).
+		// However, if the number is too long, it's probably something else.
+		regexp.MustCompile(`(\d+){7,}`),
+		"NUM",
 	},
 }
 
@@ -363,7 +424,9 @@ type oopsFormat struct {
 	alt []string
 	// If not nil, a function name is extracted from the report and passed to fmt.
 	// If not nil but frame extraction fails, the report is considered corrupted.
-	stack        *stackFmt
+	stack *stackFmt
+	// Disable stack report corruption checking as it would expect one of stackStartRes to be
+	// present, but this format does not comply with that.
 	noStackTrace bool
 	corrupted    bool
 }
@@ -386,15 +449,16 @@ type stackFmt struct {
 	extractor frameExtractor
 }
 
-type frameExtractor func(frames []string) (frame, corrupted string)
+type frameExtractor func(frames []string) (string, int)
 
 var parseStackTrace *regexp.Regexp
 
 func compile(re string) *regexp.Regexp {
-	re = strings.Replace(re, "{{ADDR}}", "0x[0-9a-f]+", -1)
-	re = strings.Replace(re, "{{PC}}", "\\[\\<?(?:0x)?[0-9a-f]+\\>?\\]", -1)
-	re = strings.Replace(re, "{{FUNC}}", "([a-zA-Z0-9_]+)(?:\\.|\\+)", -1)
-	re = strings.Replace(re, "{{SRC}}", "([a-zA-Z0-9-_/.]+\\.[a-z]+:[0-9]+)", -1)
+	re = strings.ReplaceAll(re, "{{ADDR}}", "0x[0-9a-f]+")
+	re = strings.ReplaceAll(re, "{{PC}}", "\\[\\<?(?:0x)?[0-9a-f]+\\>?\\]")
+	re = strings.ReplaceAll(re, "{{FUNC}}", "([a-zA-Z0-9_]+)(?:\\.|\\+)")
+	re = strings.ReplaceAll(re, "{{SRC}}", "([a-zA-Z0-9-_/.]+\\.[a-z]+:[0-9]+)")
+	re = strings.ReplaceAll(re, "{{TASK}}", `[\s\S]{0,100}?`)
 	return regexp.MustCompile(re)
 }
 
@@ -454,26 +518,38 @@ func extractDescription(output []byte, oops *oops, params *stackParams) (
 				continue
 			}
 		}
-		var args []interface{}
+		var argPrefix []any
 		for i := 2; i < len(match); i += 2 {
-			args = append(args, string(output[match[i]:match[i+1]]))
+			argPrefix = append(argPrefix, string(output[match[i]:match[i+1]]))
 		}
+		var frames []extractedFrame
 		corrupted = ""
 		if f.stack != nil {
-			frame := ""
-			frame, corrupted = extractStackFrame(params, f.stack, output[match[0]:])
-			if frame == "" {
-				frame = "corrupted"
-				if corrupted == "" {
-					corrupted = "extracted no stack frame"
-				}
+			var ok bool
+			frames, ok = extractStackFrame(params, f.stack, output[match[0]:])
+			if !ok {
+				corrupted = corruptedNoFrames
 			}
-			args = append(args, frame)
 		}
+		args := canonicalArgs(argPrefix, frames)
 		desc = fmt.Sprintf(f.fmt, args...)
 		for _, alt := range f.alt {
 			altTitles = append(altTitles, fmt.Sprintf(alt, args...))
 		}
+
+		// Also consider partially stripped prefixes - these will help us
+		// better deduplicate the reports.
+		argSequences := partiallyStrippedArgs(argPrefix, frames, params)
+		for _, args := range argSequences {
+			altTitle := fmt.Sprintf(f.fmt, args...)
+			if altTitle != desc {
+				altTitles = append(altTitles, altTitle)
+			}
+			for _, alt := range f.alt {
+				altTitles = append(altTitles, fmt.Sprintf(alt, args...))
+			}
+		}
+		altTitles = uniqueStrings(altTitles)
 		format = f
 	}
 	if desc == "" {
@@ -516,40 +592,100 @@ type stackParams struct {
 	stripFramePrefixes []string
 }
 
-func extractStackFrame(params *stackParams, stack *stackFmt, output []byte) (string, string) {
-	skip := append([]string{}, params.skipPatterns...)
+func (sp *stackParams) stripFrames(frames []string) []string {
+	var ret []string
+	for _, origFrame := range frames {
+		// Pick the shortest one.
+		frame := origFrame
+		for _, prefix := range sp.stripFramePrefixes {
+			newFrame := strings.TrimPrefix(origFrame, prefix)
+			if len(newFrame) < len(frame) {
+				frame = newFrame
+			}
+		}
+		ret = append(ret, frame)
+	}
+	return ret
+}
+
+type extractedFrame struct {
+	canonical string
+	raw       string
+}
+
+func extractStackFrame(params *stackParams, stack *stackFmt, output []byte) ([]extractedFrame, bool) {
+	skip := slices.Clone(params.skipPatterns)
 	skip = append(skip, stack.skip...)
 	var skipRe *regexp.Regexp
 	if len(skip) != 0 {
 		skipRe = regexp.MustCompile(strings.Join(skip, "|"))
 	}
-	extractor := stack.extractor
-	if extractor == nil {
-		extractor = func(frames []string) (string, string) {
-			return frames[0], ""
+	extractor := func(rawFrames []string) extractedFrame {
+		if len(rawFrames) == 0 {
+			return extractedFrame{}
 		}
+		stripped := params.stripFrames(rawFrames)
+		if stack.extractor == nil {
+			return extractedFrame{stripped[0], rawFrames[0]}
+		}
+		frame, idx := stack.extractor(stripped)
+		if frame != "" {
+			return extractedFrame{frame, rawFrames[idx]}
+		}
+		return extractedFrame{}
 	}
-	frame, corrupted := extractStackFrameImpl(params, output, skipRe, stack.parts, extractor)
-	if frame != "" || len(stack.parts2) == 0 {
-		return frame, corrupted
+	frames, ok := extractStackFrameImpl(params, output, skipRe, stack.parts, extractor)
+	if ok || len(stack.parts2) == 0 {
+		return frames, ok
 	}
 	return extractStackFrameImpl(params, output, skipRe, stack.parts2, extractor)
 }
 
+func lines(text []byte) [][]byte {
+	return bytes.Split(text, []byte("\n"))
+}
+
 func extractStackFrameImpl(params *stackParams, output []byte, skipRe *regexp.Regexp,
-	parts []*regexp.Regexp, extractor frameExtractor) (string, string) {
-	s := bufio.NewScanner(bytes.NewReader(output))
-	var frames []string
+	parts []*regexp.Regexp, extractor func([]string) extractedFrame) ([]extractedFrame, bool) {
+	lines := lines(output)
+	var rawFrames []string
+	var results []extractedFrame
+	ok := true
+	numStackTraces := 0
 nextPart:
-	for _, part := range parts {
+	for partIdx := 0; ; partIdx++ {
+		if partIdx == len(parts) || parts[partIdx] == parseStackTrace && numStackTraces > 0 {
+			keyFrame := extractor(rawFrames)
+			if keyFrame.canonical == "" {
+				keyFrame, ok = extractedFrame{"corrupted", "corrupted"}, false
+			}
+			results = append(results, keyFrame)
+			rawFrames = nil
+		}
+		if partIdx == len(parts) {
+			break
+		}
+		part := parts[partIdx]
 		if part == parseStackTrace {
-			for s.Scan() {
-				ln := s.Bytes()
+			numStackTraces++
+			var ln []byte
+			for len(lines) > 0 {
+				ln, lines = lines[0], lines[1:]
 				if matchesAny(ln, params.corruptedLines) {
-					break nextPart
+					ok = false
+					continue nextPart
 				}
 				if matchesAny(ln, params.stackStartRes) {
 					continue nextPart
+				}
+
+				if partIdx != len(parts)-1 {
+					match := parts[partIdx+1].FindSubmatch(ln)
+					if match != nil {
+						rawFrames = appendStackFrame(rawFrames, match, skipRe)
+						partIdx++
+						continue nextPart
+					}
 				}
 				var match [][]byte
 				for _, re := range params.frameRes {
@@ -558,44 +694,92 @@ nextPart:
 						break
 					}
 				}
-				frames = appendStackFrame(frames, match, params, skipRe)
+				rawFrames = appendStackFrame(rawFrames, match, skipRe)
 			}
 		} else {
-			for s.Scan() {
-				ln := s.Bytes()
+			var ln []byte
+			for len(lines) > 0 {
+				ln, lines = lines[0], lines[1:]
 				if matchesAny(ln, params.corruptedLines) {
-					break nextPart
+					ok = false
+					continue nextPart
 				}
 				match := part.FindSubmatch(ln)
 				if match == nil {
 					continue
 				}
-				frames = appendStackFrame(frames, match, params, skipRe)
+				rawFrames = appendStackFrame(rawFrames, match, skipRe)
 				break
 			}
 		}
 	}
-	if len(frames) == 0 {
-		return "", corruptedNoFrames
-	}
-	return extractor(frames)
+	return results, ok
 }
 
-func appendStackFrame(frames []string, match [][]byte, params *stackParams, skipRe *regexp.Regexp) []string {
+func appendStackFrame(frames []string, match [][]byte, skipRe *regexp.Regexp) []string {
 	if len(match) < 2 {
 		return frames
 	}
 	for _, frame := range match[1:] {
-		if frame != nil && (skipRe == nil || !skipRe.Match(frame)) {
-			frameName := string(frame)
-			for _, prefix := range params.stripFramePrefixes {
-				frameName = strings.TrimPrefix(frameName, prefix)
-			}
-			frames = append(frames, frameName)
-			break
+		if frame == nil {
+			continue
+		}
+		frame := demangle.Filter(string(frame), demangle.NoParams)
+		if skipRe == nil || !skipRe.MatchString(frame) {
+			frames = append(frames, frame)
 		}
 	}
 	return frames
+}
+
+func canonicalArgs(prefix []any, frames []extractedFrame) []any {
+	ret := slices.Clone(prefix)
+	for _, frame := range frames {
+		ret = append(ret, frame.canonical)
+	}
+	return ret
+}
+
+func partiallyStrippedArgs(prefix []any, frames []extractedFrame, params *stackParams) [][]any {
+	if params == nil {
+		return nil
+	}
+	ret := [][]any{}
+	for i := 0; i <= len(params.stripFramePrefixes); i++ {
+		var list []any
+		add := true
+
+		// Also include the raw frames.
+		stripPrefix := ""
+		if i > 0 {
+			stripPrefix, add = params.stripFramePrefixes[i-1], false
+		}
+		for _, frame := range frames {
+			trimmed := strings.TrimPrefix(frame.raw, stripPrefix)
+			if trimmed != frame.raw {
+				add = true
+			}
+			list = append(list, trimmed)
+		}
+		if add {
+			list = append(slices.Clone(prefix), list...)
+			ret = append(ret, list)
+		}
+	}
+	return ret
+}
+
+func uniqueStrings(source []string) []string {
+	dup := map[string]struct{}{}
+	var ret []string
+	for _, item := range source {
+		if _, ok := dup[item]; ok {
+			continue
+		}
+		dup[item] = struct{}{}
+		ret = append(ret, item)
+	}
+	return ret
 }
 
 func simpleLineParser(output []byte, oopses []*oops, params *stackParams, ignores []*regexp.Regexp) *Report {
@@ -633,12 +817,22 @@ func simpleLineParser(output []byte, oopses []*oops, params *stackParams, ignore
 	rep.Report = output[rep.StartPos:]
 	rep.Corrupted = corrupted != ""
 	rep.CorruptedReason = corrupted
+	rep.Type = crash.TitleToType(rep.Title)
 	return rep
 }
 
 func matchesAny(line []byte, res []*regexp.Regexp) bool {
 	for _, re := range res {
 		if re.Match(line) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesAnyString(str string, res []*regexp.Regexp) bool {
+	for _, re := range res {
+		if re.MatchString(str) {
 			return true
 		}
 	}
@@ -659,9 +853,30 @@ func replace(where []byte, start, end int, what []byte) []byte {
 	return where
 }
 
+// Truncate leaves up to `begin` bytes at the beginning of log and
+// up to `end` bytes at the end of the log.
+func Truncate(log []byte, begin, end int) []byte {
+	if begin+end >= len(log) {
+		return log
+	}
+	var b bytes.Buffer
+	b.Write(log[:begin])
+	if begin > 0 {
+		b.WriteString("\n\n")
+	}
+	fmt.Fprintf(&b, "<<cut %d bytes out>>",
+		len(log)-begin-end,
+	)
+	if end > 0 {
+		b.WriteString("\n\n")
+	}
+	b.Write(log[len(log)-end:])
+	return b.Bytes()
+}
+
 var (
 	filenameRe    = regexp.MustCompile(`([a-zA-Z0-9_\-\./]*[a-zA-Z0-9_\-]+\.(c|h)):[0-9]+`)
-	reportFrameRe = regexp.MustCompile(`.* in ([a-zA-Z0-9_]+)`)
+	reportFrameRe = regexp.MustCompile(`.* in ((?:<[a-zA-Z0-9_: ]+>)?[a-zA-Z0-9_:]+)`)
 )
 
 // These are produced by syzkaller itself.
@@ -674,6 +889,19 @@ var commonOopses = []*oops{
 			{
 				title:        compile("SYZFAIL:(.*)"),
 				fmt:          "SYZFAIL:%[1]v",
+				noStackTrace: true,
+			},
+		},
+		[]*regexp.Regexp{},
+	},
+	{
+		// Errors produced by log.Fatal functions.
+		[]byte("SYZFATAL:"),
+		[]oopsFormat{
+			{
+				title:        compile("SYZFATAL:(.*)()"),
+				alt:          []string{"SYZFATAL%[2]s"},
+				fmt:          "SYZFATAL:%[1]v",
 				noStackTrace: true,
 			},
 		},
@@ -703,4 +931,34 @@ var commonOopses = []*oops{
 			compile(`evtlog_status:`),
 		},
 	},
+}
+
+var groupGoRuntimeErrors = oops{
+	[]byte("fatal error:"),
+	[]oopsFormat{
+		{
+			title:        compile("fatal error:"),
+			fmt:          "go runtime error",
+			noStackTrace: true,
+		},
+	},
+	[]*regexp.Regexp{
+		compile("ALSA"),
+		compile("fatal error: cannot create timer"),
+	},
+}
+
+const reportSeparator = "\n<<<<<<<<<<<<<<< tail report >>>>>>>>>>>>>>>\n\n"
+
+func MergeReportBytes(reps []*Report) []byte {
+	var res []byte
+	for _, rep := range reps {
+		res = append(res, rep.Report...)
+		res = append(res, []byte(reportSeparator)...)
+	}
+	return res
+}
+
+func SplitReportBytes(data []byte) [][]byte {
+	return bytes.Split(data, []byte(reportSeparator))
 }

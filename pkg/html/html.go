@@ -1,32 +1,60 @@
 // Copyright 2018 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-//go:generate ./gen.sh
-
+// Package html provides HTML formatting and template execution helpers for the dashboard UI.
 package html
 
 import (
 	"fmt"
 	"html/template"
+	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	texttemplate "text/template"
 	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
+	"github.com/google/syzkaller/pkg/vcs"
+	"google.golang.org/appengine/v2"
 )
 
-func CreatePage(page string) *template.Template {
-	const headTempl = `<style type="text/css" media="screen">%v</style><script>%v</script>`
-	page = strings.Replace(page, "{{HEAD}}", fmt.Sprintf(headTempl, style, js), 1)
-	return template.Must(template.New("").Funcs(Funcs).Parse(page))
+// search path differs for the tests and AppEngine because we don't follow
+// the recommended folder structure (my best guess).
+// When you run the dashboard/app tests, CWD is syzkaller/dashboard/app.
+// When you deploy AppEngine in the GOPATH mode, CWD is syzkaller/dashboard/app.
+// When you deploy AppEngine in the  GOMOD, CWD is syzkaller/.
+var globSearchPath = func() string {
+	if appengine.IsAppEngine() {
+		return "dashboard/app/templates/"
+	}
+	return "templates/"
+}()
+
+// SetGlobSearchPath overrides the default path where syzkaller looks for templates.
+func SetGlobSearchPath(path string) {
+	globSearchPath = path
+}
+
+func init() {
+	// Used externally - do not remove.
+	runtime.KeepAlive(SetGlobSearchPath)
 }
 
 func CreateGlob(glob string) *template.Template {
-	return template.Must(template.New("").Funcs(Funcs).ParseGlob(glob))
+	if strings.Contains(glob, string(filepath.Separator)) {
+		panic("glob can't be a path, the files mask is expected")
+	}
+	return template.Must(
+		template.New("").Funcs(Funcs).ParseGlob(filepath.Join(globSearchPath, glob)))
 }
 
 func CreateTextGlob(glob string) *texttemplate.Template {
-	return texttemplate.Must(texttemplate.New("").Funcs(texttemplate.FuncMap(Funcs)).ParseGlob(glob))
+	if strings.Contains(glob, string(filepath.Separator)) {
+		panic("glob can't be a path, the files mask is expected")
+	}
+	return texttemplate.Must(
+		texttemplate.New("").Funcs(Funcs).ParseGlob(filepath.Join(globSearchPath, glob)))
 }
 
 var Funcs = template.FuncMap{
@@ -39,13 +67,15 @@ var Funcs = template.FuncMap{
 	"formatClock":            formatClock,
 	"formatDuration":         formatDuration,
 	"formatLateness":         formatLateness,
-	"formatReproLevel":       formatReproLevel,
+	"formatRepro":            formatRepro,
 	"formatStat":             formatStat,
 	"formatShortHash":        formatShortHash,
 	"formatTagHash":          formatTagHash,
 	"formatCommitTableTitle": formatCommitTableTitle,
 	"formatList":             formatStringList,
 	"selectBisect":           selectBisect,
+	"dereference":            dereferencePointer,
+	"commitLink":             commitLink,
 }
 
 func selectBisect(rep *dashapi.BugReport) *dashapi.BisectResult {
@@ -58,7 +88,7 @@ func selectBisect(rep *dashapi.BugReport) *dashapi.BisectResult {
 func link(url, text string) template.HTML {
 	text = template.HTMLEscapeString(text)
 	if url != "" {
-		text = fmt.Sprintf(`<a href="%v">%v</a>`, url, text)
+		text = fmt.Sprintf(`<a href="%v">%v</a>`, template.HTMLEscapeString(url), text)
 	}
 	return template.HTML(text)
 }
@@ -131,15 +161,17 @@ func formatLateness(now, t time.Time) string {
 	return formatDuration(d)
 }
 
-func formatReproLevel(l dashapi.ReproLevel) string {
-	switch l {
-	case dashapi.ReproLevelSyz:
-		return "syz"
-	case dashapi.ReproLevelC:
-		return "C"
-	default:
-		return ""
+func formatRepro(hasC, hasSyz bool) string {
+	if hasC && hasSyz {
+		return "syz, C"
 	}
+	if hasC {
+		return "C"
+	}
+	if hasSyz {
+		return "syz"
+	}
+	return ""
 }
 
 func formatStat(v int64) string {
@@ -179,4 +211,19 @@ func formatCommitTableTitle(v string) string {
 
 func formatStringList(list []string) string {
 	return strings.Join(list, ", ")
+}
+
+func dereferencePointer(v any) any {
+	reflectValue := reflect.ValueOf(v)
+	if !reflectValue.IsNil() && reflectValue.Kind() == reflect.Ptr {
+		elem := reflectValue.Elem()
+		if elem.CanInterface() {
+			return elem.Interface()
+		}
+	}
+	return v
+}
+
+func commitLink(repo, commit string) string {
+	return vcs.CommitLink(repo, commit)
 }

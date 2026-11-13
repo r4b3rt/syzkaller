@@ -4,16 +4,20 @@
 package mgrconfig
 
 import (
+	"bytes"
 	"fmt"
-	"io/ioutil"
+	"maps"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/google/syzkaller/pkg/config"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys" // most mgrconfig users want targets too
 	"github.com/google/syzkaller/sys/targets"
@@ -30,12 +34,19 @@ type Derived struct {
 	TargetVMArch string
 
 	// Full paths to binaries we are going to use:
-	FuzzerBin   string
 	ExecprogBin string
 	ExecutorBin string
 
-	Syscalls []int
-	Timeouts targets.Timeouts
+	Syscalls      []int
+	NoMutateCalls map[int]bool // Set of IDs of syscalls which should not be mutated.
+	Timeouts      targets.Timeouts
+
+	// Special debugging/development mode specified by VM type "none".
+	// In this mode syz-manager does not start any VMs, but instead a user is supposed
+	// to start syz-executor process in a VM manually.
+	VMLess bool
+
+	LocalModules []*vminfo.KernelModule
 }
 
 func LoadData(data []byte) (*Config, error) {
@@ -61,48 +72,73 @@ func LoadFile(filename string) (*Config, error) {
 }
 
 func LoadPartialData(data []byte) (*Config, error) {
-	cfg := defaultValues()
+	cfg := DefaultValues()
 	if err := config.LoadData(data, cfg); err != nil {
 		return nil, err
 	}
-	return loadPartial(cfg)
+	if err := SetTargets(cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 func LoadPartialFile(filename string) (*Config, error) {
-	cfg := defaultValues()
+	cfg := DefaultValues()
 	if err := config.LoadFile(filename, cfg); err != nil {
 		return nil, err
 	}
-	return loadPartial(cfg)
-}
-
-func defaultValues() *Config {
-	return &Config{
-		SSHUser:      "root",
-		Cover:        true,
-		Reproduce:    true,
-		Sandbox:      "none",
-		RPC:          ":0",
-		MaxCrashLogs: 100,
-		Procs:        6,
-	}
-}
-
-func loadPartial(cfg *Config) (*Config, error) {
-	var err error
-	cfg.TargetOS, cfg.TargetVMArch, cfg.TargetArch, err = splitTarget(cfg.RawTarget)
-	if err != nil {
+	if err := SetTargets(cfg); err != nil {
 		return nil, err
-	}
-	cfg.Target, err = prog.GetTarget(cfg.TargetOS, cfg.TargetArch)
-	if err != nil {
-		return nil, err
-	}
-	cfg.SysTarget = targets.Get(cfg.TargetOS, cfg.TargetVMArch)
-	if cfg.SysTarget == nil {
-		return nil, fmt.Errorf("unsupported OS/arch: %v/%v", cfg.TargetOS, cfg.TargetVMArch)
 	}
 	return cfg, nil
+}
+
+func DefaultValues() *Config {
+	return &Config{
+		SSHUser:        "root",
+		Cover:          true,
+		Reproduce:      true,
+		Sandbox:        "none",
+		RPC:            ":0",
+		MaxCrashLogs:   100,
+		Procs:          6,
+		PreserveCorpus: true,
+		RunFsck:        true,
+		Experimental: Experimental{
+			RemoteCover:      true,
+			CoverEdges:       true,
+			DescriptionsMode: ManualDescriptionsMode,
+		},
+	}
+}
+
+type DescriptionsMode int
+
+const (
+	ManualDescriptions = 1 << iota
+	AutoDescriptions
+	SnapshotDescriptions
+
+	AnyDescriptions = ManualDescriptions | AutoDescriptions
+)
+
+const (
+	ManualDescriptionsMode = "manual"
+	AutoDescriptionsMode   = "auto"
+	AnyDescriptionsMode    = "any"
+)
+
+var strToDescriptionsMode = map[string]DescriptionsMode{
+	ManualDescriptionsMode: ManualDescriptions,
+	AutoDescriptionsMode:   AutoDescriptions,
+	AnyDescriptionsMode:    AnyDescriptions,
+}
+
+func SetTargets(cfg *Config) error {
+	var err error
+	cfg.TargetOS, cfg.TargetVMArch, cfg.TargetArch, cfg.Target, cfg.SysTarget,
+		err = SplitTarget(cfg.RawTarget)
+	return err
 }
 
 func Complete(cfg *Config) error {
@@ -112,7 +148,6 @@ func Complete(cfg *Config) error {
 		cfg.TargetArch, "target",
 		cfg.Workdir, "workdir",
 		cfg.Syzkaller, "syzkaller",
-		cfg.HTTP, "http",
 		cfg.Type, "type",
 		cfg.SSHUser, "ssh_user",
 	); err != nil {
@@ -121,8 +156,8 @@ func Complete(cfg *Config) error {
 	cfg.Workdir = osutil.Abs(cfg.Workdir)
 	if cfg.WorkdirTemplate != "" {
 		cfg.WorkdirTemplate = osutil.Abs(cfg.WorkdirTemplate)
-		if _, err := ioutil.ReadDir(cfg.WorkdirTemplate); err != nil {
-			return fmt.Errorf("failed to read workdir_template: %v", err)
+		if _, err := os.ReadDir(cfg.WorkdirTemplate); err != nil {
+			return fmt.Errorf("failed to read workdir_template: %w", err)
 		}
 	}
 	if cfg.Image != "" {
@@ -142,11 +177,55 @@ func Complete(cfg *Config) error {
 	default:
 		return fmt.Errorf("config param sandbox must contain one of none/setuid/namespace/android")
 	}
+	if err := cfg.completeHTTPPublicURL(); err != nil {
+		return err
+	}
 	if err := cfg.checkSSHParams(); err != nil {
 		return err
 	}
 	cfg.CompleteKernelDirs()
 
+	if err := cfg.completeServices(); err != nil {
+		return nil
+	}
+
+	if cfg.FuzzingVMs < 0 {
+		return fmt.Errorf("fuzzing_vms cannot be less than 0")
+	}
+
+	descriptionsMode, ok := strToDescriptionsMode[cfg.Experimental.DescriptionsMode]
+	if !ok {
+		allowed := slices.Sorted(maps.Keys(strToDescriptionsMode))
+		return fmt.Errorf("invalid descriptions_mode %q, must be one of: %s",
+			cfg.Experimental.DescriptionsMode, strings.Join(allowed, ", "))
+	}
+	if cfg.Snapshot {
+		descriptionsMode |= SnapshotDescriptions
+	}
+	var err error
+	cfg.Syscalls, err = ParseEnabledSyscalls(cfg.Target, cfg.EnabledSyscalls, cfg.DisabledSyscalls,
+		descriptionsMode)
+	if err != nil {
+		return err
+	}
+	cfg.NoMutateCalls, err = ParseNoMutateSyscalls(cfg.Target, cfg.NoMutateSyscalls)
+	if err != nil {
+		return err
+	}
+	if err := cfg.completeFocusAreas(); err != nil {
+		return err
+	}
+	cfg.initTimeouts()
+	cfg.VMLess = cfg.Type == "none"
+
+	if cfg.VMLess && cfg.Reproduce {
+		return fmt.Errorf("if config param type is none, reproduce must be false")
+	}
+
+	return nil
+}
+
+func (cfg *Config) completeServices() error {
 	if cfg.HubClient != "" {
 		if err := checkNonEmpty(
 			cfg.Name, "name",
@@ -167,27 +246,30 @@ func Complete(cfg *Config) error {
 			return err
 		}
 	}
-	if cfg.FuzzingVMs < 0 {
-		return fmt.Errorf("fuzzing_vms cannot be less than 0")
+	if !cfg.AssetStorage.IsEmpty() {
+		if cfg.DashboardClient == "" {
+			return fmt.Errorf("asset storage also requires dashboard client")
+		}
+		if err := cfg.AssetStorage.Validate(); err != nil {
+			return err
+		}
 	}
-
-	var err error
-	cfg.Syscalls, err = ParseEnabledSyscalls(cfg.Target, cfg.EnabledSyscalls, cfg.DisabledSyscalls)
-	if err != nil {
-		return err
-	}
-	cfg.initTimeouts()
 	return nil
 }
 
 func (cfg *Config) initTimeouts() {
 	slowdown := 1
 	switch {
+	case cfg.Type == "qemu" && (runtime.GOARCH == cfg.SysTarget.Arch || runtime.GOARCH == cfg.SysTarget.VMArch):
+		// If TCG is enabled for QEMU, increase the slowdown.
+		if bytes.Contains(cfg.VM, []byte("-accel tcg")) {
+			slowdown = 10
+		}
 	case cfg.Type == "qemu" && runtime.GOARCH != cfg.SysTarget.Arch && runtime.GOARCH != cfg.SysTarget.VMArch:
 		// Assuming qemu emulation.
 		// Quick tests of mmap syscall on arm64 show ~9x slowdown.
 		slowdown = 10
-	case cfg.Type == "gvisor" && cfg.Cover && strings.Contains(cfg.Name, "-race"):
+	case cfg.Type == targets.GVisor && cfg.Cover && strings.Contains(cfg.Name, "-race"):
 		// Go coverage+race has insane slowdown of ~350x. We can't afford such large value,
 		// but a smaller value should be enough to finish at least some syscalls.
 		// Note: the name check is a hack.
@@ -206,6 +288,29 @@ func checkNonEmpty(fields ...string) error {
 	return nil
 }
 
+// completeHTTPPublicURL validates the http_public_url config param and normalizes it
+// (e.g. escapes special characters in the path).
+func (cfg *Config) completeHTTPPublicURL() error {
+	if cfg.HTTPPublicURL == "" {
+		return nil
+	}
+	u, err := url.Parse(cfg.HTTPPublicURL)
+	if err != nil {
+		return fmt.Errorf("bad config param http_public_url: %w", err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil ||
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return fmt.Errorf("bad config param http_public_url: %q, want http(s)://host[:port][/path]",
+			cfg.HTTPPublicURL)
+	}
+	cfg.HTTPPublicURL = u.String()
+	return nil
+}
+
+func (cov *CovFilterCfg) Empty() bool {
+	return len(cov.Functions)+len(cov.Files)+len(cov.RawPCs) == 0
+}
+
 func (cfg *Config) CompleteKernelDirs() {
 	cfg.KernelObj = osutil.Abs(cfg.KernelObj)
 	if cfg.KernelSrc == "" {
@@ -216,6 +321,20 @@ func (cfg *Config) CompleteKernelDirs() {
 		cfg.KernelBuildSrc = cfg.KernelSrc
 	}
 	cfg.KernelBuildSrc = osutil.Abs(cfg.KernelBuildSrc)
+}
+
+type KernelDirs struct {
+	Src      string
+	Obj      string
+	BuildSrc string
+}
+
+func (cfg *Config) KernelDirs() *KernelDirs {
+	return &KernelDirs{
+		Src:      cfg.KernelSrc,
+		Obj:      cfg.KernelObj,
+		BuildSrc: cfg.KernelBuildSrc,
+	}
 }
 
 func (cfg *Config) checkSSHParams() error {
@@ -239,49 +358,121 @@ func (cfg *Config) completeBinaries() error {
 	targetBin := func(name, arch string) string {
 		return filepath.Join(cfg.Syzkaller, "bin", cfg.TargetOS+"_"+arch, name+exe)
 	}
-	cfg.FuzzerBin = targetBin("syz-fuzzer", cfg.TargetVMArch)
 	cfg.ExecprogBin = targetBin("syz-execprog", cfg.TargetVMArch)
 	cfg.ExecutorBin = targetBin("syz-executor", cfg.TargetArch)
-	// If the target already provides an executor binary, we don't need to copy it.
+
+	if cfg.ExecprogBinOnTarget != "" {
+		cfg.SysTarget.ExecprogBin = cfg.ExecprogBinOnTarget
+	}
+	if cfg.ExecutorBinOnTarget != "" {
+		cfg.SysTarget.ExecutorBin = cfg.ExecutorBinOnTarget
+	}
+	if cfg.StraceBinOnTarget && cfg.StraceBin == "" {
+		cfg.StraceBin = "strace"
+	}
+
+	// If the target already provides binaries, we don't need to copy them.
+	if cfg.SysTarget.ExecprogBin != "" {
+		cfg.ExecprogBin = ""
+	}
 	if cfg.SysTarget.ExecutorBin != "" {
 		cfg.ExecutorBin = ""
 	}
-	if !osutil.IsExist(cfg.FuzzerBin) {
-		return fmt.Errorf("bad config syzkaller param: can't find %v", cfg.FuzzerBin)
-	}
-	if !osutil.IsExist(cfg.ExecprogBin) {
+	if cfg.ExecprogBin != "" && !osutil.IsExist(cfg.ExecprogBin) {
 		return fmt.Errorf("bad config syzkaller param: can't find %v", cfg.ExecprogBin)
 	}
 	if cfg.ExecutorBin != "" && !osutil.IsExist(cfg.ExecutorBin) {
 		return fmt.Errorf("bad config syzkaller param: can't find %v", cfg.ExecutorBin)
 	}
+	if !cfg.StraceBinOnTarget && cfg.StraceBin != "" {
+		if !osutil.IsExist(cfg.StraceBin) {
+			return fmt.Errorf("bad config param strace_bin: can't find %v", cfg.StraceBin)
+		}
+		cfg.StraceBin = osutil.Abs(cfg.StraceBin)
+	}
 	return nil
 }
 
-func splitTarget(target string) (string, string, string, error) {
-	if target == "" {
-		return "", "", "", fmt.Errorf("target is empty")
+func (cfg *Config) completeFocusAreas() error {
+	names := map[string]bool{}
+	seenEmptyFilter := false
+	for i, area := range cfg.Experimental.FocusAreas {
+		if area.Name != "" {
+			if names[area.Name] {
+				return fmt.Errorf("duplicate focus area name: %q", area.Name)
+			}
+			names[area.Name] = true
+		}
+		if area.Weight <= 0 {
+			return fmt.Errorf("focus area #%d: negative weight", i)
+		}
+		if area.Filter.Empty() {
+			if seenEmptyFilter {
+				return fmt.Errorf("there must be only one focus area with an empty filter")
+			}
+			seenEmptyFilter = true
+		}
 	}
-	targetParts := strings.Split(target, "/")
+	if !cfg.CovFilter.Empty() {
+		if len(cfg.Experimental.FocusAreas) > 0 {
+			return fmt.Errorf("you cannot use both cov_filter and focus_areas")
+		}
+		cfg.Experimental.FocusAreas = []FocusArea{
+			{
+				Name:   "filtered",
+				Filter: cfg.CovFilter,
+				Weight: 1.0,
+			},
+		}
+		cfg.CovFilter = CovFilterCfg{}
+	}
+	return nil
+}
+
+func SplitTarget(str string) (os, vmarch, arch string, target *prog.Target, sysTarget *targets.Target, err error) {
+	if str == "" {
+		err = fmt.Errorf("target is empty")
+		return
+	}
+	targetParts := strings.Split(str, "/")
 	if len(targetParts) != 2 && len(targetParts) != 3 {
-		return "", "", "", fmt.Errorf("bad config param target")
+		err = fmt.Errorf("bad config param target")
+		return
 	}
-	os := targetParts[0]
-	vmarch := targetParts[1]
-	arch := targetParts[1]
+	os = targetParts[0]
+	vmarch = targetParts[1]
+	arch = targetParts[1]
 	if len(targetParts) == 3 {
 		arch = targetParts[2]
 	}
-	return os, vmarch, arch, nil
+	sysTarget = targets.Get(os, vmarch)
+	if sysTarget == nil {
+		err = fmt.Errorf("unsupported OS/arch: %v/%v", os, vmarch)
+		return
+	}
+	target, err = prog.GetTarget(os, arch)
+	return
 }
 
-func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string) ([]int, error) {
+func FormatTarget(os, vmArch, arch string) string {
+	if vmArch == "" || vmArch == arch {
+		return os + "/" + arch
+	}
+	return os + "/" + vmArch + "/" + arch
+}
+
+func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string,
+	descriptionsMode DescriptionsMode) ([]int, error) {
 	syscalls := make(map[int]bool)
 	if len(enabled) != 0 {
 		for _, c := range enabled {
 			n := 0
 			for _, call := range target.Syscalls {
-				if MatchSyscall(call.Name, c) {
+				if !MatchSyscall(call.Name, c) {
+					continue
+				}
+				// Skip snapshot attr check for the calls that match exactly.
+				if checkMode(call, descriptionsMode, call.Name != c) {
 					syscalls[call.ID] = true
 					n++
 				}
@@ -292,6 +483,9 @@ func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string) ([]in
 		}
 	} else {
 		for _, call := range target.Syscalls {
+			if !checkMode(call, descriptionsMode, true) {
+				continue
+			}
 			syscalls[call.ID] = true
 		}
 	}
@@ -320,6 +514,43 @@ func ParseEnabledSyscalls(target *prog.Target, enabled, disabled []string) ([]in
 		arr = append(arr, id)
 	}
 	return arr, nil
+}
+
+func checkMode(syscall *prog.Syscall, descriptionsMode DescriptionsMode,
+	checkSnapshot bool) bool {
+	if syscall.Attrs.Automatic &&
+		(descriptionsMode&AutoDescriptions) == 0 {
+		return false
+	}
+	if !syscall.Attrs.Automatic &&
+		!syscall.Attrs.AutomaticHelper &&
+		(descriptionsMode&ManualDescriptions) == 0 {
+		return false
+	}
+	if checkSnapshot && syscall.Attrs.Snapshot &&
+		(descriptionsMode&SnapshotDescriptions) == 0 {
+		return false
+	}
+	return true
+}
+
+func ParseNoMutateSyscalls(target *prog.Target, syscalls []string) (map[int]bool, error) {
+	var result = make(map[int]bool)
+
+	for _, c := range syscalls {
+		n := 0
+		for _, call := range target.Syscalls {
+			if MatchSyscall(call.Name, c) {
+				result[call.ID] = true
+				n++
+			}
+		}
+		if n == 0 {
+			return nil, fmt.Errorf("unknown no_mutate syscall: %v", c)
+		}
+	}
+
+	return result, nil
 }
 
 func MatchSyscall(name, pattern string) bool {

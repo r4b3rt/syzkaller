@@ -9,9 +9,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/sys/targets"
 )
 
 type Flag struct {
@@ -50,6 +52,30 @@ func ParseFlags(set *flag.FlagSet, args []string) error {
 	return nil
 }
 
+func ParseArchList(OS, archList string) ([]string, error) {
+	allArches := targets.List[OS]
+	if allArches == nil {
+		return nil, fmt.Errorf("bad OS %q", OS)
+	}
+	archMap := make(map[string]bool)
+	if archList != "" {
+		for arch := range strings.SplitSeq(archList, ",") {
+			if allArches[arch] == nil {
+				return nil, fmt.Errorf("bad arch %q for OS %q in arches flag", arch, OS)
+			}
+			archMap[arch] = true
+		}
+	}
+	var arches []string
+	for arch := range allArches {
+		if len(archMap) == 0 || archMap[arch] {
+			arches = append(arches, arch)
+		}
+	}
+	slices.Sort(arches)
+	return arches, nil
+}
+
 const optionalFlag = "optional"
 
 func serializeFlags(flags []Flag) string {
@@ -68,18 +94,18 @@ func deserializeFlags(value string) ([]Flag, error) {
 		return nil, nil
 	}
 	var flags []Flag
-	for _, arg := range strings.Split(value, ":") {
-		eq := strings.IndexByte(arg, '=')
-		if eq == -1 {
+	for arg := range strings.SplitSeq(value, ":") {
+		before, after, ok := strings.Cut(arg, "=")
+		if !ok {
 			return nil, fmt.Errorf("failed to parse flags %q: no eq", value)
 		}
-		name, err := flagUnescape(arg[:eq])
+		name, err := flagUnescape(before)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse flags %q: %v", value, err)
+			return nil, fmt.Errorf("failed to parse flags %q: %w", value, err)
 		}
-		value, err := flagUnescape(arg[eq+1:])
+		value, err := flagUnescape(after)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse flags %q: %v", value, err)
+			return nil, fmt.Errorf("failed to parse flags %q: %w", value, err)
 		}
 		flags = append(flags, Flag{name, value})
 	}
@@ -88,7 +114,7 @@ func deserializeFlags(value string) ([]Flag, error) {
 
 func flagEscape(s string) string {
 	buf := new(bytes.Buffer)
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		ch := s[i]
 		if ch <= 0x20 || ch >= 0x7f || ch == ':' || ch == '=' || ch == '\\' {
 			buf.Write([]byte{'\\', 'x'})
@@ -102,7 +128,7 @@ func flagEscape(s string) string {
 
 func flagUnescape(s string) (string, error) {
 	buf := new(bytes.Buffer)
-	for i := 0; i < len(s); i++ {
+	for i := 0; i < len(s); {
 		ch := s[i]
 		if ch <= 0x20 || ch >= 0x7f || ch == ':' || ch == '=' {
 			return "", fmt.Errorf("unescaped char %v", ch)
@@ -116,10 +142,11 @@ func flagUnescape(s string) (string, error) {
 				return "", err
 			}
 			buf.WriteByte(res[0])
-			i += 3
+			i += 4
 			continue
 		}
 		buf.WriteByte(ch)
+		i++
 	}
 	return buf.String(), nil
 }
@@ -139,7 +166,7 @@ func (cfgs *CfgsFlag) Set(value string) error {
 	if len(*cfgs) > 0 {
 		return errors.New("configs flag were already set")
 	}
-	for _, cfg := range strings.Split(value, ",") {
+	for cfg := range strings.SplitSeq(value, ",") {
 		cfg = strings.TrimSpace(cfg)
 		*cfgs = append(*cfgs, cfg)
 	}

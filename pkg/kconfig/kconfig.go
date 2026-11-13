@@ -8,11 +8,11 @@ package kconfig
 
 import (
 	"fmt"
-	"io/ioutil"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/sys/targets"
 )
 
@@ -30,13 +30,15 @@ type Menu struct {
 	Elems  []*Menu    // sub-elements for menus
 	Parent *Menu      // parent menu, non-nil for everythign except for mainmenu
 
-	kconf     *KConfig // back-link to the owning KConfig
-	prompts   []prompt
-	defaults  []defaultVal
-	dependsOn expr
-	visibleIf expr
-	deps      map[string]bool
-	depsOnce  sync.Once
+	kconf      *KConfig // back-link to the owning KConfig
+	prompts    []prompt
+	defaults   []defaultVal
+	dependsOn  expr
+	visibleIf  expr
+	deps       map[string]bool
+	depsOnce   sync.Once
+	selects    []string
+	selectedBy []string // filled in in setSelectedBy()
 }
 
 type prompt struct {
@@ -61,6 +63,7 @@ const (
 	MenuChoice
 	MenuComment
 )
+
 const (
 	_ ConfigType = iota
 	TypeBool
@@ -118,9 +121,9 @@ type kconfigParser struct {
 }
 
 func Parse(target *targets.Target, file string) (*KConfig, error) {
-	data, err := ioutil.ReadFile(file)
+	data, err := osutil.ReadFileInRoot(filepath.Dir(file), filepath.Base(file))
 	if err != nil {
-		return nil, fmt.Errorf("failed to open Kconfig file %v: %v", file, err)
+		return nil, fmt.Errorf("failed to open Kconfig file %v: %w", file, err)
 	}
 	return ParseData(target, data, file)
 }
@@ -144,6 +147,7 @@ func ParseData(target *targets.Target, data []byte, file string) (*KConfig, erro
 		Configs: make(map[string]*Menu),
 	}
 	kconf.walk(root, nil, nil)
+	kconf.setSelectedBy()
 	return kconf, nil
 }
 
@@ -157,6 +161,38 @@ func (kconf *KConfig) walk(m *Menu, dependsOn, visibleIf expr) {
 	for _, elem := range m.Elems {
 		kconf.walk(elem, m.dependsOn, m.visibleIf)
 	}
+}
+
+// NOTE: the function is ignoring the "if" part of select/imply.
+func (kconf *KConfig) setSelectedBy() {
+	for name, cfg := range kconf.Configs {
+		for _, selectedName := range cfg.selects {
+			selected := kconf.Configs[selectedName]
+			if selected == nil {
+				continue
+			}
+			selected.selectedBy = append(selected.selectedBy, name)
+		}
+	}
+}
+
+// SelectedBy returns the set of configs that select or imply the given config.
+// NOTE: the function is ignoring the "if" part of select/imply.
+func (kconf *KConfig) SelectedBy(name string) map[string]bool {
+	ret := map[string]bool{}
+	toVisit := []string{name}
+	for len(toVisit) > 0 {
+		next := kconf.Configs[toVisit[len(toVisit)-1]]
+		toVisit = toVisit[:len(toVisit)-1]
+		if next == nil {
+			continue
+		}
+		for _, selectedBy := range next.selectedBy {
+			ret[selectedBy] = true
+			toVisit = append(toVisit, selectedBy)
+		}
+	}
+	return ret
 }
 
 func (kp *kconfigParser) parseFile() {
@@ -289,11 +325,15 @@ func (kp *kconfigParser) parseProperty(prop string) {
 	case "depends":
 		kp.MustConsume("on")
 		cur.dependsOn = exprAnd(cur.dependsOn, kp.parseExpr())
+		if kp.TryConsume("if") {
+			_ = kp.parseExpr()
+		}
 	case "visible":
 		kp.MustConsume("if")
 		cur.visibleIf = exprAnd(cur.visibleIf, kp.parseExpr())
 	case "select", "imply":
-		_ = kp.Ident()
+		name := kp.Ident()
+		cur.selects = append(cur.selects, name)
 		if kp.TryConsume("if") {
 			_ = kp.parseExpr()
 		}
@@ -302,6 +342,10 @@ func (kp *kconfigParser) parseProperty(prop string) {
 		kp.ConsumeLine()
 	case "modules":
 	case "optional":
+	// transitional is used for configs backward compatibility.
+	// We can ignore them. After such configs are removed from the kernel, we'll see kconf errors.
+	// https://www.phoronix.com/news/Linux-6.18-Transitional
+	case "transitional":
 	case "default":
 		kp.parseDefaultValue()
 	case "range":
@@ -327,15 +371,15 @@ func (kp *kconfigParser) parseProperty(prop string) {
 
 func (kp *kconfigParser) includeSource(file string) {
 	kp.newCurrent(nil)
-	file = kp.expandString(file)
-	file = filepath.Join(kp.baseDir, file)
-	data, err := ioutil.ReadFile(file)
+	relFile := filepath.FromSlash(kp.expandString(file))
+	fullPath := filepath.Join(kp.baseDir, relFile)
+	data, err := osutil.ReadFileInRoot(kp.baseDir, relFile)
 	if err != nil {
 		kp.failf("%v", err)
 		return
 	}
 	kp.includes = append(kp.includes, kp.parser)
-	kp.parser = newParser(data, file)
+	kp.parser = newParser(data, fullPath)
 	kp.parseFile()
 	err = kp.err
 	kp.parser = kp.includes[len(kp.includes)-1]
@@ -414,7 +458,9 @@ func (kp *kconfigParser) parseDefaultValue() {
 }
 
 func (kp *kconfigParser) expandString(str string) string {
-	str = strings.Replace(str, "$(SRCARCH)", kp.target.KernelHeaderArch, -1)
-	str = strings.Replace(str, "$SRCARCH", kp.target.KernelHeaderArch, -1)
+	str = strings.ReplaceAll(str, "$(SRCARCH)", kp.target.KernelHeaderArch)
+	str = strings.ReplaceAll(str, "$SRCARCH", kp.target.KernelHeaderArch)
+	str = strings.ReplaceAll(str, "$(KCONFIG_EXT_PREFIX)", "")
+	str = strings.ReplaceAll(str, "$(MALI_KCONFIG_EXT_PREFIX)", "") // ChromeOS.
 	return str
 }

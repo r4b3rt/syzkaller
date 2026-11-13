@@ -18,6 +18,7 @@ type memAlloc struct {
 	size uint64
 	mem  [memAllocL1Size]*[memAllocL0Size]uint64
 	buf  [memAllocL0Size]uint64
+	last map[uint64]uint64
 }
 
 const (
@@ -38,6 +39,7 @@ func newMemAlloc(totalMemSize uint64) *memAlloc {
 	}
 	ma := &memAlloc{
 		size: totalMemSize / memAllocGranule,
+		last: make(map[uint64]uint64),
 	}
 	ma.mem[0] = &ma.buf
 	return ma
@@ -46,13 +48,13 @@ func newMemAlloc(totalMemSize uint64) *memAlloc {
 func (ma *memAlloc) noteAlloc(addr0, size0 uint64) {
 	addr := addr0 / memAllocGranule
 	size := (addr0+size0+memAllocGranule-1)/memAllocGranule - addr
-	for i := uint64(0); i < size; i++ {
+	for i := range size {
 		ma.set(addr + i)
 	}
 }
 
 // alloc returns the next free address of size0 with respect to the given alignment.
-func (ma *memAlloc) alloc(r *randGen, size0, alignment0 uint64) uint64 {
+func (ma *memAlloc) alloc(size0, alignment0 uint64) uint64 {
 	if size0 == 0 {
 		size0 = 1
 	}
@@ -62,9 +64,11 @@ func (ma *memAlloc) alloc(r *randGen, size0, alignment0 uint64) uint64 {
 	size := (size0 + memAllocGranule - 1) / memAllocGranule
 	alignment := (alignment0 + memAllocGranule - 1) / memAllocGranule
 	end := ma.size - size
-	for start := uint64(0); start <= end; start += alignment {
+
+	start0 := ma.last[alignment]
+	for start := start0; start <= end; start += alignment {
 		empty := true
-		for i := uint64(0); i < size; i++ {
+		for i := range size {
 			if ma.get(start + i) {
 				empty = false
 				break
@@ -73,11 +77,12 @@ func (ma *memAlloc) alloc(r *randGen, size0, alignment0 uint64) uint64 {
 		if empty {
 			start0 := start * memAllocGranule
 			ma.noteAlloc(start0, size0)
+			ma.last[alignment] = start + (size+alignment-1)/alignment*alignment
 			return start0
 		}
 	}
 	ma.bankruptcy()
-	return ma.alloc(r, size0, alignment0)
+	return ma.alloc(size0, alignment0)
 }
 
 func (ma *memAlloc) bankruptcy() {
@@ -89,6 +94,7 @@ func (ma *memAlloc) bankruptcy() {
 			ma.mem[i1][i0] = 0
 		}
 	}
+	ma.last = make(map[uint64]uint64)
 }
 
 func (ma *memAlloc) pos(idx uint64) (i1, i0, bit uint64) {
@@ -151,15 +157,9 @@ func (va *vmaAlloc) alloc(r *randGen, size uint64) uint64 {
 	} else {
 		page = va.used[r.rand(len(va.used))]
 		if size > 1 && r.bin() {
-			off := r.rand(int(size))
-			if off > page {
-				off = page
-			}
-			page -= off
+			page -= min(r.rand(int(size)), page)
 		}
-		if page+size > va.numPages {
-			page = va.numPages - size
-		}
+		page = min(page, va.numPages-size)
 	}
 	if page >= va.numPages || size > va.numPages || page+size > va.numPages {
 		panic(fmt.Sprintf("vmaAlloc: bad page=%v size=%v numPages=%v", page, size, va.numPages))

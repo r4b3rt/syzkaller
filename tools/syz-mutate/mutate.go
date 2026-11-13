@@ -7,7 +7,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"runtime"
@@ -21,12 +20,16 @@ import (
 )
 
 var (
-	flagOS     = flag.String("os", runtime.GOOS, "target os")
-	flagArch   = flag.String("arch", runtime.GOARCH, "target arch")
-	flagSeed   = flag.Int("seed", -1, "prng seed")
-	flagLen    = flag.Int("len", prog.RecommendedCalls, "number of calls in programs")
-	flagEnable = flag.String("enable", "", "comma-separated list of enabled syscalls")
-	flagCorpus = flag.String("corpus", "", "name of the corpus file")
+	flagOS       = flag.String("os", runtime.GOOS, "target os")
+	flagArch     = flag.String("arch", runtime.GOARCH, "target arch")
+	flagSeed     = flag.Int("seed", -1, "prng seed")
+	flagLen      = flag.Int("len", prog.RecommendedCalls, "number of calls in programs")
+	flagEnable   = flag.String("enable", "", "comma-separated list of enabled syscalls")
+	flagCorpus   = flag.String("corpus", "", "name of the corpus file")
+	flagHintCall = flag.Int("hint-call", -1, "mutate the specified call with hints in hint-src/cmp flags")
+	flagHintSrc  = flag.Uint64("hint-src", 0, "compared value in the program")
+	flagHintCmp  = flag.Uint64("hint-cmp", 0, "compare operand in the kernel")
+	flagStrict   = flag.Bool("strict", true, "parse input program in strict mode")
 )
 
 func main() {
@@ -39,7 +42,7 @@ func main() {
 	var syscalls map[*prog.Syscall]bool
 	if *flagEnable != "" {
 		enabled := strings.Split(*flagEnable, ",")
-		syscallsIDs, err := mgrconfig.ParseEnabledSyscalls(target, enabled, nil)
+		syscallsIDs, err := mgrconfig.ParseEnabledSyscalls(target, enabled, nil, mgrconfig.AnyDescriptions)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to parse enabled syscalls: %v\n", err)
 			os.Exit(1)
@@ -69,17 +72,31 @@ func main() {
 	if flag.NArg() == 0 {
 		p = target.Generate(rs, *flagLen, ct)
 	} else {
-		data, err := ioutil.ReadFile(flag.Arg(0))
+		data, err := os.ReadFile(flag.Arg(0))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to read prog file: %v\n", err)
 			os.Exit(1)
 		}
-		p, err = target.Deserialize(data, prog.Strict)
+		mode := prog.NonStrict
+		if *flagStrict {
+			mode = prog.Strict
+		}
+		p, err = target.Deserialize(data, mode)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to deserialize the program: %v\n", err)
 			os.Exit(1)
 		}
-		p.Mutate(rs, *flagLen, ct, corpus)
+		if *flagHintCall != -1 {
+			comps := make(prog.CompMap)
+			comps.Add(0, *flagHintSrc, *flagHintCmp, true)
+			p.MutateWithHints(*flagHintCall, comps, func(p *prog.Prog) bool {
+				fmt.Printf("%s\n\n", p.Serialize())
+				return true
+			})
+			return
+		} else {
+			p.Mutate(rs, *flagLen, ct, nil, corpus)
+		}
 	}
 	fmt.Printf("%s\n", p.Serialize())
 }

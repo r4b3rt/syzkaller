@@ -4,9 +4,9 @@
 
 FAILED=""
 FILES=0
-for F in $(find . -perm -u=x -type f | egrep -v "/vendor/|/gen/|/.git"); do
+for F in $(git ls-files -s | grep -E '^100755' | cut -f 2 | grep -E -v "/gen/"); do
 	((FILES+=1))
-	if head -n 1 "$F" | egrep -q '^#!/' && head -n 1 "$F" | egrep -v -q -e '^#!/bin/sh$' -e '^#!/usr/bin/env '; then
+	if head -n 1 "$F" | grep -E -q '^#!/' && head -n 1 "$F" | grep -E -v -q -e '^#!/bin/sh$' -e '^#!/usr/bin/env '; then
 		echo "$F: Non-portable shebang line. Please use /usr/bin/env to locate the interpreter."
 		FAILED=1
 	fi

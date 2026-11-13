@@ -2,19 +2,23 @@
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 //go:build linux
-// +build linux
 
 package build
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"testing"
 	"text/template"
 
+	"github.com/google/syzkaller/pkg/debugtracer"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 )
 
 func TestElfBinarySignature(t *testing.T) {
@@ -25,18 +29,19 @@ func TestElfBinarySignature(t *testing.T) {
 func TestQueryLinuxCompiler(t *testing.T) {
 	const goodDir = "./testdata/linux_compiler_ok"
 	const expectedCompiler = "gcc (Debian 10.2.1-6+build2) 10.2.1 20210110, GNU ld (GNU Binutils for Debian) 2.35.2"
-	ret, err := queryLinuxCompiler(goodDir)
-	if err != nil {
-		t.Fatalf("error: %v", err)
-	}
-	if ret != expectedCompiler {
-		t.Fatalf("got: %T, expected: %T", ret, expectedCompiler)
-	}
-	const badDir = "./testingData/non_existing_folder"
-	_, err = queryLinuxCompiler(badDir)
-	if err == nil {
-		t.Fatalf("Expected an error, got none")
-	}
+	root, err := osutil.OpenSandboxRoot(goodDir)
+	require.NoError(t, err)
+	defer root.Close()
+	ret, err := queryLinuxCompiler(root)
+	require.NoError(t, err)
+	assert.Equal(t, expectedCompiler, ret)
+
+	// The testdata dir does not contain include/generated/compile.h.
+	badRoot, err := osutil.OpenSandboxRoot("./testdata")
+	require.NoError(t, err)
+	defer badRoot.Close()
+	_, err = queryLinuxCompiler(badRoot)
+	assert.Error(t, err)
 }
 
 func enumerateFlags(t *testing.T, flags, allFlags []string) {
@@ -47,19 +52,26 @@ func enumerateFlags(t *testing.T, flags, allFlags []string) {
 	}
 	t.Run(strings.Join(flags, "-"), func(t *testing.T) {
 		t.Parallel()
-		sign1, sign2 := "", ""
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			sign1 = sign(t, flags, false, false)
-			wg.Done()
-		}()
-		go func() {
-			sign2 = sign(t, flags, false, true)
-			wg.Done()
-		}()
-		sign3 := sign(t, flags, true, false)
-		wg.Wait()
+		sign1, sign2, sign3 := "", "", ""
+		g, _ := errgroup.WithContext(context.Background())
+		g.Go(func() error {
+			var err error
+			sign1, err = sign(t, flags, false, false)
+			return err
+		})
+		g.Go(func() error {
+			var err error
+			sign2, err = sign(t, flags, false, true)
+			return err
+		})
+		g.Go(func() error {
+			var err error
+			sign3, err = sign(t, flags, true, false)
+			return err
+		})
+		if err := g.Wait(); err != nil {
+			t.Error(err)
+		}
 		if sign1 != sign2 {
 			t.Errorf("signature has changed after a comment-only change")
 		}
@@ -69,28 +81,28 @@ func enumerateFlags(t *testing.T, flags, allFlags []string) {
 	})
 }
 
-func sign(t *testing.T, flags []string, changed, comment bool) string {
+func sign(t *testing.T, flags []string, changed, comment bool) (string, error) {
 	buf := new(bytes.Buffer)
 	if err := srcTemplate.Execute(buf, SrcParams{Changed: changed, Comment: comment}); err != nil {
-		t.Fatal(err)
+		return "", fmt.Errorf("template exec failed: %w", err)
 	}
 	src := buf.Bytes()
 	bin, err := osutil.TempFile("syz-build-test")
 	if err != nil {
-		t.Fatal(err)
+		return "", fmt.Errorf("temp file creation error: %w", err)
 	}
 	defer os.Remove(bin)
 	cmd := osutil.Command("gcc", append(flags, "-pthread", "-o", bin, "-x", "c", "-")...)
 	cmd.Stdin = buf
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("compiler failed: %v\n%s\n\n%s", err, src, out)
+		return "", fmt.Errorf("compiler failed: %w\n%s\n\n%s", err, src, out)
 	}
-	sign, err := elfBinarySignature(bin)
+	sign, err := elfBinarySignature(bin, &debugtracer.TestTracer{T: t})
 	if err != nil {
-		t.Fatal(err)
+		return "", fmt.Errorf("signature creation failed: %w", err)
 	}
-	return sign
+	return sign, nil
 }
 
 type SrcParams struct {

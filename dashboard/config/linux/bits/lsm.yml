@@ -9,7 +9,8 @@ config:
  - SECURITY_INFINIBAND: [optional]
 
  - SECURITY_TOMOYO
- - SECURITY_TOMOYO_MAX_ACCEPT_ENTRY: 1024
+ # The default setting of 1024 causes significant slowdown (see issue #2892).
+ - SECURITY_TOMOYO_MAX_ACCEPT_ENTRY: 64
  - SECURITY_TOMOYO_MAX_AUDIT_LOG: 32
  - SECURITY_TOMOYO_INSECURE_BUILTIN_SETTING
  - SECURITY_YAMA
@@ -32,6 +33,9 @@ config:
  - EVM_ADD_XATTRS
  - EVM_ATTR_FSUUID
  - AUDIT
+
+ # Lockdown may be too restrictive for normal kernel fuzzing.
+ - LOCK_DOWN_KERNEL_FORCE_NONE: [v5.4]
 
  # Note: this depends on a number of BPF-related configs, which may be not enabled.
  - BPF_LSM: [optional]

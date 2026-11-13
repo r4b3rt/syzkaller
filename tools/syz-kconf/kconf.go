@@ -9,15 +9,16 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/syzkaller/pkg/build"
 	"github.com/google/syzkaller/pkg/kconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/tool"
@@ -26,15 +27,17 @@ import (
 )
 
 const (
-	featOverride = "override"
-	featOptional = "optional"
-	featAppend   = "append"
-	featWeak     = "weak"
-	featBaseline = "baseline"
-	featReduced  = "reduced"
-	featClang    = "clang"
-	featAndroid  = "android"
-	featChromeos = "chromeos"
+	featOverride   = "override"
+	featOptional   = "optional"
+	featAppend     = "append"
+	featWeak       = "weak"
+	featBaseline   = "baseline"    // disables extra configs
+	featBaseConfig = "base-config" // only set for `-base.config` files
+	featModules    = "modules"
+	featReduced    = "reduced"
+	featClang      = "clang"
+	featAndroid    = "android"
+	featChromeos   = "chromeos"
 )
 
 func main() {
@@ -59,7 +62,6 @@ func main() {
 		tool.Fail(err)
 	}
 	// In order to speed up the process we generate instances that use the same kernel revision in parallel.
-	failed := false
 	generated := make(map[string]bool)
 	for _, inst := range instances {
 		// Find the first instance that we did not generate yet.
@@ -69,7 +71,7 @@ func main() {
 		fmt.Printf("git checkout %v %v\n", inst.Kernel.Repo, inst.Kernel.Tag)
 		if _, err := repo.SwitchCommit(inst.Kernel.Tag); err != nil {
 			if _, err := repo.CheckoutCommit(inst.Kernel.Repo, inst.Kernel.Tag); err != nil {
-				tool.Failf("failed to checkout %v/%v: %v", inst.Kernel.Repo, inst.Kernel.Tag, err)
+				tool.Failf("failed to checkout %v/%v: %v", inst.Kernel.Repo, inst.Kernel.Tag, osutil.VerboseMessage(err))
 			}
 		}
 		releaseTag, err := releaseTag(*flagSourceDir)
@@ -95,20 +97,21 @@ func main() {
 			}
 			go func() {
 				if err := ctx.generate(); err != nil {
-					results <- fmt.Errorf("%v failed:\n%v", ctx.Inst.Name, err)
+					results <- fmt.Errorf("%v failed:\n%w", ctx.Inst.Name, err)
 				}
 				results <- nil
 			}()
 		}
-		for i := 0; i < batch; i++ {
+		failed := false
+		for range batch {
 			if err := <-results; err != nil {
 				fmt.Printf("%v\n", err)
 				failed = true
 			}
 		}
-	}
-	if failed {
-		tool.Failf("some configs failed")
+		if failed {
+			tool.Failf("some configs failed")
+		}
 	}
 	if len(generated) == 0 {
 		tool.Failf("unknown instance name")
@@ -126,9 +129,13 @@ func checkConfigs(instances []*Instance, unusedFeatures []string) error {
 		}
 	}
 	dedup := make(map[string]bool)
-	errorString := ""
+	var errorString strings.Builder
 	for _, inst := range instances {
 		for _, cfg := range inst.Configs {
+			if strings.HasPrefix(cfg.Name, "CONFIG_") {
+				msg := fmt.Sprintf("Warning: excessive CONFIG_ in %v at %v:%v ?", cfg.Name, cfg.File, cfg.Line)
+				errorString.WriteString("\n" + msg)
+			}
 			for _, feat := range cfg.Constraints {
 				if feat[0] == '-' {
 					feat = feat[1:]
@@ -141,17 +148,17 @@ func checkConfigs(instances []*Instance, unusedFeatures []string) error {
 					continue
 				}
 				dedup[msg] = true
-				errorString += "\n" + msg
+				errorString.WriteString("\n" + msg)
 			}
 		}
 	}
-	if errorString != "" {
-		return errors.New(errorString[1:])
+	if errorString.String() != "" {
+		return errors.New(errorString.String()[1:])
 	}
 	return nil
 }
 
-// Generation context for a single instance.
+// Context represents the generation context for a single instance.
 type Context struct {
 	Inst       *Instance
 	Target     *targets.Target
@@ -164,7 +171,7 @@ type Context struct {
 
 func (ctx *Context) generate() error {
 	var err error
-	if ctx.BuildDir, err = ioutil.TempDir("", "syz-kconf"); err != nil {
+	if ctx.BuildDir, err = os.MkdirTemp("", "syz-kconf"); err != nil {
 		return err
 	}
 	defer os.RemoveAll(ctx.BuildDir)
@@ -194,24 +201,32 @@ func (ctx *Context) generate() error {
 		}
 	}
 	ctx.applyConfigs(cf)
-	cf.ModToYes()
+	if !ctx.Inst.Features[featModules] {
+		cf.ModToYes()
+	}
 	// Set all configs that are not present (actually not present, rather than "is not set") to "is not set".
 	// This avoids olddefconfig turning on random things we did not ask for.
+	var missing []string
 	for _, cfg := range ctx.Kconf.Configs {
 		if (cfg.Type == kconfig.TypeTristate || cfg.Type == kconfig.TypeBool) && cf.Map[cfg.Name] == nil {
-			cf.Set(cfg.Name, kconfig.No)
+			missing = append(missing, cfg.Name)
 		}
+	}
+	// Without sorting we can get random changes in the config after olddefconfig.
+	slices.Sort(missing)
+	for _, name := range missing {
+		cf.Set(name, kconfig.No)
 	}
 	original := cf.Serialize()
 	if err := osutil.WriteFile(configFile, original); err != nil {
-		return fmt.Errorf("failed to write .config file: %v", err)
+		return fmt.Errorf("failed to write .config file: %w", err)
 	}
 	// Save what we've got before olddefconfig for debugging purposes, it allows to see if we did not set a config,
 	// or olddefconfig removed it. Save as .tmp so that it's not checked-in accidentially.
 	outputFile := filepath.Join(ctx.ConfigDir, ctx.Inst.Name+".config")
 	outputFileTmp := outputFile + ".tmp"
 	if err := osutil.WriteFile(outputFileTmp, original); err != nil {
-		return fmt.Errorf("failed to write tmp config file: %v", err)
+		return fmt.Errorf("failed to write tmp config file: %w", err)
 	}
 	if err := ctx.Make("olddefconfig"); err != nil {
 		return err
@@ -221,9 +236,11 @@ func (ctx *Context) generate() error {
 		return err
 	}
 	if err := ctx.verifyConfigs(cf); err != nil {
-		return fmt.Errorf("%vsaved config before olddefconfig to %v", err, outputFileTmp)
+		return fmt.Errorf("%w: saved config before olddefconfig to %v", err, outputFileTmp)
 	}
-	cf.ModToNo()
+	if !ctx.Inst.Features[featModules] {
+		cf.ModToNo()
+	}
 	config := []byte(fmt.Sprintf(`# Automatically generated by syz-kconf; DO NOT EDIT.
 # Kernel: %v %v
 
@@ -235,14 +252,14 @@ func (ctx *Context) generate() error {
 }
 
 func (ctx *Context) executeShell() error {
+	envRe := regexp.MustCompile("^[A-Z0-9_]+=")
 	for _, shell := range ctx.Inst.Shell {
 		if !ctx.Inst.Features.Match(shell.Constraints) {
 			continue
 		}
 		args := strings.Split(shell.Cmd, " ")
 		for i := 1; i < len(args); i++ {
-			args[i] = strings.ReplaceAll(args[i], "${BUILDDIR}", ctx.BuildDir)
-			args[i] = strings.ReplaceAll(args[i], "${ARCH}", ctx.Target.KernelArch)
+			args[i] = ctx.replaceVars(args[i])
 		}
 		if args[0] == "make" {
 			if err := ctx.Make(args[1:]...); err != nil {
@@ -250,7 +267,18 @@ func (ctx *Context) executeShell() error {
 			}
 			continue
 		}
-		if _, err := osutil.RunCmd(10*time.Minute, ctx.SourceDir, args[0], args[1:]...); err != nil {
+		env := os.Environ()
+		for len(args) > 1 {
+			if !envRe.MatchString(args[0]) {
+				break
+			}
+			env = append(env, args[0])
+			args = args[1:]
+		}
+		cmd := osutil.Command(args[0], args[1:]...)
+		cmd.Dir = ctx.SourceDir
+		cmd.Env = env
+		if _, err := osutil.Run(10*time.Minute, cmd); err != nil {
 			return err
 		}
 	}
@@ -287,7 +315,17 @@ func (ctx *Context) verifyConfigs(cf *kconfig.ConfigFile) error {
 		if act == kconfig.No {
 			errs.push("%v:%v: %v is not present in the final config", cfg.File, cfg.Line, cfg.Name)
 		} else if cfg.Value == kconfig.No {
-			errs.push("%v:%v: %v is present in the final config", cfg.File, cfg.Line, cfg.Name)
+			var selectedBy []string
+			for name := range ctx.Kconf.SelectedBy(cfg.Name) {
+				if cf.Value(name) == kconfig.Yes {
+					selectedBy = append(selectedBy, name)
+				}
+			}
+			selectedByStr := ""
+			if len(selectedBy) > 0 {
+				selectedByStr = fmt.Sprintf(", possibly selected by %q", selectedBy)
+			}
+			errs.push("%v:%v: %v is present in the final config%s", cfg.File, cfg.Line, cfg.Name, selectedByStr)
 		} else {
 			errs.push("%v:%v: %v does not match final config %v vs %v",
 				cfg.File, cfg.Line, cfg.Name, cfg.Value, act)
@@ -374,11 +412,11 @@ func (ctx *Context) setReleaseFeatures() error {
 	}
 	major, err := strconv.ParseInt(match[1], 10, 32)
 	if err != nil {
-		return fmt.Errorf("bad release tag %q: %v", tag, err)
+		return fmt.Errorf("bad release tag %q: %w", tag, err)
 	}
 	minor, err := strconv.ParseInt(match[2], 10, 32)
 	if err != nil {
-		return fmt.Errorf("bad release tag %q: %v", tag, err)
+		return fmt.Errorf("bad release tag %q: %w", tag, err)
 	}
 	for ; major >= 2; major-- {
 		for ; minor >= 0; minor-- {
@@ -417,23 +455,34 @@ clean:
 }
 
 func (ctx *Context) Make(args ...string) error {
-	args = append(args,
-		"O="+ctx.BuildDir,
-		"ARCH="+ctx.Target.KernelArch,
-		"-j", fmt.Sprint(runtime.NumCPU()),
-	)
-	if ctx.Target.Triple != "" {
-		args = append(args, "CROSS_COMPILE="+ctx.Target.Triple+"-")
+	compiler, linker := "", ""
+	if ctx.Inst.Compiler != "" {
+		compiler = ctx.replaceVars(ctx.Inst.Compiler)
 	}
-	if ctx.Target.KernelCompiler != "" {
-		args = append(args, "CC="+ctx.Target.KernelCompiler)
+	if ctx.Inst.Linker != "" {
+		linker = ctx.replaceVars(ctx.Inst.Linker)
 	}
+	args = append(args, build.LinuxMakeArgs(
+		ctx.Target,
+		compiler,
+		linker,
+		"", // ccache
+		ctx.BuildDir,
+		runtime.NumCPU(),
+	)...)
 	_, err := osutil.RunCmd(10*time.Minute, ctx.SourceDir, "make", args...)
 	return err
 }
 
+func (ctx *Context) replaceVars(str string) string {
+	str = strings.ReplaceAll(str, "${SOURCEDIR}", ctx.SourceDir)
+	str = strings.ReplaceAll(str, "${BUILDDIR}", ctx.BuildDir)
+	str = strings.ReplaceAll(str, "${ARCH}", ctx.Target.KernelArch)
+	return str
+}
+
 func releaseTag(dir string) (string, error) {
-	data, err := ioutil.ReadFile(filepath.Join(dir, "Makefile"))
+	data, err := os.ReadFile(filepath.Join(dir, "Makefile"))
 	if err != nil {
 		return "", err
 	}

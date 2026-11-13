@@ -58,7 +58,7 @@ override the commit simply by sending another `#syz fix` command.
 **Note**: all commands must start from beginning of the line.
 
 **Note**: please keep at least `syzkaller-bugs@googlegroups.com` mailing list in CC.
-It serves as a history of what happened with each bug report. Keepint the main kernel
+It serves as a history of what happened with each bug report. Keeping the main kernel
 mailing list (e.g. `linux-kernel@vger.kernel.org `) in CC is useful as well so that
 it's searchable in those archives as well.
 
@@ -82,18 +82,41 @@ or alternatively, to test on exact commit reply with:
 ```
 #syz test: git://repo/address.git commit-hash
 ```
+
+You can also completely omit these parameters:
+```
+#syz test
+```
+
+In this case, syzbot will check out the latest commit from the branch where the
+issue was detected.
+
 If you also provide a patch with the email, `syzbot` will apply it on top of the
-tree before testing. The patch can be provided either inline in email text or as
+tree before testing. The patch can be provided inline in email text or as
 a text attachment (which is more reliable if your email client messes with
 whitespaces).
+
+If you want to include the patch directly in the email body, just paste the diff
+somewhere under the `#syz test` command line, e.g.
+
+```
+#syz test: git://repo/address.git branch
+
+--- a/mm/kasan/kasan.c
++++ b/mm/kasan/kasan.c
+-       current->kasan_depth++;
++       current->kasan_depth--;
+```
+
+[Here](https://groups.google.com/g/syzkaller-bugs/search?q=%22%23syz%20test%22) are
+some real examples of `#syz test` commands for syzbot-reported bugs.
 
 If you don't provide a patch, `syzbot` will test the tree as is.
 This is useful if this is your own tree which already contains the patch,
 or to check if the bug is already fixed by some recent commit.
 
 After sending an email you should typically get a reply email with results within
-an hour. In certain cases (e.g. syzbot is busy with a bisection) it might take
-singnificantly longer, up to a few days (see #1923 for details).
+an hour.
 
 **Note**: you may send the request only to `syzbot` email address, as patches sent
 to some mailing lists (e.g. netdev, netfilter-devel) will trigger patchwork.
@@ -108,6 +131,76 @@ the supplied patch.
 **Note**: see [below](#kmsan-bugs) for `KMSAN` bugs testing.
 
 **Note**: see [below](#usb-bugs) for `USB` bugs testing.
+
+## Subsystems
+
+For all its bugs, `syzbot` automatically assigns kernel subsystems tags. For Linux,
+the predefined list of kernel subsystems can be found at
+https://syzkaller.appspot.com/upstream/subsystems.
+
+By clicking on a name in the subsystem list or by following a tag after a bug's
+title, you can get the full list of bugs belonging to the subsystem. For example,
+all `nfc` bugs are listed here: https://syzkaller.appspot.com/upstream/s/nfc.
+
+`syzbot` includes subsystem tags into email subject as well, with `?` indicating
+that it's an automatic guess: `[syzbot] [ntfs?] kernel BUG in ntfs_iget`.
+
+Over time, as we improve the classification rules or as syzbot obtains more
+information about the bug (e.g. finds a reproducer), `syzbot` will update tags.
+
+You can also manually override the automatic guess by replying to the `syzbot` email:
+
+```
+#syz set subsystems: net, mm
+```
+
+Names of subsystems must be taken from the subsystem list page on the syzbot web
+dashboard.
+
+<div id="labels"/>
+
+## Bug labels
+
+It is possible to assign labels to syzkaller-reported bugs. These labels
+are displayed near bug titles on the bug lists and on individual bug pages.
+
+There are two types of labels:
+* Flags
+  * Send `#syz set <label>` to set the flag.
+  * Send `#syz unset <label>` to drop the flag.
+* Label with values
+  * Send `#syz set <label>: <value>[, <value2> ...]`  to overwrite the value list.
+  * `#syz unset <label>` would drop the label with all its values.
+
+There's a fixed list of supported labels (*). Most important ones:
+| Key | Description | Values | Example |
+| - | - | - | - |
+| `subsystems` | A comma-separated list of subsystems of the bug | See [the list](https://syzkaller.appspot.com/upstream/subsystems) on the syzbot dashboard | `#syz set subsystems: mm, reiserfs` |
+| `prio` | The priority of the bug | One of `low`, `normal`, `high` | `#syz set prio: low`<br>`#syz unset prio` |
+| `no-reminders` | Don't include the bug into monthly reminders | No values, just a flag |  `#syz set no-reminders`<br>`#syz unset no-reminders` |
+
+It is also possible to set and unset labels for individual bugs from a monthly
+subsystem report. Let's consider an example.
+
+```
+Some of the still happening issues:
+
+Ref Crashes Repro Title
+<1> 10      No    WARNING in __brelse (2)
+                  https://syzkaller.appspot.com/bug?id=cd9cb7a620dcfbf46a5eaf201031acaf3aeda28e
+<2> 3       No    WARNING in kernfs_get (4)
+                  https://syzkaller.appspot.com/bug?id=b4278401038872458a20f08210e46f3ab519b786
+```
+
+One can send the following email to disable reminders for the first bug and to
+change the subsystem of the second bug:
+
+```
+#syz set <1> no-reminders
+#syz set <2> subsystems: kernfs
+```
+
+(*) If you need other labels to facilitate your work, feel free to contact us.
 
 <div id="amend"/>
 <div id="linux-next"/>
@@ -147,7 +240,7 @@ using `#syz fix: commit-title` commands.
 can reproduce the bug and then goes back release-by-release to find the first
 release where kernel does not crash. Once such release is found, `syzbot` starts
 bisection on that range. `syzbot` has limitation of how far back in time it can
-go (currently `v4.1`), going back in time is [very hard](/pkg/vcs/linux.go)
+go (currently `v4.19`), going back in time is [very hard](/pkg/vcs/linux.go)
 because of incompatible compiler/linker/asm/perl/make/libc/etc, kernel
 build/boot breakages and large amounts of bugs.
 
@@ -205,30 +298,56 @@ on HEAD upon fix bisection, it will be retried in another 30 days.
 If you receive an email with fix bisection results you think is correct, please
 reply with a `#syz fix: commit-title` so that syzbot can close the bug report.
 
+<div id="ai-bisection"/>
+
+### AI bisection
+
+`syzbot` also uses LLM-based agents to look for the commit that introduced or
+fixed a bug (`bisected by AI`). Unlike the regular bisection described above,
+AI bisection does not test kernel revisions: it analyzes the crash report, the
+kernel sources and the git history. The result is therefore a hypothesis rather
+than a test result, and it may be wrong. You can check the `AI reasoning` link
+in the report for the full analysis, and please add a suggested `Fixes:` tag
+only if you agree with it.
+
 <div id="syzkaller-reproducers"/>
 
-## syzkaller reproducers
+## Running reproducers
+
+*Detailed instructions on running reproducers can be found [here](/docs/reproducing_crashes.md).*
 
 `syzbot` aims at providing stand-alone C reproducers for all reported bugs.
 However, sometimes it can't extract a reproducer at all, or can only extract a
 syzkaller reproducer. syzkaller reproducers are programs in a special syzkaller
 notation and they can be executed on the target system with a little bit more
-effort. See [this](/docs/executing_syzkaller_programs.md) for instructions.
+effort.
 
 A syskaller program can also give you an idea as to what syscalls with what
 arguments were executed (note that some calls can actually be executed in
 parallel).
 
-A syzkaller program can be converted to an almost equivalent C source using `syz-prog2c` utility. `syz-prog2c`
-has lots of flags in common with [syz-execprog](/docs/executing_syzkaller_programs.md),
-e.g. `-threaded`/`-collide` which control if the syscalls are executed sequentially or in parallel.
+A syzkaller program can be converted to an almost equivalent C source using
+`syz-prog2c` utility. `syz-prog2c` has lots of flags in common with
+[syz-execprog](/docs/reproducing_crashes.md#from-execution-logs),
+e.g. `-threaded` which controls if the syscalls are executed sequentially or
+concurrently.
+
 An example invocation:
 
 ```
-syz-prog2c -prog repro.syz.txt -enable=all -threaded -collide -repeat -procs=8 -sandbox=namespace -segv -tmpdir -waitrepeat
+syz-prog2c -prog repro.syz.txt -enable=all -threaded -repeat -procs=8 -sandbox=namespace -segv -tmpdir -waitrepeat
 ```
 
-However, note that if `syzbot` did not provide a C reproducer, it wasn't able to trigger the bug using the C program (though, it can be just because the bug is triggered by a subtle race condition).
+However, note that if `syzbot` did not provide a C reproducer, it wasn't able to
+trigger the bug using the C program (it might also be the case that the bug is
+triggered by a rare race condition).
+
+## Downloadable assets
+
+Syzbot shares links to the bootable disk image, kernel object file and other
+relevant files that can be used to reproduce and debug the issue locally.
+
+See [this tutorial](/docs/syzbot_assets.md) on how to use them.
 
 ## Crash does not reproduce?
 
@@ -245,12 +364,35 @@ then the program needs to be built with `-m32` flag.
 If the reproducer exits quickly, try to run it several times, or in a loop.
 There can be some races involved.
 
-Exact compilers used by `syzbot` can be found here:
+Sometimes it might be important to build the kernel using the exact same
+compiler that was used by syzbot. Normally that information is included in every
+email report, e.g.:
+
+```
+compiler:       Debian clang version 15.0.6, GNU ld (GNU Binutils for Debian) 2.40
+```
+
+The latest compilers used by syzbot are contained in the
+`gcr.io/syzkaller/syzbot` docker image. For in-tree kernel build in current
+directory it can be used as follows:
+
+```
+docker pull gcr.io/syzkaller/syzbot
+docker run -it --user $(id -u ${USER}):$(id -g ${USER}) \
+	--volume "$PWD:/syzkaller/pwd" --workdir /syzkaller/pwd \
+	gcr.io/syzkaller/syzbot:latest
+make
+```
+
+For an out-of-tree build one needs to proxy more host directories using `--volume` flag.
+
+Older compilers used by `syzbot` can be found here:
 - [gcc 7.1.1 20170620](https://storage.googleapis.com/syzkaller/gcc-7.tar.gz) (245MB)
 - [gcc 8.0.1 20180301](https://storage.googleapis.com/syzkaller/gcc-8.0.1-20180301.tar.gz) (286MB)
 - [gcc 8.0.1 20180412](https://storage.googleapis.com/syzkaller/gcc-8.0.1-20180412.tar.gz) (33MB)
 - [gcc 9.0.0 20181231](https://storage.googleapis.com/syzkaller/gcc-9.0.0-20181231.tar.gz) (30MB)
 - [gcc 10.1.0-syz (20200507)](https://storage.googleapis.com/syzkaller/gcc-10.1.0-syz.tar.xz) (220MB)
+- [gcc 10.2.0](https://storage.googleapis.com/syzkaller/gcc-10.2.0.tar.gz) (165MB)
 - [clang 7.0.0 (trunk 329060)](https://storage.googleapis.com/syzkaller/clang-kmsan-329060.tar.gz) (44MB)
 - [clang 7.0.0 (trunk 334104)](https://storage.googleapis.com/syzkaller/clang-kmsan-334104.tar.gz) (44MB)
 - [clang 8.0.0 (trunk 343298)](https://storage.googleapis.com/syzkaller/clang-kmsan-343298.tar.gz) (45MB)
@@ -258,30 +400,26 @@ Exact compilers used by `syzbot` can be found here:
 - [clang 11.0.0 (git ca2dcbd030e)](https://storage.googleapis.com/syzkaller/clang-11-prerelease-ca2dcbd030e.tar.xz) (682MB)
 - [clang 11.0.1](https://github.com/llvm/llvm-project/releases/tag/llvmorg-11.0.1)
 
-A QEMU-suitable Debian Stretch image can be found [here](https://storage.googleapis.com/syzkaller/stretch.img) (2 GB, compression somehow breaks it), root ssh key for it is [here](https://storage.googleapis.com/syzkaller/stretch.img.key)
-(do `chmod 0600` on it). A reference `qemu` command line to run it is as follows:
+A QEMU-suitable Debian Stretch image can be found
+[here](https://storage.googleapis.com/syzkaller/images/stretch-amd64.img.gz) (241 MB).
+A reference `qemu` command line to run it is as follows:
 ```
 qemu-system-x86_64 -smp 2 -m 4G -enable-kvm -cpu host \
     -net nic -net user,hostfwd=tcp::10022-:22 \
     -kernel arch/x86/boot/bzImage -nographic \
     -device virtio-scsi-pci,id=scsi \
     -device scsi-hd,bus=scsi.0,drive=d0 \
-    -drive file=stretch.img,format=raw,if=none,id=d0 \
-    -append "root=/dev/sda console=ttyS0 earlyprintk=serial \
-      oops=panic panic_on_warn=1 panic=86400 kvm-intel.nested=1 \
-      security=apparmor ima_policy=tcb workqueue.watchdog_thresh=140 \
-      nf-conntrack-ftp.ports=20000 nf-conntrack-tftp.ports=20000 \
-      nf-conntrack-sip.ports=20000 nf-conntrack-irc.ports=20000 \
-      nf-conntrack-sane.ports=20000 vivid.n_devs=16 \
-      vivid.multiplanar=1,2,1,2,1,2,1,2,1,2,1,2,1,2,1,2 \
-      spec_store_bypass_disable=prctl nopcid"
+    -drive file=stretch-amd64.img,format=raw,if=none,id=d0 \
+    -append "root=/dev/sda1 console=ttyS0 earlyprintk=serial"
 ```
 And then you can ssh into it using:
 ```
-ssh -p 10022 -i stretch.img.key root@localhost
+ssh -p 10022 root@localhost
 ```
 
-Note: before March 25th 2020 Debian Wheezy image was used for testing, so some of the bugs reported before that date might only be reproducible on Wheezy. That image is [here](https://storage.googleapis.com/syzkaller/wheezy.img) and the key for it is [here](https://storage.googleapis.com/syzkaller/wheezy.img.key).
+Note: before March 25th 2020 Debian Wheezy image was used for testing, so some of the bugs reported before that date
+might only be reproducible on Wheezy. That image is [here](https://storage.googleapis.com/syzkaller/wheezy.img)
+and the key for it is [here](https://storage.googleapis.com/syzkaller/wheezy.img.key).
 
 ## No reproducer at all?
 
@@ -320,7 +458,7 @@ propagation of uninitialized values through memory and registers and only flags
 actual eventual uses of uninitialized values. For example, `KMSAN` will detect
 a branch on or a `copy_to_user()` of values that transitively come from
 uninitialized memory created by heap/stack allocations. This ensures
-/theoretical/ absense of both false positives and false negatives (with some
+/theoretical/ absence of both false positives and false negatives (with some
 implementation limitations of course). Note that `KMSAN` requires `clang` compiler.
 
 `KMSAN` is not upstream yet, though, we want to upstream it later. For now,
@@ -338,7 +476,7 @@ and attach/inline your test patch in the same email.
 Report explanation. The first call trace points to the `use` of the uninit value
 (which is usually a branching or copying it to userspace). Then there are 0 or
 more "Uninit was stored to memory at:" stacks which denote how the unint value
-travelled through memory. Finally there is a "Uninit was created at:"
+traveled through memory. Finally there is a "Uninit was created at:"
 section which points either to a heap allocation or a stack variable which
 is the original source of uninitialized-ness.
 
@@ -404,11 +542,11 @@ There are several reasons for this:
 - custom patches may not apply tomorrow
 - custom patches may not apply to all of the tested git trees
 - it's hard to communicate exact state of the code with bug reports (not just hash anymore)
-- line numbers won't match in reports (which always brings suspecion as to the quality of reports)
+- line numbers won't match in reports (which always brings suspicion as to the quality of reports)
 - custom patches can also introduce bugs, and even if they don't a developer may (rightfully)
   question validity of and may not want to spend time on reports obtained
   with a number of out-of-tree patches
-- order of patch application generatelly matters, and at some point patches
+- order of patch application generally matters, and at some point patches
   need to be removed, there is nobody to manage this
 
 We've experimented with application of custom patches in the past and it lead

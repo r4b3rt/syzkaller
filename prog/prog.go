@@ -1,25 +1,79 @@
 // Copyright 2015 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package prog implements syzkaller test program representation, parsing, mutation,
+// generation, and serialization.
 package prog
 
 import (
 	"fmt"
 	"reflect"
+	"slices"
+	"strings"
 )
 
 type Prog struct {
 	Target   *Target
 	Calls    []*Call
 	Comments []string
+
+	// Was deserialized using Unsafe mode, so can do unsafe things.
+	isUnsafe bool
 }
 
-// These properties are parsed and serialized according to the tag and the type
+const ExtraCallName = ".extra"
+
+func (p *Prog) CallName(call int) string {
+	if call >= len(p.Calls) || call < -1 {
+		panic(fmt.Sprintf("bad call index %v/%v", call, len(p.Calls)))
+	}
+	if call == -1 {
+		return ExtraCallName
+	}
+	return p.Calls[call].Meta.Name
+}
+
+// OnlyContains determines whether the program only consists of the syscalls from the first argument.
+func (p *Prog) OnlyContains(syscalls map[*Syscall]bool) bool {
+	for _, c := range p.Calls {
+		if !syscalls[c.Meta] {
+			return false
+		}
+	}
+	return true
+}
+
+// FilterInplace only leaves the allowed system calls and deletes all remaining ones.
+func (p *Prog) FilterInplace(allowed map[*Syscall]bool) {
+	for i := 0; i < len(p.Calls); {
+		c := p.Calls[i]
+		if !allowed[c.Meta] {
+			p.RemoveCall(i)
+			continue
+		}
+		i++
+	}
+}
+
+// countArgs is used in tests to filter out particularly large programs.
+func (p *Prog) countArgs() int {
+	total := 0
+	for _, call := range p.Calls {
+		ForeachArg(call, func(_ Arg, _ *ArgCtx) {
+			total++
+		})
+	}
+	return total
+}
+
+// CallProps represents properties that are parsed and serialized according to the tag and the type
 // of the corresponding fields.
 // IMPORTANT: keep the exact values of "key" tag for existing props unchanged,
 // otherwise the backwards compatibility would be broken.
 type CallProps struct {
-	FailNth int `key:"fail_nth"`
+	FailNth int  `key:"fail_nth"`
+	Async   bool `key:"async"`
+	Rerun   int  `key:"rerun"`
 }
 
 type Call struct {
@@ -43,7 +97,7 @@ type Arg interface {
 	Dir() Dir
 	Size() uint64
 
-	validate(ctx *validCtx) error
+	validate(ctx *validCtx, dir Dir) error
 	serialize(ctx *serializer)
 }
 
@@ -52,7 +106,7 @@ type ArgCommon struct {
 	dir Dir
 }
 
-func (arg ArgCommon) Type() Type {
+func (arg *ArgCommon) Type() Type {
 	if arg.ref == 0 {
 		panic("broken type ref")
 	}
@@ -63,7 +117,7 @@ func (arg *ArgCommon) Dir() Dir {
 	return arg.dir
 }
 
-// Used for ConstType, IntType, FlagsType, LenType, ProcType and CsumType.
+// ConstArg is used for ConstType, IntType, FlagsType, LenType, ProcType and CsumType.
 type ConstArg struct {
 	ArgCommon
 	Val uint64
@@ -103,7 +157,7 @@ func (arg *ConstArg) Value() (uint64, uint64) {
 	}
 }
 
-// Used for PtrType and VmaType.
+// PointerArg is used for PtrType and VmaType.
 type PointerArg struct {
 	ArgCommon
 	Address uint64
@@ -161,7 +215,7 @@ func (target *Target) PhysicalAddr(arg *PointerArg) uint64 {
 	return target.DataOffset + arg.Address
 }
 
-// Used for BufferType.
+// DataArg is used for BufferType.
 type DataArg struct {
 	ArgCommon
 	data []byte // for in/inout args
@@ -172,7 +226,7 @@ func MakeDataArg(t Type, dir Dir, data []byte) *DataArg {
 	if dir == DirOut {
 		panic("non-empty output data arg")
 	}
-	return &DataArg{ArgCommon: ArgCommon{ref: t.ref(), dir: dir}, data: append([]byte{}, data...)}
+	return &DataArg{ArgCommon: ArgCommon{ref: t.ref(), dir: dir}, data: slices.Clone(data)}
 }
 
 func MakeOutDataArg(t Type, dir Dir, size uint64) *DataArg {
@@ -200,10 +254,10 @@ func (arg *DataArg) SetData(data []byte) {
 	if arg.Dir() == DirOut {
 		panic("setting data of output data arg")
 	}
-	arg.data = append([]byte{}, data...)
+	arg.data = slices.Clone(data)
 }
 
-// Used for StructType and ArrayType.
+// GroupArg is used for StructType and ArrayType.
 // Logical group of args (struct or array).
 type GroupArg struct {
 	ArgCommon
@@ -221,12 +275,19 @@ func (arg *GroupArg) Size() uint64 {
 	}
 	switch typ := typ0.(type) {
 	case *StructType:
-		var size uint64
-		for _, fld := range arg.Inner {
-			size += fld.Size()
-		}
-		if typ.AlignAttr != 0 && size%typ.AlignAttr != 0 {
-			size += typ.AlignAttr - size%typ.AlignAttr
+		var size, offset uint64
+		for i, fld := range arg.Inner {
+			if i == typ.OverlayField {
+				offset = 0
+			}
+			offset += fld.Size()
+			// Add dynamic alignment at the end and before the overlay part.
+			if i+1 == len(arg.Inner) || i+1 == typ.OverlayField {
+				if typ.AlignAttr != 0 && offset%typ.AlignAttr != 0 {
+					offset += typ.AlignAttr - offset%typ.AlignAttr
+				}
+			}
+			size = max(size, offset)
 		}
 		return size
 	case *ArrayType:
@@ -251,11 +312,15 @@ func (arg *GroupArg) fixedInnerSize() bool {
 	}
 }
 
-// Used for UnionType.
+// UnionArg is used for UnionType.
 type UnionArg struct {
 	ArgCommon
 	Option Arg
 	Index  int // Index of the selected option in the union type.
+	// Used for unions with conditional fields.
+	// We first create a dummy arg with transient=True and then
+	// patch them.
+	transient bool
 }
 
 func MakeUnionArg(t Type, dir Dir, opt Arg, index int) *UnionArg {
@@ -269,7 +334,7 @@ func (arg *UnionArg) Size() uint64 {
 	return arg.Option.Size()
 }
 
-// Used for ResourceType.
+// ResultArg is used for ResourceType.
 // This is the only argument that can be used as syscall return value.
 // Either holds constant value or reference another ResultArg.
 type ResultArg struct {
@@ -304,7 +369,7 @@ func (arg *ResultArg) Size() uint64 {
 	return arg.Type().Size()
 }
 
-// Returns inner arg for pointer args.
+// InnerArg returns inner arg for pointer args.
 func InnerArg(arg Arg) Arg {
 	if _, ok := arg.Type().(*PtrType); ok {
 		res := arg.(*PointerArg).Res
@@ -339,6 +404,9 @@ func (p *Prog) insertBefore(c *Call, calls []*Call) {
 
 // replaceArg replaces arg with arg1 in a program.
 func replaceArg(arg, arg1 Arg) {
+	if arg == arg1 {
+		panic("replacing an argument with itself")
+	}
 	switch a := arg.(type) {
 	case *ConstArg:
 		*a = *arg1.(*ConstArg)
@@ -347,18 +415,37 @@ func replaceArg(arg, arg1 Arg) {
 	case *PointerArg:
 		*a = *arg1.(*PointerArg)
 	case *UnionArg:
+		if a.Option != nil {
+			removeArg(a.Option)
+		}
 		*a = *arg1.(*UnionArg)
 	case *DataArg:
 		*a = *arg1.(*DataArg)
 	case *GroupArg:
+		_, isStruct := arg.Type().(*StructType)
 		a1 := arg1.(*GroupArg)
-		if len(a.Inner) != len(a1.Inner) {
+		if isStruct && len(a.Inner) != len(a1.Inner) {
 			panic(fmt.Sprintf("replaceArg: group fields don't match: %v/%v",
 				len(a.Inner), len(a1.Inner)))
 		}
 		a.ArgCommon = a1.ArgCommon
-		for i := range a.Inner {
+		// Replace min(|a|, |a1|) arguments.
+		for i := 0; i < len(a.Inner) && i < len(a1.Inner); i++ {
 			replaceArg(a.Inner[i], a1.Inner[i])
+		}
+		// Remove extra arguments of a.
+		for len(a.Inner) > len(a1.Inner) {
+			i := len(a.Inner) - 1
+			removeArg(a.Inner[i])
+			a.Inner[i] = nil
+			a.Inner = a.Inner[:i]
+		}
+		// Add extra arguments to a.
+		for i := len(a.Inner); i < len(a1.Inner); i++ {
+			a.Inner = append(a.Inner, a1.Inner[i])
+		}
+		if debug && len(a.Inner) != len(a1.Inner) {
+			panic("replaceArg implementation bug")
 		}
 	default:
 		panic(fmt.Sprintf("replaceArg: bad arg kind %#v", arg))
@@ -403,7 +490,7 @@ func removeArg(arg0 Arg) {
 	})
 }
 
-// removeCall removes call idx from p.
+// RemoveCall removes call idx from p.
 func (p *Prog) RemoveCall(idx int) {
 	c := p.Calls[idx]
 	for _, arg := range c.Args {
@@ -422,6 +509,107 @@ func (p *Prog) sanitizeFix() {
 	}
 }
 
+// FormatArg returns a string slice representation of an argument with one
+// entry per line in the output. The formatting roughly corresponds to syzlang
+// descriptions and is intended to be human readable.
+func FormatArg(arg Arg, name string) []string {
+	const indent string = "  " // Two spaces.
+	makeIndent := func(level int) string {
+		return strings.Repeat(indent, level)
+	}
+
+	// Depth-first search starting at initial argument, incrementing the indent
+	// level as we go deeper.
+	var visit func(Arg, string, int) []string
+	visit = func(arg Arg, name string, depth int) []string {
+		var lines []string
+
+		var lineBuilder strings.Builder
+		lineBuilder.WriteString(makeIndent(depth))
+
+		if name != "" {
+			fmt.Fprintf(&lineBuilder, "%s: ", name)
+		}
+
+		switch a := arg.(type) {
+		case *GroupArg:
+			fmt.Fprintf(&lineBuilder, "%s {", a.Type().String())
+			lines = append(lines, lineBuilder.String())
+
+			s, isStruct := a.ArgCommon.Type().(*StructType)
+			for i, inner := range a.Inner {
+				// For GroupArgs, only those of type StructType have named
+				// children.
+				childName := ""
+				if isStruct {
+					childName = s.Fields[i].Name
+				}
+				lines = append(lines, visit(inner, childName, depth+1)...)
+			}
+			lines = append(lines, makeIndent(depth)+"}")
+		case *ConstArg:
+			fmt.Fprintf(&lineBuilder, "%s = 0x%x (%d bytes)", a.Type().Name(), a.Val, a.Size())
+			lines = append(lines, lineBuilder.String())
+		case *DataArg:
+			tpe, ok := a.Type().(*BufferType)
+			if !ok {
+				panic("data args should be a buffer type")
+			}
+
+			fmt.Fprintf(&lineBuilder, "%s: ", a.Type().String())
+
+			// Result buffer - nothing to display.
+			if a.Dir() == DirOut {
+				fmt.Fprint(&lineBuilder, "(DirOut)")
+			} else {
+				// Compressed buffers (e.g., fs images) tend to be very large
+				// and it doesn't make much sense to output their contents.
+				if tpe.Kind == BufferCompressed {
+					fmt.Fprintf(&lineBuilder, "(compressed buffer with length 0x%x)", len(a.Data()))
+				} else {
+					fmt.Fprintf(&lineBuilder, "{% x} (length 0x%x)", a.Data(), len(a.Data()))
+				}
+			}
+			lines = append(lines, lineBuilder.String())
+		case *PointerArg:
+			if a.Res != nil {
+				fmt.Fprintf(&lineBuilder, "%s {", a.Type().String())
+				lines = append(lines, lineBuilder.String())
+				lines = append(lines, visit(a.Res, "", depth+1)...)
+				lines = append(lines, makeIndent(depth)+"}")
+			} else {
+				if a.VmaSize == 0 {
+					lineBuilder.WriteString("nil")
+				} else {
+					fmt.Fprintf(&lineBuilder, "VMA[0x%x]", a.VmaSize)
+				}
+				lines = append(lines, lineBuilder.String())
+			}
+		case *UnionArg:
+			union, ok := a.ArgCommon.Type().(*UnionType)
+			if !ok {
+				panic("a UnionArg should have an ArgCommon of type UnionType")
+			}
+			fmt.Fprintf(&lineBuilder, "union %s {", a.Type().Name())
+			lines = append(lines, lineBuilder.String())
+			if a.Option != nil {
+				lines = append(lines, visit(a.Option, union.Fields[a.Index].Name, depth+1)...)
+			}
+			lines = append(lines, makeIndent(depth)+"}")
+		case *ResultArg:
+			fmt.Fprintf(&lineBuilder, "%s (resource)", a.ArgCommon.Type().String())
+			lines = append(lines, lineBuilder.String())
+		default:
+			// We shouldn't hit this because the switch statements cover every
+			// prog.Arg implementation.
+			panic("Unsupported argument type.")
+		}
+		return lines
+	}
+
+	return visit(arg, name, 0)
+}
+
 func (p *Prog) sanitize(fix bool) error {
 	for _, c := range p.Calls {
 		if err := p.Target.sanitize(c, fix); err != nil {
@@ -431,11 +619,12 @@ func (p *Prog) sanitize(fix bool) error {
 	return nil
 }
 
+// ForeachProp executes f for each property.
 // TODO: This method might be more generic - it can be applied to any struct.
 func (props *CallProps) ForeachProp(f func(fieldName, key string, value reflect.Value)) {
 	valueObj := reflect.ValueOf(props).Elem()
 	typeObj := valueObj.Type()
-	for i := 0; i < valueObj.NumField(); i++ {
+	for i := range valueObj.NumField() {
 		fieldValue := valueObj.Field(i)
 		fieldType := typeObj.Field(i)
 		f(fieldType.Name, fieldType.Tag.Get("key"), fieldValue)

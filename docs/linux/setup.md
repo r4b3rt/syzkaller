@@ -7,12 +7,14 @@ Instructions for a particular VM type or kernel architecture can be found on the
 - [Setup: Ubuntu host, QEMU vm, x86-64 kernel](setup_ubuntu-host_qemu-vm_x86-64-kernel.md)
 - [Setup: Linux host, QEMU vm, arm64 kernel](setup_linux-host_qemu-vm_arm64-kernel.md)
 - [Setup: Linux host, QEMU vm, arm kernel](setup_linux-host_qemu-vm_arm-kernel.md)
+- [Setup: Linux host, QEMU vm, loongarch64 kernel](setup_linux-host_qemu-vm_loongarch64-kernel.md)
 - [Setup: Linux host, QEMU vm, riscv64 kernel](setup_linux-host_qemu-vm_riscv64-kernel.md)
 - [Setup: Linux host, QEMU vm, s390x kernel](setup_linux-host_qemu-vm_s390x-kernel.md)
 - [Setup: Linux host, Android device, arm32/64 kernel](setup_linux-host_android-device_arm-kernel.md)
+- [Setup: Linux host, Android virtual device, x86-64 kernel](setup_linux-host_android-virtual-device_x86-64-kernel.md)
 - [Setup: Linux isolated host](setup_linux-host_isolated.md)
 - [Setup: Ubuntu host, VMware vm, x86-64 kernel](setup_ubuntu-host_vmware-vm_x86-64-kernel.md)
-- [Setup: Ubuntu host, Odroid C2 board, arm64 kernel](setup_ubuntu-host_odroid-c2-board_arm64-kernel.md) [outdated]
+- [Setup: Ubuntu host, VirtualBox vm, x86-64 kernel](setup_ubuntu-host_virtualbox-vm_x86-64-kernel.md)
 
 ## Install
 
@@ -27,18 +29,14 @@ If you encounter any troubles, check the [troubleshooting](/docs/troubleshooting
 
 ### Go and syzkaller
 
-`syzkaller` is written in [Go](https://golang.org), and `Go 1.13+`
-toolchain is required for build. *Note:* `Go 1.14` is required for contributors,
-as `Go 1.13` may change `go.mod` file. The toolchain can be installed with:
+`syzkaller` is written in [Go](https://golang.org), and `Go 1.23+` toolchain is required for build.
+Generally we aim at supporting 2 latest releases of Go.
+The toolchain can be installed with:
 
 ```
-wget https://dl.google.com/go/go1.14.2.linux-amd64.tar.gz
-tar -xf go1.14.2.linux-amd64.tar.gz
-mv go goroot
-mkdir gopath
-export GOPATH=`pwd`/gopath
-export GOROOT=`pwd`/goroot
-export PATH=$GOPATH/bin:$PATH
+wget https://dl.google.com/go/go1.23.6.linux-amd64.tar.gz
+tar -xf go1.23.6.linux-amd64.tar.gz
+export GOROOT=`pwd`/go
 export PATH=$GOROOT/bin:$PATH
 ```
 
@@ -47,8 +45,8 @@ See [Go: Download and install](https://golang.org/doc/install) for other options
 To download and build `syzkaller`:
 
 ``` bash
-go get -u -d github.com/google/syzkaller/prog
-cd gopath/src/github.com/google/syzkaller/
+git clone https://github.com/google/syzkaller
+cd syzkaller
 make
 ```
 
@@ -56,11 +54,6 @@ As the result compiled binaries should appear in the `bin/` dir.
 
 Note: if you want to do cross-OS/arch testing, you need to specify `TARGETOS`,
 `TARGETVMARCH` and `TARGETARCH` arguments to `make`. See the [Makefile](/Makefile) for details.
-
-Note: older versions of Go toolchain formatted code in a slightly
-[different way](https://github.com/golang/go/issues/25161).
-So if you are seeing unrelated code formatting diffs after running `make generate`
-or `make format`, you may be using `Go 1.10` or older. In such case update to `Go 1.13+`.
 
 ### Environment
 
@@ -75,9 +68,9 @@ Make sure that your GCC meets this requirement, or get a GCC that [syzbot](/docs
 ### Linux Kernel
 
 Besides coverage support in GCC, you also need support for it on the kernel side.
-KCOV was added into mainline Linux kernel in version 4.6 and is be enabled by `CONFIG_KCOV=y` kernel configation option.
+KCOV was added into mainline Linux kernel in version 4.6 and is be enabled by `CONFIG_KCOV=y` kernel configuration option.
 For older kernels you need to at least backport commit [kernel: add kcov code coverage](https://github.com/torvalds/linux/commit/5c9a8750a6409c63a0f01d51a9024861022f6593).
-Besides that, it's recomended to backport all kernel patches that touch `kernel/kcov.c`.
+Besides that, it's recommended to backport all kernel patches that touch `kernel/kcov.c`.
 
 To enable more syzkaller features and improve bug detection abilities, it's recommended to use additional config options.
 See [this page](kernel_configs.md) for details.
@@ -85,7 +78,7 @@ See [this page](kernel_configs.md) for details.
 ### VM Setup
 
 Syzkaller performs kernel fuzzing on worker virtual machines or physical devices.
-These worker enviroments are referred to as VMs.
+These worker environments are referred to as VMs.
 Out-of-the-box syzkaller supports QEMU, kvmtool and GCE virtual machines, Android devices and Odroid C2 boards.
 
 These are the generic requirements for a syzkaller VM:

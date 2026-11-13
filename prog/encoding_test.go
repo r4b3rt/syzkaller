@@ -6,37 +6,32 @@ package prog
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"math/rand"
 	"reflect"
-	"sort"
+	"slices"
 	"testing"
-)
 
-func setToArray(s map[string]struct{}) []string {
-	a := make([]string, 0, len(s))
-	for c := range s {
-		a = append(a, c)
-	}
-	sort.Strings(a)
-	return a
-}
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
 
 func TestSerializeData(t *testing.T) {
 	t.Parallel()
 	r := rand.New(rand.NewSource(0))
 	for _, readable := range []bool{false, true} {
-		for i := 0; i < 1e3; i++ {
+		for range 1000 {
 			data := make([]byte, r.Intn(4))
 			for i := range data {
 				data[i] = byte(r.Intn(256))
 			}
 			buf := new(bytes.Buffer)
 			serializeData(buf, data, readable)
-			p := newParser(nil, buf.Bytes(), true)
+			p := newParser(nil, buf.Bytes(), true, false)
 			if !p.Scan() {
 				t.Fatalf("parser does not scan")
 			}
-			data1, err := p.deserializeData()
+			data1, _, err := p.deserializeData()
 			if err != nil {
 				t.Fatalf("failed to deserialize %q -> %s: %v", data, buf.Bytes(), err)
 			}
@@ -80,12 +75,13 @@ func TestCallSet(t *testing.T) {
 			1,
 		},
 		{
-			"getpid()\n" +
-				"open(0x1, something that this package may not understand)\n" +
-				"getpid()\n" +
-				"#read()\n" +
-				"\n" +
-				"close$foo(&(0x0000) = {})\n",
+			`getpid()
+open(0x1, something that this package may not understand)
+getpid()
+#read()
+
+close$foo(&(0x0000) = {})
+`,
 			true,
 			[]string{"getpid", "open", "close$foo"},
 			4,
@@ -100,8 +96,11 @@ func TestCallSet(t *testing.T) {
 			if err == nil && !test.ok {
 				t.Fatalf("parsing did not fail")
 			}
-			callArray := setToArray(calls)
-			sort.Strings(test.calls)
+			callArray := slices.Sorted(maps.Keys(calls))
+			if callArray == nil {
+				callArray = []string{}
+			}
+			slices.Sort(test.calls)
 			if !reflect.DeepEqual(callArray, test.calls) {
 				t.Fatalf("got call set %+v, expect %+v", callArray, test.calls)
 			}
@@ -115,7 +114,7 @@ func TestCallSet(t *testing.T) {
 func TestCallSetRandom(t *testing.T) {
 	target, rs, iters := initTest(t)
 	ct := target.DefaultChoiceTable()
-	for i := 0; i < iters; i++ {
+	for range iters {
 		const ncalls = 10
 		p := target.Generate(rs, ncalls, ct)
 		calls0 := make(map[string]struct{})
@@ -126,8 +125,8 @@ func TestCallSetRandom(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CallSet failed: %v", err)
 		}
-		callArray0 := setToArray(calls0)
-		callArray1 := setToArray(calls1)
+		callArray0 := slices.Sorted(maps.Keys(calls0))
+		callArray1 := slices.Sorted(maps.Keys(calls1))
 		if !reflect.DeepEqual(callArray0, callArray1) {
 			t.Fatalf("got call set:\n%+v\nexpect:\n%+v", callArray1, callArray0)
 		}
@@ -226,12 +225,12 @@ func TestDeserialize(t *testing.T) {
 		{
 			In:        `test$type_confusion1(&(0x7f0000000000)=@unknown)`,
 			Out:       `test$type_confusion1(&(0x7f0000000000))`,
-			StrictErr: "wrong union option",
+			StrictErr: `wrong option "unknown" of union "type_confusion", available options are: "f1"`,
 		},
 		{
 			In:        `test$type_confusion1(&(0x7f0000000000)=@unknown={0x0, 'abc'}, 0x0)`,
 			Out:       `test$type_confusion1(&(0x7f0000000000))`,
-			StrictErr: "wrong union option",
+			StrictErr: `wrong option "unknown" of union "type_confusion", available options are: "f1"`,
 		},
 		{
 			In:        `test$excessive_fields1(&(0x7f0000000000)=0x0)`,
@@ -240,6 +239,14 @@ func TestDeserialize(t *testing.T) {
 		},
 		{
 			In: `test$excessive_fields1(0xffffffffffffffff)`,
+		},
+		{
+			In:  `serialize1(&(0x7f0000000000)="0000000000000000", 300000)`,
+			Out: `serialize1(&(0x7f0000000000)=""/8, 0x493e0)`,
+		},
+		{
+			In:  `serialize1(&(0x7f0000000000)="0000000000000000", 010)`,
+			Out: `serialize1(&(0x7f0000000000)=""/8, 0x8)`,
 		},
 		{
 			In: `test$excessive_fields1(0xfffffffffffffffe)`,
@@ -259,6 +266,26 @@ func TestDeserialize(t *testing.T) {
 		{
 			In:  `test$auto0(AUTO, &AUTO={AUTO, AUTO, AUTO}, AUTO, 0x0)`,
 			Err: `wrong type *prog.IntType for AUTO`,
+		},
+		{
+			In:  `test$csum_ipv4(&(0x7f0000000000)={AUTO, 0x0, 0x0})`,
+			Out: `test$csum_ipv4(&(0x7f0000000000)={0x0, 0x0, 0x0})`,
+		},
+		{
+			In:  `test$auto1(AUTO, &AUTO=AUTO, AUTO, 0x0)`,
+			Out: `test$auto1(0x42, &(0x7f0000000040)={0xc, 0x43, 0x0}, 0xc, 0x0)`,
+		},
+		{
+			In:  `test$auto2(AUTO, &AUTO=AUTO, AUTO, 0x0)`,
+			Out: `test$auto2(0x42, &(0x7f0000000040)={0x10, {0xc, 0x43, 0x0}}, 0x10, 0x0)`,
+		},
+		{
+			In:  `test$auto0(AUTO, &AUTO=AUTO, AUTO, 0x0)`,
+			Err: `wrong type *prog.IntType for AUTO`,
+		},
+		{
+			In:  `test$bf2(&AUTO={AUTO, 0x10, 0x0, AUTO})`,
+			Out: `test$bf2(&(0x7f0000000040)={0x8, 0x10, 0x0, 0x18})`,
 		},
 		{
 			In:  `test$str0(&AUTO="303100090a0d7022273a")`,
@@ -331,6 +358,33 @@ func TestDeserialize(t *testing.T) {
 			In:  `test$opt2(0x0) (fail_nth: 0)`,
 			Out: `test$opt2(0x0)`,
 		},
+		{
+			In:  `test$str2(&(0x7f0000000000)="$eJwqrqzKTszJSS0CBAAA//8TyQPi`,
+			Err: `want ", got EOF`,
+		},
+		{
+			In: `mutate9(&(0x7f0000000000)='./local/filename\x00')`,
+		},
+		{
+			In:  `mutate9(&(0x7f0000000000)='/escaping/filename\x00')`,
+			Err: `escapes sandbox`,
+		},
+		{
+			In:  "test$opt2(0x0)\r",
+			Out: "test$opt2(0x0)",
+		},
+		{
+			In:  "test$opt2(0x0)\r\n",
+			Out: "test$opt2(0x0)",
+		},
+		{
+			In:  "test$opt2(0x0) \t\r\n",
+			Out: "test$opt2(0x0)",
+		},
+		{
+			In:  "  test$opt2(0x0)",
+			Out: "test$opt2(0x0)",
+		},
 	})
 }
 
@@ -344,45 +398,69 @@ func TestSerializeDeserialize(t *testing.T) {
 			In:  `serialize1(&(0x7f0000000000)="0000000000000000", 0x8)`,
 			Out: `serialize1(&(0x7f0000000000)=""/8, 0x8)`,
 		},
+		{
+			In:  `serialize2(&(0x7f0000000000)="$c3l6a2FsbGVy")`,
+			Out: `serialize2(&(0x7f0000000000)='syzkaller')`,
+		},
+		{
+			In: `serialize3(&(0x7f0000000000)="$eJwqrqzKTszJSS0CBAAA//8TyQPi")`,
+		},
+		{
+			In:        `foo$any_filename(&(0x7f0000000000)=ANY=[@ANYBLOB='/'])`,
+			Out:       `foo$any_filename(&(0x7f0000000000)=@complex={0x0, 0x0, 0x0, 0x0, {0x0, 0x0, 0x0, 0x0, 0x0, 0x0}, []})`,
+			StrictErr: `wrong array arg`,
+		},
+	})
+}
+
+func TestDeserializeDataMmapProg(t *testing.T) {
+	testEachTarget(t, func(t *testing.T, target *Target) {
+		p := target.DataMmapProg()
+		data := p.Serialize()
+		p2, err := target.Deserialize(data, StrictUnsafe)
+		assert.NoError(t, err)
+		data2 := p2.Serialize()
+		assert.Equal(t, string(data), string(data2))
+		p.SerializeForExec()
 	})
 }
 
 func TestSerializeDeserializeRandom(t *testing.T) {
 	testEachTargetRandom(t, func(t *testing.T, target *Target, rs rand.Source, iters int) {
 		ct := target.DefaultChoiceTable()
-		data0 := make([]byte, ExecBufferSize)
-		data1 := make([]byte, ExecBufferSize)
-		for i := 0; i < iters; i++ {
+		for range iters {
 			p0 := target.Generate(rs, 10, ct)
-			if ok, _, _ := testSerializeDeserialize(t, p0, data0, data1); ok {
+			if p0.countArgs() > maxArgCutoff {
 				continue
 			}
-			p0, _ = Minimize(p0, -1, false, func(p1 *Prog, _ int) bool {
-				ok, _, _ := testSerializeDeserialize(t, p1, data0, data1)
+			if _, _, ok := testSerializeDeserialize(t, p0); ok {
+				continue
+			}
+			p0, _ = Minimize(p0, -1, MinimizeCorpus, func(p1 *Prog, _ int) bool {
+				_, _, ok := testSerializeDeserialize(t, p1)
 				return !ok
 			})
-			ok, n0, n1 := testSerializeDeserialize(t, p0, data0, data1)
+			data0, data1, ok := testSerializeDeserialize(t, p0)
 			if ok {
 				t.Log("flaky?")
 			}
-			decoded0, err := target.DeserializeExec(data0[:n0])
+			decoded0, err := target.DeserializeExec(data0, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
-			decoded1, err := target.DeserializeExec(data1[:n1])
+			decoded1, err := target.DeserializeExec(data1, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			t.Logf("decoded0: %+v", decoded0)
 			t.Logf("decoded1: %+v", decoded1)
-			t.Fatalf("was: %q\ngot: %q\nprogram:\n%s",
-				data0[:n0], data1[:n1], p0.Serialize())
+			t.Fatalf("was: %q\ngot: %q\nprogram:\n%s", data0, data1, p0.Serialize())
 		}
 	})
 }
 
-func testSerializeDeserialize(t *testing.T, p0 *Prog, data0, data1 []byte) (bool, int, int) {
-	n0, err := p0.SerializeForExec(data0)
+func testSerializeDeserialize(t *testing.T, p0 *Prog) ([]byte, []byte, bool) {
+	data0, err := p0.SerializeForExec()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,16 +469,16 @@ func testSerializeDeserialize(t *testing.T, p0 *Prog, data0, data1 []byte) (bool
 	if err != nil {
 		t.Fatal(err)
 	}
-	n1, err := p1.SerializeForExec(data1)
+	data1, err := p1.SerializeForExec()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(data0[:n0], data1[:n1]) {
-		t.Logf("PROG0:\n%s\n", p0.Serialize())
-		t.Logf("PROG1:\n%s\n", p1.Serialize())
-		return false, n0, n1
+	if !bytes.Equal(data0, data1) {
+		t.Logf("PROG0:\n%s", p0.Serialize())
+		t.Logf("PROG1:\n%s", p1.Serialize())
+		return data0, data1, false
 	}
-	return true, 0, 0
+	return nil, nil, true
 }
 
 func TestSerializeCallProps(t *testing.T) {
@@ -421,7 +499,7 @@ func TestSerializeCallProps(t *testing.T) {
 		},
 		{
 			"serialize0(0x0) (fail_nth: 5)\n",
-			[]CallProps{{5}},
+			[]CallProps{{5, false, 0}},
 		},
 		{
 			"serialize0(0x0) (fail_nth)\n",
@@ -430,6 +508,14 @@ func TestSerializeCallProps(t *testing.T) {
 		{
 			"serialize0(0x0) (fail_nth: \"5\")\n",
 			nil,
+		},
+		{
+			"serialize0(0x0) (async)\n",
+			[]CallProps{{0, true, 0}},
+		},
+		{
+			"serialize0(0x0) (async, rerun: 10)\n",
+			[]CallProps{{0, true, 10}},
 		},
 	}
 
@@ -488,4 +574,53 @@ serialize0(0x0)
 	if !reflect.DeepEqual(p.Comments, wantComments) {
 		t.Errorf("bad program comments %q\nwant: %q", p.Comments, wantComments)
 	}
+}
+
+func TestHasNext(t *testing.T) {
+	testCases := []struct {
+		input    string
+		expected bool
+	}{
+		{"abcdef", true},
+		{"xyz", false},
+		{"ab", false},
+		{"abc", true},
+	}
+	for _, testCase := range testCases {
+		p := newParser(nil, []byte(testCase.input), true, false)
+		if !p.Scan() {
+			t.Fatalf("parser does not scan")
+		}
+		result := p.HasNext("abc")
+		if result != testCase.expected {
+			t.Errorf("expected HasNext(\"abc\") on input %q to be %v, but got %v",
+				testCase.input, testCase.expected, result)
+		}
+	}
+}
+
+// nolint: lll
+func TestDeserializeSkipImage(t *testing.T) {
+	target := initTargetTest(t, "linux", "amd64")
+	p, err := target.Deserialize([]byte(`
+syz_mount_image$ext4(&(0x7f0000000080)='ext4\x00', &(0x7f00000000c0)='./file0\x00', 0x0, &(0x7f0000000100), 0x1, 0x71, &(0x7f0000000140)="$eJzszrENAVAUBdDrLyASnUIYwA5GESWdiljJDiYwgg0UWs1XfArfABI5J3kvue827/I4Tc6zpA6T2tntD5vVtu3wl0qSUZJxkum85duydYNXf70f1+/59b8AAAAAAAAAwLeSRZ8/Ds8AAAD//9ZiI98=")
+`), Strict)
+	require.NoError(t, err)
+	assert.Equal(t, `syz_mount_image$ext4(&(0x7f0000000080)='ext4\x00', &(0x7f00000000c0)='./file0\x00', 0x0, &(0x7f0000000100), 0x1, 0x71, &(0x7f0000000140)="<<IMAGE>>")
+`,
+		string(p.Serialize(SkipImages)))
+}
+
+func TestValidateMultipleErrors(t *testing.T) {
+	target := initTargetTest(t, "linux", "amd64")
+	data := []byte(`
+openat(0xffffffffffffff9c, &(0x7f0000000000)='../file1\x00', 0x0, 0x0)
+openat(0xffffffffffffff9c, &(0x7f0000000040)='../file2\x00', 0x0, 0x0)
+`)
+	_, err := target.Deserialize(data, Strict)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "call #0 openat")
+	assert.Contains(t, err.Error(), "filename \"../file1\\x00\" escapes sandbox")
+	assert.Contains(t, err.Error(), "call #1 openat")
+	assert.Contains(t, err.Error(), "filename \"../file2\\x00\" escapes sandbox")
 }

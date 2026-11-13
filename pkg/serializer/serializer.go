@@ -1,6 +1,7 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package serializer provides formatting and serialization of Go data structures.
 package serializer
 
 import (
@@ -16,7 +17,7 @@ import (
 // does not write package names before types, omits struct fields with default values,
 // omits type names where possible, etc. On the other hand, it currently does not
 // support all types (e.g. channels and maps).
-func Write(ww io.Writer, i interface{}) {
+func Write(ww io.Writer, i any) {
 	w := writer{ww}
 	v := reflect.ValueOf(i)
 	if v.Kind() == reflect.Slice && (v.IsNil() || v.Len() == 0) {
@@ -25,6 +26,12 @@ func Write(ww io.Writer, i interface{}) {
 		return
 	}
 	w.do(v, false)
+}
+
+func WriteString(i any) string {
+	var sb strings.Builder
+	Write(&sb, i)
+	return sb.String()
 }
 
 type writer struct {
@@ -86,11 +93,11 @@ func (w *writer) doInterface(v reflect.Value) {
 	elem := v.Elem()
 	// Handling of user types that has underlying primitive types. Consider:
 	//	type T int
-	//	var obj interface{} = T(42)
+	//	var obj any = T(42)
 	// T has kind reflect.Int. But if we serialize obj as just "42", it will be turned into plain int.
 	// Detect this case and serialize obj as "T(42)".
 	if (elem.Kind() == reflect.Bool || elem.Kind() == reflect.String ||
-		elem.Type().ConvertibleTo(reflect.TypeOf(0))) &&
+		elem.Type().ConvertibleTo(reflect.TypeFor[int]())) &&
 		strings.Contains(elem.Type().String(), ".") {
 		w.string(elem.Type().Name())
 		w.byte('(')
@@ -111,7 +118,7 @@ func (w *writer) doSlice(v reflect.Value) {
 	if sub == reflect.Ptr || sub == reflect.Interface || sub == reflect.Struct {
 		// Elem per-line.
 		w.string("{\n")
-		for i := 0; i < v.Len(); i++ {
+		for i := range v.Len() {
 			w.do(v.Index(i), true)
 			w.string(",\n")
 		}
@@ -120,7 +127,7 @@ func (w *writer) doSlice(v reflect.Value) {
 	}
 	// All on one line.
 	w.byte('{')
-	for i := 0; i < v.Len(); i++ {
+	for i := range v.Len() {
 		if i > 0 {
 			w.byte(',')
 		}
@@ -135,15 +142,14 @@ func (w *writer) doStruct(v reflect.Value, sliceElem bool) {
 	}
 	w.byte('{')
 	fieldNames := false
-	for i := 0; i < v.NumField(); i++ {
-		f := v.Field(i)
+	for _, f := range v.Fields() {
 		if isDefaultValue(f) || !f.CanSet() {
 			fieldNames = true
 			break
 		}
 	}
 	needComma := false
-	for i := 0; i < v.NumField(); i++ {
+	for i := range v.NumField() {
 		f := v.Field(i)
 		if fieldNames && (isDefaultValue(f) || !f.CanSet()) {
 			continue
@@ -195,8 +201,8 @@ func isDefaultValue(v reflect.Value) bool {
 	case reflect.Slice:
 		return v.IsNil() || v.Len() == 0
 	case reflect.Struct:
-		for i := 0; i < v.NumField(); i++ {
-			if !isDefaultValue(v.Field(i)) {
+		for _, field := range v.Fields() {
+			if !isDefaultValue(field) {
 				return false
 			}
 		}

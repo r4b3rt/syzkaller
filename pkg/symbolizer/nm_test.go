@@ -8,11 +8,11 @@ import (
 )
 
 func TestSymbols(t *testing.T) {
-	symb := NewSymbolizer(nil)
-	symbols, err := symb.ReadTextSymbols("testdata/nm.test.out")
+	symbols, err := ReadTextSymbols("testdata/nm.test.out")
 	if err != nil {
 		t.Fatalf("failed to read symbols: %v", err)
 	}
+	t.Logf("symbols: %+v", symbols)
 	if len(symbols) != 5 {
 		t.Fatalf("got %v symbols, want 5", len(symbols))
 	}
@@ -36,11 +36,11 @@ func TestSymbols(t *testing.T) {
 		want := []Symbol{
 			{
 				Addr: 0x4004fa,
-				Size: 0x10,
+				Size: 0xd,
 			},
 			{
 				Addr: 0x4004ed,
-				Size: 0x10,
+				Size: 0xd,
 			},
 		}
 		if !symcmp(want[0], s[0]) && !symcmp(want[0], s[1]) {

@@ -5,49 +5,87 @@
 package main
 
 import (
+	"errors"
 	"flag"
-	"io/ioutil"
+	"fmt"
 	"os"
 	"runtime"
 
 	"github.com/google/syzkaller/pkg/build"
+	"github.com/google/syzkaller/pkg/debugtracer"
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/tool"
 )
 
 var (
-	flagOS            = flag.String("os", runtime.GOOS, "OS to test")
-	flagArch          = flag.String("arch", runtime.GOARCH, "arch to test")
+	flagOS            = flag.String("os", runtime.GOOS, "OS to build")
+	flagArch          = flag.String("arch", runtime.GOARCH, "arch to build")
+	flagVM            = flag.String("vm", "gce", "VM type to build")
 	flagKernelSrc     = flag.String("kernel_src", "", "path to kernel checkout")
+	flagMake          = flag.String("make", "", "non-default make")
+	flagCompiler      = flag.String("compiler", "", "non-default compiler")
+	flagLinker        = flag.String("linker", "", "non-default linker")
+	flagCcache        = flag.String("ccache", "", "ccache executable")
 	flagKernelConfig  = flag.String("config", "", "kernel config file")
 	flagKernelSysctl  = flag.String("sysctl", "", "kernel sysctl file")
 	flagKernelCmdline = flag.String("cmdline", "", "kernel cmdline file")
 	flagUserspace     = flag.String("userspace", "", "path to userspace for build")
+	flagBuilderImage  = flag.String("builder_image", "",
+		"optional VM image used to build the kernel, needed for some cross-compilation targets")
+	flagCPUs  = flag.Int("cpus", 0, "number of CPUs to use for build (0 = all)")
+	flagTrace = flag.Bool("trace", false, "trace build process and save debug artefacts")
 )
 
 func main() {
 	flag.Parse()
 	if os.Getuid() != 0 {
-		tool.Failf("image build will fail, run under root")
+		fmt.Printf("not running under root, image build may fail\n")
 	}
 	os.Setenv("SYZ_DISABLE_SANDBOXING", "yes")
-	kernelConfig, err := ioutil.ReadFile(*flagKernelConfig)
+	var kernelConfig []byte
+	if *flagKernelConfig != "" {
+		var err error
+		kernelConfig, err = os.ReadFile(*flagKernelConfig)
+		if err != nil {
+			tool.Fail(err)
+		}
+	}
+	wd, err := os.Getwd()
 	if err != nil {
 		tool.Fail(err)
 	}
 	params := build.Params{
 		TargetOS:     *flagOS,
 		TargetArch:   *flagArch,
-		VMType:       "gce",
+		VMType:       *flagVM,
 		KernelDir:    *flagKernelSrc,
-		OutputDir:    ".",
-		Compiler:     "",
-		Ccache:       "",
+		OutputDir:    wd,
+		Make:         *flagMake,
+		Compiler:     *flagCompiler,
+		Linker:       *flagLinker,
+		Ccache:       *flagCcache,
 		UserspaceDir: *flagUserspace,
+		BuilderImage: *flagBuilderImage,
 		CmdlineFile:  *flagKernelCmdline,
 		SysctlFile:   *flagKernelSysctl,
 		Config:       kernelConfig,
+		BuildCPUs:    *flagCPUs,
+		Tracer:       &debugtracer.NullTracer{},
 	}
-	if _, err := build.Image(params); err != nil {
-		tool.Fail(err)
+	if *flagTrace {
+		params.Tracer = &debugtracer.GenericTracer{
+			TraceWriter: os.Stdout,
+			OutDir:      ".",
+		}
 	}
+	details, err := build.Image(params)
+	if err != nil {
+		msg := osutil.VerboseMessage(err)
+		if kernelErr, ok := errors.AsType[*build.KernelError](err); ok {
+			msg += "\n" + string(kernelErr.Output)
+		}
+		tool.Failf("%s", msg)
+	}
+	params.Tracer.Logf("signature: %v", details.Signature)
+	params.Tracer.Logf("compiler: %v", details.CompilerID)
 }

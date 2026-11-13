@@ -7,35 +7,45 @@ package gvisor
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/google/syzkaller/pkg/config"
+	"github.com/google/syzkaller/pkg/gvisor"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm/vmimpl"
 )
 
 func init() {
-	vmimpl.Register("gvisor", ctor, true)
+	vmimpl.Register(targets.GVisor, vmimpl.Type{
+		Ctor:       ctor,
+		Overcommit: true,
+	})
 }
 
 type Config struct {
-	Count     int    `json:"count"` // number of VMs to use
-	RunscArgs string `json:"runsc_args"`
+	Count            int    `json:"count"` // number of VMs to use
+	RunscArgs        string `json:"runsc_args"`
+	MemoryTotalBytes uint64 `json:"memory_total_bytes"`
+	CPUs             uint64 `json:"cpus"`
 }
 
 type Pool struct {
-	env *vmimpl.Env
-	cfg *Config
+	env   *vmimpl.Env
+	cfg   *Config
+	runsc string
 }
 
 type instance struct {
@@ -55,21 +65,32 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 		Count: 1,
 	}
 	if err := config.LoadData(env.Config, cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse vm config: %v", err)
+		return nil, fmt.Errorf("failed to parse vm config: %w", err)
 	}
 	if cfg.Count < 1 || cfg.Count > 128 {
 		return nil, fmt.Errorf("invalid config param count: %v, want [1, 128]", cfg.Count)
 	}
-	if env.Debug && cfg.Count > 1 {
-		log.Logf(0, "limiting number of VMs from %v to 1 in debug mode", cfg.Count)
-		cfg.Count = 1
+	hostTotalMemory := osutil.SystemMemorySize()
+	minMemory := uint64(cfg.Count) * 10_000_000
+	if cfg.MemoryTotalBytes != 0 && (cfg.MemoryTotalBytes < minMemory || cfg.MemoryTotalBytes > hostTotalMemory) {
+		return nil, fmt.Errorf("invalid config param memory_total_bytes: %v, want [%d,%d]",
+			minMemory, cfg.MemoryTotalBytes, hostTotalMemory)
 	}
 	if !osutil.IsExist(env.Image) {
 		return nil, fmt.Errorf("image file %q does not exist", env.Image)
 	}
+	imageDir := filepath.Join(env.Workdir, "gvisor-image")
+	if err := os.RemoveAll(imageDir); err != nil {
+		return nil, err
+	}
+	runsc, err := gvisor.Extract(env.Image, imageDir)
+	if err != nil {
+		return nil, err
+	}
 	pool := &Pool{
-		cfg: cfg,
-		env: env,
+		cfg:   cfg,
+		env:   env,
+		runsc: runsc,
 	}
 	return pool, nil
 }
@@ -78,7 +99,7 @@ func (pool *Pool) Count() int {
 	return pool.cfg.Count
 }
 
-func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
+func (pool *Pool) Create(_ context.Context, workdir string, index int) (vmimpl.Instance, error) {
 	rootDir := filepath.Clean(filepath.Join(workdir, "..", "gvisor_root"))
 	imageDir := filepath.Join(workdir, "image")
 	bundleDir := filepath.Join(workdir, "bundle")
@@ -93,13 +114,24 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 		}
 		caps += "\"" + c + "\""
 	}
-	vmConfig := fmt.Sprintf(configTempl, imageDir, caps)
+	name := fmt.Sprintf("%v-%v", pool.env.Name, index)
+	memoryLimit := int64(pool.cfg.MemoryTotalBytes / uint64(pool.Count()))
+	if pool.cfg.MemoryTotalBytes == 0 {
+		memoryLimit = -1
+	}
+	cpuPeriod := uint64(100000)
+	cpus := pool.cfg.CPUs
+	if cpus == 0 {
+		cpus = uint64(runtime.NumCPU())
+	}
+	cpuLimit := cpuPeriod * cpus
+	vmConfig := fmt.Sprintf(configTempl, imageDir, caps, name, memoryLimit, cpuLimit, cpuPeriod)
 	if err := osutil.WriteFile(filepath.Join(bundleDir, "config.json"), []byte(vmConfig)); err != nil {
 		return nil, err
 	}
 	bin, err := exec.LookPath(os.Args[0])
 	if err != nil {
-		return nil, fmt.Errorf("failed to lookup %v: %v", os.Args[0], err)
+		return nil, fmt.Errorf("failed to lookup %v: %w", os.Args[0], err)
 	}
 	if err := osutil.CopyFile(bin, filepath.Join(imageDir, "init")); err != nil {
 		return nil, err
@@ -134,16 +166,16 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 		tee = os.Stdout
 	}
 	merger := vmimpl.NewOutputMerger(tee)
-	merger.Add("gvisor", rpipe)
-	merger.Add("gvisor-goruntime", panicLogReadFD)
+	merger.Add("runsc", vmimpl.OutputConsole, rpipe)
+	merger.Add("runsc-goruntime", vmimpl.OutputConsole, panicLogReadFD)
 
 	inst := &instance{
 		cfg:      pool.cfg,
-		image:    pool.env.Image,
+		image:    pool.runsc,
 		debug:    pool.env.Debug,
 		rootDir:  rootDir,
 		imageDir: imageDir,
-		name:     fmt.Sprintf("%v-%v", pool.env.Name, index),
+		name:     name,
 		merger:   merger,
 	}
 
@@ -151,7 +183,7 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 	osutil.Run(time.Minute, inst.runscCmd("delete", "-force", inst.name))
 	time.Sleep(3 * time.Second)
 
-	cmd := inst.runscCmd("--panic-log", panicLog, "run", "-bundle", bundleDir, inst.name)
+	cmd := inst.runscCmd("--panic-log", panicLog, "--cpu-num-from-quota", "run", "-bundle", bundleDir, inst.name)
 	cmd.Stdout = wpipe
 	cmd.Stderr = wpipe
 	if err := cmd.Start(); err != nil {
@@ -177,10 +209,12 @@ func (inst *instance) waitBoot() error {
 	timeout := time.NewTimer(time.Minute)
 	defer timeout.Stop()
 	var output []byte
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	for {
 		select {
 		case out := <-inst.merger.Output:
-			output = append(output, out...)
+			output = append(output, out.Data...)
 			if pos := bytes.Index(output, errorMsg); pos != -1 {
 				end := bytes.IndexByte(output[pos:], '\n')
 				if end == -1 {
@@ -196,7 +230,7 @@ func (inst *instance) waitBoot() error {
 			if bytes.Contains(output, bootedMsg) {
 				return nil
 			}
-		case err := <-inst.merger.Err:
+		case err := <-inst.merger.Errors(ctx):
 			return vmimpl.BootError{
 				Title:  fmt.Sprintf("runsc failed: %v", err),
 				Output: output,
@@ -210,7 +244,7 @@ func (inst *instance) waitBoot() error {
 	}
 }
 
-func (inst *instance) runscCmd(add ...string) *exec.Cmd {
+func (inst *instance) args() []string {
 	args := []string{
 		"-root", inst.rootDir,
 		"-watchdog-action=panic",
@@ -223,16 +257,28 @@ func (inst *instance) runscCmd(add ...string) *exec.Cmd {
 	if inst.cfg.RunscArgs != "" {
 		args = append(args, strings.Split(inst.cfg.RunscArgs, " ")...)
 	}
-	args = append(args, add...)
-	cmd := osutil.Command(inst.image, args...)
+	return args
+}
+
+func (inst *instance) Info() ([]byte, error) {
+	info := fmt.Sprintf("%v %v\n", inst.image, strings.Join(inst.args(), " "))
+	return []byte(info), nil
+}
+
+func (inst *instance) runscCmd(add ...string) *exec.Cmd {
+	cmd := osutil.Command(inst.image, append(inst.args(), add...)...)
 	cmd.Env = []string{
 		"GOTRACEBACK=all",
 		"GORACE=halt_on_error=1",
+		// New glibc-s enable rseq by default but ptrace and systrap
+		// platforms don't work in this case. runsc is linked with libc
+		// only when the race detector is enabled.
+		"GLIBC_TUNABLES=glibc.pthread.rseq=0",
 	}
 	return cmd
 }
 
-func (inst *instance) Close() {
+func (inst *instance) Close() error {
 	time.Sleep(3 * time.Second)
 	osutil.Run(time.Minute, inst.runscCmd("delete", "-force", inst.name))
 	inst.cmd.Process.Kill()
@@ -240,6 +286,7 @@ func (inst *instance) Close() {
 	inst.cmd.Wait()
 	osutil.Run(time.Minute, inst.runscCmd("delete", "-force", inst.name))
 	time.Sleep(3 * time.Second)
+	return nil
 }
 
 func (inst *instance) Forward(port int) (string, error) {
@@ -247,7 +294,7 @@ func (inst *instance) Forward(port int) (string, error) {
 		return "", fmt.Errorf("forward port is already setup")
 	}
 	inst.port = port
-	return "stdin", nil
+	return "stdin:0", nil
 }
 
 func (inst *instance) Copy(hostSrc string) (string, error) {
@@ -261,8 +308,8 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	return filepath.Join("/", fname), nil
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
-	<-chan []byte, <-chan error, error) {
+func (inst *instance) Run(ctx context.Context, command string) (
+	<-chan vmimpl.Chunk, <-chan error, error) {
 	args := []string{"exec", "-user=0:0"}
 	for _, c := range sandboxCaps {
 		args = append(args, "-cap", c)
@@ -276,9 +323,18 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 		return nil, nil, err
 	}
 	defer wpipe.Close()
-	inst.merger.Add("cmd", rpipe)
+	inst.merger.Add("cmd", vmimpl.OutputStdout, rpipe)
+
+	rpipeErr, wpipeErr, err := osutil.LongPipe()
+	if err != nil {
+		rpipe.Close()
+		return nil, nil, err
+	}
+	defer wpipeErr.Close()
+	inst.merger.Add("cmd-err", vmimpl.OutputStderr, rpipeErr)
+
 	cmd.Stdout = wpipe
-	cmd.Stderr = wpipe
+	cmd.Stderr = wpipeErr
 
 	guestSock, err := inst.guestProxy()
 	if err != nil {
@@ -301,12 +357,12 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	}
 
 	go func() {
+		errCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 		select {
-		case <-time.After(timeout):
+		case <-ctx.Done():
 			signal(vmimpl.ErrTimeout)
-		case <-stop:
-			signal(vmimpl.ErrTimeout)
-		case err := <-inst.merger.Err:
+		case err := <-inst.merger.Errors(errCtx):
 			cmd.Process.Kill()
 			if cmdErr := cmd.Wait(); cmdErr == nil {
 				// If the command exited successfully, we got EOF error from merger.
@@ -396,17 +452,35 @@ const configTempl = `
 		"path": "%[1]v",
 		"readonly": true
 	},
+	"linux": {
+		"cgroupsPath": "%[3]v",
+		"resources": {
+			"cpu": {
+				"shares": 1024,
+				"period": %[6]d,
+				"quota": %[5]d
+			},
+			"memory": {
+				"limit": %[4]d,
+				"reservation": %[4]d,
+				"disableOOMKiller": false
+			}
+		},
+		"sysctl": {
+			"fs.nr_open": "1048576"
+		}
+	},
 	"process":{
-                "args": ["/init"],
-                "cwd": "/tmp",
-                "env": ["SYZ_GVISOR_PROXY=1"],
-                "capabilities": {
-                	"bounding": [%[2]v],
-                	"effective": [%[2]v],
-                	"inheritable": [%[2]v],
-                	"permitted": [%[2]v],
-                	"ambient": [%[2]v]
-                }
+		"args": ["/init"],
+		"cwd": "/tmp",
+		"env": ["SYZ_GVISOR_PROXY=1"],
+		"capabilities": {
+			"bounding": [%[2]v],
+			"effective": [%[2]v],
+			"inheritable": [%[2]v],
+			"permitted": [%[2]v],
+			"ambient": [%[2]v]
+		}
 	}
 }
 `

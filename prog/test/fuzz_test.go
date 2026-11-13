@@ -23,6 +23,16 @@ mutate7()
 mutate8()
 `,
 		`E`,
+		`
+test$str0(&(0x7f0000ffffd5)=ANY=[0])
+test$res2()
+test$res2()
+test$res2()
+test$res2()
+`,
+		`r=test$res0()
+test$recur2(&(293324893027559)={r})
+`,
 	} {
 		t.Logf("test #%v: %q", i, data)
 		inp := []byte(data)[:len(data):len(data)]

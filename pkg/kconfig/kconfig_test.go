@@ -5,9 +5,13 @@ package kconfig
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/syzkaller/sys/targets"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestParseKConfig(t *testing.T) {
@@ -20,6 +24,24 @@ func TestParseKConfig(t *testing.T) {
 mainmenu "test"
 config FOO
 	default "$(shell,$(srctree)/scripts/gcc-plugin.sh "$(preferred-plugin-hostcc)" "$(HOSTCXX)" "$(CC)")" if CC_IS_GCC
+`,
+		},
+		{
+			in: `
+mainmenu "test_transitional"
+config FOO
+	transitional
+`,
+		},
+		{
+			in: `
+mainmenu "test_if_depends"
+config FOO
+	bool "FOO"
+
+config BAR
+	bool "BAR"
+	depends on FOO if CC_IS_GCC
 `,
 		},
 	}
@@ -35,10 +57,65 @@ config FOO
 	}
 }
 
+func TestSelectedby(t *testing.T) {
+	configData := `
+mainmenu "test"
+
+config FEATURE_A
+    bool "Feature A"
+    select FEATURE_B
+
+config FEATURE_B
+    bool "Feature B"
+    select FEATURE_C
+
+config FEATURE_C
+    bool "Feature C"
+
+`
+	target := targets.Get("linux", "amd64")
+	kconf, err := ParseData(target, []byte(configData), "Kconfig")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assert.Empty(t, kconf.SelectedBy("FEATURE_A"))
+	assert.Equal(t, map[string]bool{
+		"FEATURE_A": true,
+	}, kconf.SelectedBy("FEATURE_B"))
+	assert.Equal(t, map[string]bool{
+		"FEATURE_A": true,
+		"FEATURE_B": true,
+	}, kconf.SelectedBy("FEATURE_C"))
+}
+
 func TestFuzzParseKConfig(t *testing.T) {
 	for _, data := range []string{
 		``,
 	} {
 		FuzzParseKConfig([]byte(data)[:len(data):len(data)])
+	}
+}
+
+func TestIncludeSourcePathTraversal(t *testing.T) {
+	outerDir := t.TempDir()
+	secretFile := filepath.Join(outerDir, "secret.txt")
+	const secretContent = "SUPER_SECRET_TOKEN_VALUE"
+	require.NoError(t, os.WriteFile(secretFile, []byte(secretContent), 0644))
+
+	repoDir := filepath.Join(outerDir, "repo")
+	require.NoError(t, os.MkdirAll(repoDir, 0755))
+	require.NoError(t, os.Symlink(secretFile, filepath.Join(repoDir, "Kconfig.symlink")))
+
+	target := targets.Get("linux", "amd64")
+	for _, sourcePath := range []string{"../secret.txt", "Kconfig.symlink"} {
+		t.Run(sourcePath, func(t *testing.T) {
+			kconfigPath := filepath.Join(repoDir, "Kconfig")
+			content := fmt.Sprintf("mainmenu \"test\"\nsource %q\n", sourcePath)
+			require.NoError(t, os.WriteFile(kconfigPath, []byte(content), 0644))
+
+			_, err := Parse(target, kconfigPath)
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), secretContent)
+		})
 	}
 }

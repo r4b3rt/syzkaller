@@ -5,25 +5,28 @@
 // The format aims at simple parsing: binary and irreversible.
 
 // Exec format is an sequence of uint64's which encodes a sequence of calls.
-// The sequence is terminated by a speciall call execInstrEOF.
+// The sequence is terminated by a special call execInstrEOF.
 // Each call is (call ID, copyout index, number of arguments, arguments...).
 // Each argument is (type, size, value).
-// There are 4 types of arguments:
+// There are the following types of arguments:
 //  - execArgConst: value is const value
+//  - execArgAddr32/64: constant address
 //  - execArgResult: value is copyout index we want to reference
 //  - execArgData: value is a binary blob (represented as ]size/8[ uint64's)
 //  - execArgCsum: runtime checksum calculation
-// There are 2 other special calls:
+// There are the following special calls:
 //  - execInstrCopyin: copies its second argument into address specified by first argument
 //  - execInstrCopyout: reads value at address specified by first argument (result can be referenced by execArgResult)
+//  - execInstrSetProps: sets special properties for the previous call
 
 package prog
 
 import (
-	"errors"
+	"cmp"
+	"encoding/binary"
 	"fmt"
 	"reflect"
-	"sort"
+	"slices"
 )
 
 const (
@@ -35,6 +38,8 @@ const (
 
 const (
 	execArgConst = uint64(iota)
+	execArgAddr32
+	execArgAddr64
 	execArgResult
 	execArgData
 	execArgCsum
@@ -58,31 +63,41 @@ const (
 	execMaxCommands = 1000 // executor knows about this constant (kMaxCommands)
 )
 
-var ErrExecBufferTooSmall = errors.New("encodingexec: provided buffer is too small")
-
 // SerializeForExec serializes program p for execution by process pid into the provided buffer.
 // Returns number of bytes written to the buffer.
 // If the provided buffer is too small for the program an error is returned.
-func (p *Prog) SerializeForExec(buffer []byte) (int, error) {
+func (p *Prog) SerializeForExec() ([]byte, error) {
 	p.debugValidate()
 	w := &execContext{
 		target: p.Target,
-		buf:    buffer,
-		eof:    false,
+		buf:    make([]byte, 0, 4<<10),
 		args:   make(map[Arg]argInfo),
 	}
+	w.write(uint64(len(p.Calls)))
 	for _, c := range p.Calls {
 		w.csumMap, w.csumUses = calcChecksumsCall(c)
-		w.serializeCall(c)
+		// TODO: if we propagate this error, something breaks and no coverage
+		// is displayed to the dashboard or the logs.
+		_ = w.serializeCall(c)
 	}
 	w.write(execInstrEOF)
-	if w.eof || w.copyoutSeq > execMaxCommands {
-		return 0, ErrExecBufferTooSmall
+	if len(w.buf) > ExecBufferSize {
+		return nil, fmt.Errorf("encodingexec: too large program (%v/%v)", len(w.buf), ExecBufferSize)
 	}
-	return len(buffer) - len(w.buf), nil
+	if w.copyoutSeq > execMaxCommands {
+		return nil, fmt.Errorf("encodingexec: too many resources (%v/%v)", w.copyoutSeq, execMaxCommands)
+	}
+	return w.buf, nil
 }
 
-func (w *execContext) serializeCall(c *Call) {
+func (w *execContext) serializeCall(c *Call) error {
+	// We introduce special serialization logic for kfuzztest targets, which
+	// require special handling due to their use of relocation tables to copy
+	// entire blobs of data into the kernel.
+	if c.Meta.Attrs.KFuzzTest {
+		return w.serializeKFuzzTestCall(c)
+	}
+
 	// Calculate arg offsets within structs.
 	// Generate copyin instructions that fill in data into pointer arguments.
 	w.writeCopyin(c)
@@ -112,12 +127,73 @@ func (w *execContext) serializeCall(c *Call) {
 
 	// Generate copyout instructions that persist interesting return values.
 	w.writeCopyout(c)
+	return nil
+}
+
+// KFuzzTest targets require special handling due to their use of relocation
+// tables for serializing all data (including pointed-to data) into a
+// continuous blob that can be passed into the kernel.
+func (w *execContext) serializeKFuzzTestCall(c *Call) error {
+	if !c.Meta.Attrs.KFuzzTest {
+		// This is a specialized function that shouldn't be called on anything
+		// other than an instance of a syz_kfuzztest_run$* syscall
+		panic("serializeKFuzzTestCall called on an invalid syscall")
+	}
+
+	// Generate the final syscall instruction with the update arguments.
+	kFuzzTestRunID, err := w.target.KFuzzTestRunID()
+	if err != nil {
+		panic(err)
+	}
+	// Ensures that we copy some arguments into the executor so that it doesn't
+	// receive an incomplete program on failure.
+	defer func() {
+		w.write(uint64(kFuzzTestRunID))
+		w.write(ExecNoCopyout)
+		w.write(uint64(len(c.Args)))
+		for _, arg := range c.Args {
+			w.writeArg(arg)
+		}
+	}()
+
+	// Write the initial string argument (test name) normally.
+	w.writeCopyin(&Call{Meta: c.Meta, Args: []Arg{c.Args[0]}})
+
+	// Args[1] is the second argument to syz_kfuzztest_run, which is a pointer
+	// to some struct input. This is the data that must be flattened and sent
+	// to the fuzzing driver with a relocation table.
+	dataArg := c.Args[1].(*PointerArg)
+	finalBlob := MarshalKFuzztestArg(dataArg.Res)
+	if len(finalBlob) > int(KFuzzTestMaxInputSize) {
+		return fmt.Errorf("encoded blob was too large")
+	}
+
+	// Use the buffer argument as data offset - this represents a buffer of
+	// size 64KiB - the maximum input size that the KFuzzTest module accepts.
+	bufferArg := c.Args[3].(*PointerArg)
+	if bufferArg.Res == nil {
+		return fmt.Errorf("buffer was nil")
+	}
+	blobAddress := w.target.PhysicalAddr(bufferArg) - w.target.DataOffset
+
+	// Write the entire marshalled blob as a raw byte array.
+	w.write(execInstrCopyin)
+	w.write(blobAddress)
+	w.write(execArgData)
+	w.write(uint64(len(finalBlob)))
+	w.buf = append(w.buf, finalBlob...)
+
+	// Update the value of the length arg which should now match the length of
+	// the byte array that we created. Previously, it contained the bytesize
+	// of the struct argument passed into the pseudo-syscall.
+	lenArg := c.Args[2].(*ConstArg)
+	lenArg.Val = uint64(len(finalBlob))
+	return nil
 }
 
 type execContext struct {
 	target     *Target
 	buf        []byte
-	eof        bool
 	args       map[Arg]argInfo
 	copyoutSeq uint64
 	// Per-call state cached here to not pass it through all functions.
@@ -134,12 +210,18 @@ type argInfo struct {
 func (w *execContext) writeCallProps(props CallProps) {
 	w.write(execInstrSetProps)
 	props.ForeachProp(func(_, _ string, value reflect.Value) {
+		var uintVal uint64
 		switch kind := value.Kind(); kind {
 		case reflect.Int:
-			w.write(uint64(value.Int()))
+			uintVal = uint64(value.Int())
+		case reflect.Bool:
+			if value.Bool() {
+				uintVal = 1
+			}
 		default:
 			panic("Unsupported (yet) kind: " + kind.String())
 		}
+		w.write(uintVal)
 	})
 }
 
@@ -148,7 +230,7 @@ func (w *execContext) writeCopyin(c *Call) {
 		if ctx.Base == nil {
 			return
 		}
-		addr := w.target.PhysicalAddr(ctx.Base) + ctx.Offset
+		addr := w.target.PhysicalAddr(ctx.Base) - w.target.DataOffset + ctx.Offset
 		addr -= arg.Type().UnitOffset()
 		if w.willBeUsed(arg) {
 			w.args[arg] = argInfo{Addr: addr}
@@ -184,11 +266,10 @@ func (w *execContext) writeChecksums() {
 	for arg := range w.csumMap {
 		csumArgs = append(csumArgs, arg)
 	}
-	sort.Slice(csumArgs, func(i, j int) bool {
-		return w.args[csumArgs[i]].Addr < w.args[csumArgs[j]].Addr
+	slices.SortFunc(csumArgs, func(a, b Arg) int {
+		return cmp.Compare(w.args[a].Addr, w.args[b].Addr)
 	})
-	for i := len(csumArgs) - 1; i >= 0; i-- {
-		arg := csumArgs[i]
+	for _, arg := range slices.Backward(csumArgs) {
 		info := w.csumMap[arg]
 		if _, ok := arg.Type().(*CsumType); !ok {
 			panic("csum arg is not csum type")
@@ -241,12 +322,7 @@ func (w *execContext) writeCopyout(c *Call) {
 }
 
 func (w *execContext) write(v uint64) {
-	if len(w.buf) < 8 {
-		w.eof = true
-		return
-	}
-	HostEndian.PutUint64(w.buf, v)
-	w.buf = w.buf[8:]
+	w.buf = binary.AppendVarint(w.buf, int64(v))
 }
 
 func (w *execContext) writeArg(arg Arg) {
@@ -272,11 +348,19 @@ func (w *execContext) writeArg(arg Arg) {
 			w.write(a.Type().(*ResourceType).Default())
 		}
 	case *PointerArg:
-		w.writeConstArg(a.Size(), w.target.PhysicalAddr(a), 0, 0, 0, FormatNative)
+		switch a.Size() {
+		case 4:
+			w.write(execArgAddr32)
+		case 8:
+			w.write(execArgAddr64)
+		default:
+			panic(fmt.Sprintf("bad pointer address size %v", a.Size()))
+		}
+		w.write(w.target.PhysicalAddr(a) - w.target.DataOffset)
 	case *DataArg:
 		data := a.Data()
 		if len(data) == 0 {
-			return
+			panic("writing data arg with 0 size")
 		}
 		w.write(execArgData)
 		flags := uint64(len(data))
@@ -284,17 +368,7 @@ func (w *execContext) writeArg(arg Arg) {
 			flags |= execArgDataReadable
 		}
 		w.write(flags)
-		padded := len(data)
-		if pad := 8 - len(data)%8; pad != 8 {
-			padded += pad
-		}
-		if len(w.buf) < padded {
-			w.eof = true
-		} else {
-			copy(w.buf, data)
-			copy(w.buf[len(data):], make([]byte, 8))
-			w.buf = w.buf[padded:]
-		}
+		w.buf = append(w.buf, data...)
 	case *UnionArg:
 		w.writeArg(a.Option)
 	default:

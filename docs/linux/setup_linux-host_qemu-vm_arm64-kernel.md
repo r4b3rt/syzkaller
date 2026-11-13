@@ -5,7 +5,7 @@ This document will detail the steps involved in setting up a Syzkaller instance 
 ## Create a disk image
 
 We will use buildroot to create the disk image.
-You can obtain buildroot from [here](https://buildroot.uclibc.org/download.html).
+You can obtain buildroot from [here](https://buildroot.org/download.html).
 Extract the tarball and perform a `make menuconfig` inside it.
 Choose the following options.
 
@@ -32,7 +32,7 @@ Choose the following options.
 
 Run `make`. After the build, confirm that `output/images/rootfs.ext3` exists.
 
-If you're expreriencing a very slow sshd start up time with arm64 qemu running on x86, the reason is probably low entropy and it be "fixed" with installing `haveged`. It can be found in the buildroot `menuconfig`:
+If you're experiencing a very slow sshd start up time with arm64 qemu running on x86, the reason is probably low entropy and it be "fixed" with installing `haveged`. It can be found in the buildroot `menuconfig`:
 
 ```
     Target packages
@@ -44,7 +44,7 @@ If you're expreriencing a very slow sshd start up time with arm64 qemu running o
 
 You will require an ARM64 kernel with gcc plugin support.
 If not, obtain the ARM64 toolchain from Linaro.
-Get `gcc-linaro-6.1.1-2016.08-x86_64_aarch64-linux-gnu.tar.xz` from [here](https://releases.linaro.org/components/toolchain/binaries/latest/aarch64-linux-gnu/).
+Get `gcc-linaro-6.1.1-2016.08-x86_64_aarch64-linux-gnu.tar.xz` from [here](https://releases.linaro.org/components/toolchain/binaries/6.1-2016.08/aarch64-linux-gnu/).
 Extract and add its `bin/` to your `PATH`.
 If you have another ARM64 toolchain on your machine, ensure that this newly downloaded toolchain takes precedence.
 
@@ -149,7 +149,7 @@ A sample config file that exercises the required options are shown below. Modify
     "kernel_obj": "/path/to/linux/build/dir",
     "syzkaller": "/path/to/syzkaller/arm64/",
     "image": "/path/to/rootfs.ext3",
-    "sshkey": "/path/to/ida_rsa",
+    "sshkey": "/path/to/id_rsa",
     "procs": 8,
     "type": "qemu",
     "vm": {

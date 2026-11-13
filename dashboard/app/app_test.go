@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -14,8 +15,10 @@ import (
 
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/auth"
+	"github.com/google/syzkaller/pkg/subsystem"
+	_ "github.com/google/syzkaller/pkg/subsystem/lists"
 	"github.com/google/syzkaller/sys/targets"
-	"google.golang.org/appengine/user"
+	"google.golang.org/appengine/v2/user"
 )
 
 func init() {
@@ -27,19 +30,53 @@ func init() {
 	os.Setenv("GAE_MODULE_VERSION", "1")
 	os.Setenv("GAE_MINOR_VERSION", "1")
 
-	isBrokenAuthDomainInTest = true
+	trustedAuthDomain = "" // Devappserver environment value is "", prod value is "gmail.com".
 	obsoleteWhatWontBeFixBisected = true
 	notifyAboutUnsuccessfulBisections = true
+	ensureConfigImmutability = true
 	initMocks()
+	// Insert namespaces from localUIConfig into testConfig.
+	// This is required b/c main.go registers HTTP handlers for all namespaces
+	// in the main installed config only, so if we don't do that the localUIConfig
+	// namespaces won't have handlers. // It's not important if there are duplicates
+	// b/c registration code mostly looks at namespace names.
+	for ns, cfg := range localUIConfig.Namespaces {
+		if testConfig.Namespaces[ns] == nil {
+			testConfig.Namespaces[ns] = cfg
+		}
+	}
+	checkConfig(localUIConfig)
 	installConfig(testConfig)
 }
 
 // Config used in tests.
 var testConfig = &GlobalConfig{
 	AccessLevel: AccessPublic,
-	AuthDomain:  "@syzkaller.com",
-	Clients: map[string]string{
-		"reporting": "reportingkeyreportingkeyreportingkey",
+	ACL: []*ACLItem{
+		{
+			Domain: "syzkaller.com",
+			Access: AccessUser,
+		},
+		{
+			Email:  makeUser(AuthorizedAccessPublic).Email,
+			Access: AccessPublic,
+		},
+	},
+	Clients: map[string]APIClient{
+		reportingClient: {Key: reportingKey},
+		agentClient: {
+			Key:     agentKey,
+			Methods: AIMethods,
+		},
+		agentRestrictedClient: {
+			Key:              agentRestrictedKey,
+			Methods:          AIMethods,
+			AIWorkflowSuffix: "-foobar",
+		},
+		"unrestricted-ai": {
+			Key:     "unrestrictedkey1234",
+			Methods: AIMethods,
+		},
 	},
 	EmailBlocklist: []string{
 		"\"Bar\" <Blocked@Domain.com>",
@@ -49,16 +86,22 @@ var testConfig = &GlobalConfig{
 		MaxPeriod:         100 * 24 * time.Hour,
 		NonFinalMinPeriod: 40 * 24 * time.Hour,
 		NonFinalMaxPeriod: 60 * 24 * time.Hour,
+		ReproRetestPeriod: 100 * 24 * time.Hour,
+	},
+	DiscussionEmails: []DiscussionEmailConfig{
+		{"lore@email.com", dashapi.DiscussionLore},
 	},
 	DefaultNamespace: "test1",
+	DungeonNamespace: "test1",
 	Namespaces: map[string]*Config{
 		"test1": {
 			AccessLevel:           AccessAdmin,
 			Key:                   "test1keytest1keytest1key",
 			FixBisectionAutoClose: true,
-			Clients: map[string]string{
-				client1: password1,
-				"oauth": auth.OauthMagic + "111111122222222",
+			SimilarityDomain:      testDomain,
+			Clients: map[string]APIClient{
+				client1: {Key: password1},
+				"oauth": {Key: auth.OauthMagic + "111111122222222"},
 			},
 			Repos: []KernelRepo{
 				{
@@ -72,10 +115,16 @@ var testConfig = &GlobalConfig{
 				{
 					URL:    "git://github.com/google/syzkaller",
 					Branch: "master",
-					Alias:  "repo10alias",
+					Alias:  "repo10alias1",
 					CC: CCConfig{
 						Maintainers: []string{"maintainers@repo10.org", "bugs@repo10.org"},
 					},
+				},
+				{
+					URL:    "git://github.com/google/syzkaller",
+					Branch: "old_master",
+					Alias:  "repo10alias2",
+					NoPoll: true,
 				},
 			},
 			Managers: map[string]ConfigManager{
@@ -87,7 +136,7 @@ var testConfig = &GlobalConfig{
 			Reporting: []Reporting{
 				{
 					Name:       "reporting1",
-					DailyLimit: 3,
+					DailyLimit: 5,
 					Embargo:    14 * 24 * time.Hour,
 					Filter:     skipWithRepro,
 					Config: &TestConfig{
@@ -96,18 +145,22 @@ var testConfig = &GlobalConfig{
 				},
 				{
 					Name:       "reporting2",
-					DailyLimit: 3,
+					DailyLimit: 5,
 					Config: &TestConfig{
 						Index: 2,
 					},
 				},
 			},
+			Subsystems: SubsystemsConfig{
+				Service: subsystem.MustMakeService(testSubsystems, 0),
+			},
 		},
 		"test2": {
-			AccessLevel: AccessAdmin,
-			Key:         "test2keytest2keytest2key",
-			Clients: map[string]string{
-				client2: password2,
+			AccessLevel:      AccessAdmin,
+			Key:              "test2keytest2keytest2key",
+			SimilarityDomain: testDomain,
+			Clients: map[string]APIClient{
+				client2: {Key: password2},
 			},
 			Repos: []KernelRepo{
 				{
@@ -130,10 +183,6 @@ var testConfig = &GlobalConfig{
 				},
 			},
 			Managers: map[string]ConfigManager{
-				restrictedManager: {
-					RestrictedTestingRepo:   "git://restricted.git/restricted.git",
-					RestrictedTestingReason: "you should test only on restricted.git",
-				},
 				noFixBisectionManager: {
 					FixBisectionDisabled: true,
 				},
@@ -180,9 +229,10 @@ var testConfig = &GlobalConfig{
 		// Namespaces for access level testing.
 		"access-admin": {
 			AccessLevel: AccessAdmin,
+			AI:          &AIConfig{},
 			Key:         "adminkeyadminkeyadminkey",
-			Clients: map[string]string{
-				clientAdmin: keyAdmin,
+			Clients: map[string]APIClient{
+				clientAdmin: {Key: keyAdmin},
 			},
 			Repos: []KernelRepo{
 				{
@@ -206,9 +256,10 @@ var testConfig = &GlobalConfig{
 		},
 		"access-user": {
 			AccessLevel: AccessUser,
+			AI:          &AIConfig{},
 			Key:         "userkeyuserkeyuserkey",
-			Clients: map[string]string{
-				clientUser: keyUser,
+			Clients: map[string]APIClient{
+				clientUser: {Key: keyUser},
 			},
 			Repos: []KernelRepo{
 				{
@@ -233,15 +284,17 @@ var testConfig = &GlobalConfig{
 		},
 		"access-public": {
 			AccessLevel: AccessPublic,
+			AI:          &AIConfig{},
 			Key:         "publickeypublickeypublickey",
-			Clients: map[string]string{
-				clientPublic: keyPublic,
+			Clients: map[string]APIClient{
+				clientPublic: {Key: keyPublic},
 			},
 			Repos: []KernelRepo{
 				{
-					URL:    "git://syzkaller.org/access-public.git",
-					Branch: "access-public",
-					Alias:  "access-public",
+					URL:                    "git://syzkaller.org/access-public.git",
+					Branch:                 "access-public",
+					Alias:                  "access-public",
+					DetectMissingBackports: true,
 				},
 			},
 			Reporting: []Reporting{
@@ -257,30 +310,478 @@ var testConfig = &GlobalConfig{
 					Config:     &TestConfig{Index: 2},
 				},
 			},
+			FindBugOriginTrees: true,
+			CacheUIPages:       true,
+			RetestRepros:       true,
+		},
+		"access-public-email": {
+			AccessLevel: AccessPublic,
+			Key:         "publickeypublickeypublickey",
+			Clients: map[string]APIClient{
+				clientPublicEmail: {Key: keyPublicEmail},
+			},
+			Managers: map[string]ConfigManager{
+				restrictedManager: {
+					RestrictedTestingRepo:   "git://restricted.git/restricted.git",
+					RestrictedTestingReason: "you should test only on restricted.git",
+				},
+			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org/access-public-email.git",
+					Branch: "access-public-email",
+					Alias:  "access-public-email",
+				},
+				{
+					// Needed for TestTreeOriginLtsBisection().
+					URL:    "https://upstream.repo/repo",
+					Branch: "upstream-master",
+					Alias:  "upstream-master",
+				},
+			},
+			Reporting: []Reporting{
+				{
+					AccessLevel: AccessPublic,
+					Name:        "access-public-email-reporting1",
+					DailyLimit:  1000,
+					Config: &EmailConfig{
+						Email:            "test@syzkaller.com",
+						HandleListEmails: true,
+						SubjectPrefix:    "[syzbot]",
+					},
+				},
+			},
+			RetestRepros: true,
+			Subsystems: SubsystemsConfig{
+				Service: subsystem.MustMakeService(testSubsystems, 0),
+				Redirect: map[string]string{
+					"oldSubsystem": "subsystemA",
+				},
+			},
+		},
+		// The second namespace reporting to the same mailing list.
+		"access-public-email-2": {
+			AccessLevel: AccessPublic,
+			Key:         "publickeypublickeypublickey",
+			Clients: map[string]APIClient{
+				clientPublicEmail2: {Key: keyPublicEmail2},
+			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org/access-public-email2.git",
+					Branch: "access-public-email2",
+					Alias:  "access-public-email2",
+				},
+			},
+			Reporting: []Reporting{
+				{
+					AccessLevel: AccessPublic,
+					Name:        "access-public-email2-reporting1",
+					DailyLimit:  1000,
+					Config: &EmailConfig{
+						Email:            "test@syzkaller.com",
+						HandleListEmails: true,
+					},
+				},
+			},
+		},
+		"fs-bugs-reporting": {
+			AccessLevel: AccessPublic,
+			Key:         "fspublickeypublickeypublickey",
+			Clients: map[string]APIClient{
+				clientPublicFs: {Key: keyPublicFs},
+			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org/fs-bugs.git",
+					Branch: "fs-bugs",
+					Alias:  "fs-bugs",
+				},
+			},
+			Reporting: []Reporting{
+				{
+					Name:       "wait-repro",
+					DailyLimit: 1000,
+					Filter: func(bug *Bug) FilterResult {
+						if canBeVfsBug(bug) &&
+							!bug.HasRepro() {
+							return FilterReport
+						}
+						return FilterSkip
+					},
+					Config: &TestConfig{Index: 1},
+				},
+				{
+					AccessLevel: AccessPublic,
+					Name:        "public",
+					DailyLimit:  1000,
+					Config: &EmailConfig{
+						Email:              "test@syzkaller.com",
+						HandleListEmails:   true,
+						DefaultMaintainers: []string{"linux-kernel@vger.kernel.org"},
+						MailMaintainers:    true,
+						SubjectPrefix:      "[syzbot]",
+					},
+				},
+			},
+			Subsystems: SubsystemsConfig{
+				Service: subsystem.ListService("linux"),
+			},
+		},
+		"test-decommission": {
+			AccessLevel:      AccessAdmin,
+			Key:              "testdecommissiontestdecommission",
+			SimilarityDomain: testDomain,
+			Clients: map[string]APIClient{
+				clientTestDecomm: {Key: keyTestDecomm},
+			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org",
+					Branch: "branch10",
+					Alias:  "repo10alias",
+				},
+			},
+			Reporting: []Reporting{
+				{
+					Name:       "reporting1",
+					DailyLimit: 3,
+					Embargo:    14 * 24 * time.Hour,
+					Filter:     skipWithRepro,
+					Config: &TestConfig{
+						Index: 1,
+					},
+				},
+				{
+					Name:       "reporting2",
+					DailyLimit: 3,
+					Config: &TestConfig{
+						Index: 2,
+					},
+				},
+			},
+		},
+		"test-mgr-decommission": {
+			AccessLevel:      AccessAdmin,
+			Key:              "testmgrdecommissiontestmgrdecommission",
+			SimilarityDomain: testDomain,
+			Clients: map[string]APIClient{
+				clientMgrDecommission: {Key: keyMgrDecommission},
+			},
+			Managers: map[string]ConfigManager{
+				notYetDecommManger: {},
+				delegateToManager:  {},
+			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org",
+					Branch: "branch10",
+					Alias:  "repo10alias",
+				},
+			},
+			Reporting: []Reporting{
+				{
+					Name:       "reporting1",
+					DailyLimit: 5,
+					Embargo:    14 * 24 * time.Hour,
+					Filter:     skipWithRepro,
+					Config: &EmailConfig{
+						Email: "test@syzkaller.com",
+					},
+				},
+				{
+					Name:       "reporting2",
+					DailyLimit: 3,
+					Filter:     skipWithRepro2,
+					Config: &EmailConfig{
+						Email:              "bugs@syzkaller.com",
+						DefaultMaintainers: []string{"default@maintainers.com"},
+						SubjectPrefix:      "[syzbot]",
+						MailMaintainers:    true,
+					},
+				},
+			},
+			RetestRepros: true,
+		},
+		"subsystem-reminders": {
+			AccessLevel: AccessPublic,
+			Key:         "subsystemreminderssubsystemreminders",
+			Clients: map[string]APIClient{
+				clientSubsystemRemind: {Key: keySubsystemRemind},
+			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org/reminders.git",
+					Branch: "main",
+					Alias:  "main",
+				},
+			},
+			Reporting: []Reporting{
+				{
+					// Let's emulate public moderation.
+					AccessLevel: AccessPublic,
+					Name:        "moderation",
+					DailyLimit:  1000,
+					Filter: func(bug *Bug) FilterResult {
+						if strings.Contains(bug.Title, "keep in moderation") {
+							return FilterReport
+						}
+						return FilterSkip
+					},
+					Config: &TestConfig{Index: 1},
+				},
+				{
+					AccessLevel: AccessPublic,
+					Name:        "public",
+					DailyLimit:  1000,
+					Config: &EmailConfig{
+						Email:              "bugs@syzkaller.com",
+						HandleListEmails:   true,
+						MailMaintainers:    true,
+						DefaultMaintainers: []string{"default@maintainers.com"},
+						SubjectPrefix:      "[syzbot]",
+					},
+				},
+			},
+			Subsystems: SubsystemsConfig{
+				Service: subsystem.MustMakeService(testSubsystems, 0),
+				Reminder: &BugListReportingConfig{
+					SourceReporting: "public",
+					BugsInReport:    6,
+					ModerationConfig: &EmailConfig{
+						Email:         "moderation@syzkaller.com",
+						SubjectPrefix: "[moderation]",
+					},
+					Config: &EmailConfig{
+						Email:           "bugs@syzkaller.com",
+						MailMaintainers: true,
+						SubjectPrefix:   "[syzbot]",
+					},
+				},
+			},
+		},
+		"tree-tests": {
+			AccessLevel:           AccessPublic,
+			FixBisectionAutoClose: true,
+			Key:                   "treeteststreeteststreeteststreeteststreeteststreetests",
+			Clients: map[string]APIClient{
+				clientTreeTests: {Key: keyTreeTests},
+			},
+			Repos: []KernelRepo{
+				{
+					URL:                    "git://syzkaller.org/test.git",
+					Branch:                 "main",
+					Alias:                  "main",
+					DetectMissingBackports: true,
+				},
+			},
+			Managers: map[string]ConfigManager{
+				"better-manager": {
+					Priority: 1,
+				},
+			},
+			Reporting: []Reporting{
+				{
+					AccessLevel: AccessAdmin,
+					Name:        "non-public",
+					DailyLimit:  1000,
+					Filter: func(bug *Bug) FilterResult {
+						return FilterReport
+					},
+					Config: &TestConfig{Index: 1},
+				},
+				{
+					AccessLevel: AccessUser,
+					Name:        "user",
+					DailyLimit:  1000,
+					Config: &EmailConfig{
+						Email:         "bugs@syzkaller.com",
+						SubjectPrefix: "[syzbot]",
+					},
+					Labels: map[string]string{
+						"origin:downstream": "Bug presence analysis results: the bug reproduces only on the downstream tree.",
+					},
+				},
+			},
+			FindBugOriginTrees:     true,
+			RetestMissingBackports: true,
+		},
+		"coverage-tests": {
+			Coverage: &CoverageConfig{
+				EmailRegressionsTo:  "test@test.test",
+				RegressionThreshold: 1,
+			},
+			AccessLevel: AccessPublic,
+			Key:         "coveragetestskeycoveragetestskeycoveragetestskey",
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org/test.git",
+					Branch: "main",
+					Alias:  "main",
+				},
+			},
+			Reporting: []Reporting{
+				{
+					Name:       "non-public",
+					DailyLimit: 1000,
+					Filter: func(bug *Bug) FilterResult {
+						return FilterReport
+					},
+					Config: &TestConfig{Index: 1},
+				},
+			},
+		},
+		"ains": {
+			AI: &AIConfig{
+				AutoReproC:     true,
+				BaseRepository: "git://ai/base.git",
+				BaseBranch:     "ai-base",
+				BaseCommit:     "RC",
+			},
+			AccessLevel: AccessPublic,
+			Key:         "publickeypublickeypublickey",
+			Clients: map[string]APIClient{
+				clientAI: {Key: keyAI},
+			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org/test.git",
+					Branch: "main",
+					Alias:  "main",
+				},
+			},
+			Reporting: []Reporting{
+				{
+					AccessLevel: AccessPublic,
+					Name:        "ai-email-reporting",
+					DailyLimit:  1000,
+					Config: &EmailConfig{
+						Email:            "test@syzkaller.com",
+						HandleListEmails: true,
+						SubjectPrefix:    "[syzbot]",
+					},
+				},
+			},
+		},
+		"skip-stage": {
+			AccessLevel: AccessPublic,
+			Key:         "publickeypublickeypublickey",
+			Clients: map[string]APIClient{
+				clientSkipStage: {Key: keySkipStage},
+			},
+			Repos: []KernelRepo{
+				{
+					URL:    "git://syzkaller.org/access-public.git",
+					Branch: "access-public",
+					Alias:  "access-public",
+				},
+			},
+			Reporting: []Reporting{
+				{
+					Name:       "reporting1",
+					DailyLimit: 1000,
+					Config:     &TestConfig{Index: 1},
+					Embargo:    4 * 24 * time.Hour,
+					Filter: func(bug *Bug) FilterResult {
+						if bug.Title == "skip reporting1" {
+							return FilterSkip
+						}
+						return FilterReport
+					},
+				},
+				{
+					Name:       "reporting2",
+					DailyLimit: 1000,
+					Config:     &TestConfig{Index: 2},
+					Filter: func(bug *Bug) FilterResult {
+						if bug.manuallyUpstreamed("reporting1") {
+							return FilterSkip
+						}
+						return FilterReport
+					},
+				},
+				{
+					Name:       "reporting3",
+					DailyLimit: 1000,
+					Config:     &TestConfig{Index: 3},
+				},
+			},
 		},
 	},
 }
 
+var testSubsystems = []*subsystem.Subsystem{
+	{
+		Name:        "subsystemA",
+		PathRules:   []subsystem.PathRule{{IncludeRegexp: `a\.c`}},
+		Lists:       []string{"subsystemA@list.com"},
+		Maintainers: []string{"subsystemA@person.com"},
+	},
+	{
+		Name:        "subsystemB",
+		PathRules:   []subsystem.PathRule{{IncludeRegexp: `b\.c`}},
+		Lists:       []string{"subsystemB@list.com"},
+		Maintainers: []string{"subsystemB@person.com"},
+	},
+	{
+		Name:        "subsystemC",
+		PathRules:   []subsystem.PathRule{{IncludeRegexp: `c\.c`}},
+		Lists:       []string{"subsystemC@list.com"},
+		Maintainers: []string{"subsystemC@person.com"},
+		NoReminders: true,
+	},
+}
+
 const (
-	client1      = "client1"
-	client2      = "client2"
-	password1    = "client1keyclient1keyclient1key"
-	password2    = "client2keyclient2keyclient2key"
-	clientAdmin  = "client-admin"
-	keyAdmin     = "clientadminkeyclientadminkey"
-	clientUser   = "client-user"
-	keyUser      = "clientuserkeyclientuserkey"
-	clientPublic = "client-public"
-	keyPublic    = "clientpublickeyclientpublickey"
+	client1               = "client1"
+	client2               = "client2"
+	password1             = "client1keyclient1keyclient1key"
+	password2             = "client2keyclient2keyclient2key"
+	clientAdmin           = "client-admin"
+	keyAdmin              = "clientadminkeyclientadminkey"
+	clientUser            = "client-user"
+	keyUser               = "clientuserkeyclientuserkey"
+	clientPublic          = "client-public"
+	keyPublic             = "clientpublickeyclientpublickey"
+	clientPublicEmail     = "client-public-email"
+	keyPublicEmail        = "clientpublicemailkeyclientpublicemailkey"
+	clientPublicEmail2    = "client-public-email2"
+	keyPublicEmail2       = "clientpublicemailkeyclientpublicemailkey2"
+	clientPublicFs        = "client-public-fs"
+	keyPublicFs           = "keypublicfskeypublicfskeypublicfs"
+	clientTestDecomm      = "client-test-decomm"
+	keyTestDecomm         = "keyTestDecommkeyTestDecomm"
+	clientMgrDecommission = "client-mgr-decommission"
+	keyMgrDecommission    = "keyMgrDecommissionkeyMgrDecommission"
+	clientSubsystemRemind = "client-subystem-reminders"
+	keySubsystemRemind    = "keySubsystemRemindkeySubsystemRemind"
+	clientTreeTests       = "clientTreeTestsclientTreeTests"
+	keyTreeTests          = "keyTreeTestskeyTreeTestskeyTreeTests"
+	clientGlobalAI        = "ai-ns-global-client"
+	keyGlobalAI           = "ai-ns-global-clientai-ns-global-client"
+	clientAI              = "client-ai"
+	keyAI                 = "clientaikeyclientaikeyclientaikey"
+	clientSkipStage       = "client-skip-stage"
+	keySkipStage          = "skipstagekeyskipstagekeyskipstagekey"
+	reportingClient       = "reporting"
+	reportingKey          = "reportingkeyreportingkeyreportingkey"
+	agentClient           = "agent"
+	agentKey              = "agentagentagentagentagentagentagentagentagentagent"
+	agentRestrictedClient = "agent-foobar"
+	agentRestrictedKey    = "agentrestrictedagentrestrictedagentrestrictedagentrestricted"
 
 	restrictedManager     = "restricted-manager"
 	noFixBisectionManager = "no-fix-bisection-manager"
 	specialCCManager      = "special-cc-manager"
+	notYetDecommManger    = "not-yet-decomm-manager"
+	delegateToManager     = "delegate-to-manager"
+
+	testDomain = "test"
 )
 
 func skipWithRepro(bug *Bug) FilterResult {
 	if strings.HasPrefix(bug.Title, "skip with repro") &&
-		bug.ReproLevel != dashapi.ReproLevelNone {
+		bug.HasRepro() {
 		return FilterSkip
 	}
 	return FilterReport
@@ -288,7 +789,7 @@ func skipWithRepro(bug *Bug) FilterResult {
 
 func skipWithRepro2(bug *Bug) FilterResult {
 	if strings.HasPrefix(bug.Title, "skip reporting2 with repro") &&
-		bug.ReproLevel != dashapi.ReproLevelNone {
+		bug.HasRepro() {
 		return FilterSkip
 	}
 	return FilterReport
@@ -341,6 +842,7 @@ func testCrashWithRepro(build *dashapi.Build, id int) *dashapi.Crash {
 	crash.ReproOpts = []byte(fmt.Sprintf("repro opts %v", id))
 	crash.ReproSyz = []byte(fmt.Sprintf("syncfs(%v)", id))
 	crash.ReproC = []byte(fmt.Sprintf("int main() { return %v; }", id))
+	crash.ReproLog = []byte(fmt.Sprintf("repro log %d", id))
 	return crash
 }
 
@@ -355,7 +857,8 @@ func TestApp(t *testing.T) {
 	c := NewCtx(t)
 	defer c.Close()
 
-	c.expectOK(c.GET("/test1"))
+	_, err := c.GET("/test1")
+	c.expectOK(err)
 
 	apiClient1 := c.makeClient(client1, password1, false)
 	apiClient2 := c.makeClient(client2, password2, false)
@@ -374,23 +877,34 @@ func TestApp(t *testing.T) {
 
 	crash1 := testCrash(build, 1)
 	c.client.ReportCrash(crash1)
-	c.client.pollBug()
+	c.globalClient.pollBug()
 
 	// Test that namespace isolation works.
 	c.expectFail("unknown build", apiClient2.Query("report_crash", crash1, nil))
 
 	crash2 := testCrashWithRepro(build, 2)
 	c.client.ReportCrash(crash2)
-	c.client.pollBug()
+	c.globalClient.pollBug()
 
 	// Provoke purgeOldCrashes.
-	for i := 0; i < 30; i++ {
+	const purgeTestIters = 30
+	for i := range purgeTestIters {
+		// Also test how daily counts work.
+		if i == purgeTestIters/2 {
+			c.advanceTime(48 * time.Hour)
+		}
 		crash := testCrash(build, 3)
 		crash.Log = []byte(fmt.Sprintf("log%v", i))
 		crash.Report = []byte(fmt.Sprintf("report%v", i))
 		c.client.ReportCrash(crash)
 	}
-	c.client.pollBug()
+	rep := c.globalClient.pollBug()
+	bug, _, _ := c.loadBug(rep.ID)
+	c.expectNE(bug, nil)
+	c.expectEQ(bug.DailyStats, []BugDailyStats{
+		{20000101, purgeTestIters / 2},
+		{20000103, purgeTestIters / 2},
+	})
 
 	cid := &dashapi.CrashID{
 		BuildID: "build1",
@@ -398,13 +912,15 @@ func TestApp(t *testing.T) {
 	}
 	c.client.ReportFailedRepro(cid)
 
-	c.client.ReportingPollBugs("test")
+	c.globalClient.ReportingPollBugs("test")
 
-	c.client.ReportingUpdate(&dashapi.BugUpdate{
-		ID:         "id",
+	reply, _ := c.globalClient.ReportingUpdate(&dashapi.BugUpdate{
+		ID:         rep.ID,
 		Status:     dashapi.BugStatusOpen,
-		ReproLevel: dashapi.ReproLevelC,
+		ReproLevel: dashapi.ReproLevelNone,
 	})
+	c.expectEQ(reply.Error, false)
+	c.expectEQ(reply.OK, true)
 }
 
 func TestRedirects(t *testing.T) {
@@ -415,8 +931,55 @@ func TestRedirects(t *testing.T) {
 	checkRedirect(c, AccessAdmin, "/", "/admin", http.StatusFound)
 	checkLoginRedirect(c, AccessPublic, "/access-user") // not accessible namespace
 
-	_, err := c.httpRequest("GET", "/access-user", "", AccessUser)
+	_, err := c.AuthGET(AccessUser, "/access-user")
 	c.expectOK(err)
+}
+
+func TestResponseStatusCode(t *testing.T) {
+	tests := []struct {
+		whatURL      string
+		wantRespCode int
+	}{
+		{
+			"/text?tag=CrashLog&x=13354bf5700000",
+			http.StatusNotFound,
+		},
+		{
+			"/text?tag=CrashReport&x=17a2bedcb00000",
+			http.StatusNotFound,
+		},
+		{
+			"/text?tag=ReproSyz&x=107e219b700000",
+			http.StatusNotFound,
+		},
+		{
+			"/text?tag=ReproC&x=1762ad64f00000",
+			http.StatusNotFound,
+		},
+		{
+			"/text?tag=CrashLog",
+			http.StatusBadRequest,
+		},
+		{
+			"/text?tag=CrashReport",
+			http.StatusBadRequest,
+		},
+		{
+			"/text?tag=ReproC",
+			http.StatusBadRequest,
+		},
+		{
+			"/text?tag=ReproSyz",
+			http.StatusBadRequest,
+		},
+	}
+
+	c := NewCtx(t)
+	defer c.Close()
+
+	for _, test := range tests {
+		checkResponseStatusCode(c, AccessUser, test.whatURL, test.wantRespCode)
+	}
 }
 
 func checkLoginRedirect(c *Ctx, accessLevel AccessLevel, url string) {
@@ -428,12 +991,20 @@ func checkLoginRedirect(c *Ctx, accessLevel AccessLevel, url string) {
 }
 
 func checkRedirect(c *Ctx, accessLevel AccessLevel, from, to string, status int) {
-	_, err := c.httpRequest("GET", from, "", accessLevel)
+	_, err := c.AuthGET(accessLevel, from)
 	c.expectNE(err, nil)
-	httpErr, ok := err.(HTTPError)
-	c.expectTrue(ok)
+	var httpErr *HTTPError
+	c.expectTrue(errors.As(err, &httpErr))
 	c.expectEQ(httpErr.Code, status)
 	c.expectEQ(httpErr.Headers["Location"], []string{to})
+}
+
+func checkResponseStatusCode(c *Ctx, accessLevel AccessLevel, url string, status int) {
+	_, err := c.AuthGET(accessLevel, url)
+	c.expectNE(err, nil)
+	var httpErr *HTTPError
+	c.expectTrue(errors.As(err, &httpErr))
+	c.expectEQ(httpErr.Code, status)
 }
 
 // Test purging of old crashes for bugs with lots of crashes.
@@ -451,21 +1022,21 @@ func TestPurgeOldCrashes(t *testing.T) {
 	crash := testCrash(build, 1)
 	crash.ReproOpts = []byte("no repro")
 	c.client.ReportCrash(crash)
-	rep := c.client.pollBug()
+	rep := c.globalClient.pollBug()
 
 	crash.ReproSyz = []byte("getpid()")
 	crash.ReproOpts = []byte("syz repro")
 	c.client.ReportCrash(crash)
-	c.client.pollBug()
+	c.globalClient.pollBug()
 
 	crash.ReproC = []byte("int main() {}")
 	crash.ReproOpts = []byte("C repro")
 	c.client.ReportCrash(crash)
-	c.client.pollBug()
+	c.globalClient.pollBug()
 
 	// Now report lots of bugs with/without repros. Some of the older ones should be purged.
-	const totalReported = 3 * maxCrashes
-	for i := 0; i < totalReported; i++ {
+	var totalReported = 3 * maxCrashes()
+	for i := range totalReported {
 		c.advanceTime(2 * time.Hour) // This ensures that crashes are saved.
 		crash.ReproSyz = nil
 		crash.ReproC = nil
@@ -493,10 +1064,10 @@ func TestPurgeOldCrashes(t *testing.T) {
 		}
 	}
 	c.t.Logf("got reported=%v, norepro=%v, repro=%v, maxCrashes=%v",
-		reported, norepro, repro, maxCrashes)
+		reported, norepro, repro, maxCrashes())
 	if reported != 3 ||
-		norepro < maxCrashes || norepro > maxCrashes+10 ||
-		repro < maxCrashes || repro > maxCrashes+10 {
+		norepro < maxCrashes() || norepro > maxCrashes()+10 ||
+		repro < maxCrashes() || repro > maxCrashes()+10 {
 		c.t.Fatalf("bad purged crashes")
 	}
 	// Then, check that latest crashes were preserved.
@@ -513,6 +1084,45 @@ func TestPurgeOldCrashes(t *testing.T) {
 		if idx < totalReported-count {
 			c.t.Errorf("preserved bad crash repro=%v: %v", crash.ReproC != 0, idx)
 		}
+	}
+
+	firstCrashExists := func() bool {
+		_, crashKeys, err := queryCrashesForBug(c.ctx, bug.key(c.ctx), 10*totalReported)
+		c.expectOK(err)
+		for _, key := range crashKeys {
+			if key.IntID() == rep.CrashID {
+				return true
+			}
+		}
+		return false
+	}
+
+	// A sanity check for the test itself.
+	if !firstCrashExists() {
+		t.Fatalf("the first reported crash should be present")
+	}
+
+	// Unreport the first crash.
+	reply, _ := c.globalClient.ReportingUpdate(&dashapi.BugUpdate{
+		ID:               rep.ID,
+		Status:           dashapi.BugStatusUpdate,
+		ReproLevel:       dashapi.ReproLevelC,
+		UnreportCrashIDs: []int64{rep.CrashID},
+	})
+	c.expectEQ(reply.OK, true)
+
+	// Trigger more purge events.
+	var moreIterations = maxCrashes()
+	for i := range moreIterations {
+		c.advanceTime(2 * time.Hour) // This ensures that crashes are saved.
+		crash.ReproSyz = nil
+		crash.ReproC = nil
+		crash.ReproOpts = []byte(fmt.Sprintf("%v", i))
+		c.client.ReportCrash(crash)
+	}
+	// Check that the unreported crash was purged.
+	if firstCrashExists() {
+		t.Fatalf("the unreported crash should have been purged")
 	}
 }
 

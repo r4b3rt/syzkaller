@@ -52,21 +52,29 @@ package main
 // modification time allows us to understand if we need to rebuild after a restart.
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
-	"regexp"
+	"strings"
 	"sync"
+	"time"
 
+	"github.com/google/syzkaller/dashboard/dashapi"
+	"github.com/google/syzkaller/pkg/asset"
+	"github.com/google/syzkaller/pkg/asset/storage"
 	"github.com/google/syzkaller/pkg/config"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/tool"
+	"github.com/google/syzkaller/pkg/updater"
+	"github.com/google/syzkaller/pkg/vcs"
 )
 
 var (
@@ -74,13 +82,19 @@ var (
 	flagAutoUpdate = flag.Bool("autoupdate", true, "auto-update the binary (for testing)")
 	flagManagers   = flag.Bool("managers", true, "start managers (for testing)")
 	flagDebug      = flag.Bool("debug", false, "debug mode (for testing)")
+	// nolint: lll
+	flagExitOnUpgrade = flag.Bool("exit-on-upgrade", false, "exit after a syz-ci upgrade is applied; otherwise syz-ci restarts")
 )
 
 type Config struct {
 	Name string `json:"name"`
 	HTTP string `json:"http"`
 	// If manager http address is not specified, give it an address starting from this port. Optional.
-	ManagerPort     int    `json:"manager_port_start"`
+	// This is also used to auto-assign ports for test instances.
+	ManagerPort int `json:"manager_port_start"`
+	// If manager rpc address is not specified, give it addresses starting from this port. By default 30000.
+	// This is also used to auto-assign ports for test instances.
+	RPCPort         int    `json:"rpc_port_start"`
 	DashboardAddr   string `json:"dashboard_addr"`   // Optional.
 	DashboardClient string `json:"dashboard_client"` // Optional.
 	DashboardKey    string `json:"dashboard_key"`    // Optional.
@@ -89,18 +103,57 @@ type Config struct {
 	Goroot          string `json:"goroot"`           // Go 1.8+ toolchain dir.
 	SyzkallerRepo   string `json:"syzkaller_repo"`
 	SyzkallerBranch string `json:"syzkaller_branch"` // Defaults to "master".
-	// Dir with additional syscall descriptions (.txt and .const files).
+	// Dir with additional syscall descriptions.
+	// - *.txt and *.const files are copied to syzkaller/sys/linux/
+	// - *.test files are copied to syzkaller/sys/linux/test/
+	// - *.h files are copied to syzkaller/executor/
 	SyzkallerDescriptions string `json:"syzkaller_descriptions"`
-	// Protocol-specific path to upload coverage reports from managers (optional).
+	// Path to upload coverage reports from managers (optional).
 	// Supported protocols: GCS (gs://) and HTTP PUT (http:// or https://).
-	CoverUploadPath string           `json:"cover_upload_path"`
-	BisectBinDir    string           `json:"bisect_bin_dir"`
-	Ccache          string           `json:"ccache"`
-	Managers        []*ManagerConfig `json:"managers"`
+	CoverUploadPath string `json:"cover_upload_path"`
+	// Path to upload managers syz programs and their coverage in jsonl (optional).
+	CoverProgramsPath string `json:"cover_programs_path"`
+	// Path to upload json coverage reports from managers (optional).
+	CoverPipelinePath string `json:"cover_pipeline_path"`
+	// Path to upload corpus.db from managers (optional).
+	// Supported protocols: GCS (gs://) and HTTP PUT (http:// or https://).
+	CorpusUploadPath string `json:"corpus_upload_path"`
+	// Make files uploaded via CoverUploadPath, CorpusUploadPath and CoverProgramsPath public.
+	PublishGCS bool `json:"publish_gcs"`
+	// Path to upload bench data from instances (optional).
+	// Supported protocols: GCS (gs://) and HTTP PUT (http:// or https://).
+	BenchUploadPath string `json:"bench_upload_path"`
+	// BinDir must point to a dir that contains compilers required to build
+	// older versions of the kernel. For linux, it needs to include several
+	// compiler versions.
+	BisectBinDir string `json:"bisect_bin_dir"`
+	// Keys of BisectIgnore are full commit hashes that should never be reported
+	// in bisection results.
+	// Values of the map are ignored and can e.g. serve as comments.
+	BisectIgnore map[string]string `json:"bisect_ignore"`
+	// Extra commits to cherry-pick to older kernel revisions.
+	// The list is concatenated with the similar parameter from ManagerConfig.
+	BisectBackports []vcs.BackportCommit `json:"bisect_backports"`
+	Ccache          string               `json:"ccache"`
+	// BuildCPUs defines the maximum number of parallel kernel build threads.
+	BuildCPUs int              `json:"build_cpus"`
+	Managers  []*ManagerConfig `json:"managers"`
 	// Poll period for jobs in seconds (optional, defaults to 10 seconds)
 	JobPollPeriod int `json:"job_poll_period"`
+	// Set up a second (parallel) job processor to speed up processing.
+	// For now, this second job processor only handles patch testing requests.
+	ParallelJobs bool `json:"parallel_jobs"`
 	// Poll period for commits in seconds (optional, defaults to 3600 seconds)
 	CommitPollPeriod int `json:"commit_poll_period"`
+	// Asset Storage config.
+	AssetStorage *asset.Config `json:"asset_storage"`
+	// Per-vm type JSON diffs that will be applied to every instace of the
+	// corresponding VM type.
+	PatchVMConfigs map[string]json.RawMessage `json:"patch_vm_configs"`
+	// Some commits don't live long.
+	// Push all commits used in kernel builds to this git repo URL.
+	// The archive is later used by coverage merger.
+	GitArchive string `json:"git_archive"`
 }
 
 type ManagerConfig struct {
@@ -133,27 +186,56 @@ type ManagerConfig struct {
 	// and rename managers/foo to managers/ci-foo. Then this instance can be moved
 	// to another ci along with managers/ci-foo dir.
 	Name            string `json:"name"`
-	Disabled        string `json:"disabled"` // If not empty, don't build/start this manager.
-	DashboardClient string `json:"dashboard_client"`
-	DashboardKey    string `json:"dashboard_key"`
+	Disabled        string `json:"disabled"`         // If not empty, don't build/start this manager.
+	DashboardClient string `json:"dashboard_client"` // Optional.
+	DashboardKey    string `json:"dashboard_key"`    // Optional.
 	Repo            string `json:"repo"`
 	// Short name of the repo (e.g. "linux-next"), used only for reporting.
-	RepoAlias    string `json:"repo_alias"`
-	Branch       string `json:"branch"` // Defaults to "master".
+	RepoAlias string `json:"repo_alias"`
+	Branch    string `json:"branch"` // Defaults to "master".
+	// Currently either 'gcc' or 'clang'. Note that pkg/bisect requires
+	// explicit plumbing for every os/compiler combination.
+	CompilerType string `json:"compiler_type"` // Defaults to "gcc"
 	Compiler     string `json:"compiler"`
+	Make         string `json:"make"`
+	Linker       string `json:"linker"`
 	Ccache       string `json:"ccache"`
 	Userspace    string `json:"userspace"`
-	KernelConfig string `json:"kernel_config"`
+	// Optional VM image used to build the kernel, needed for some cross-compilation targets.
+	KernelBuilderImage string `json:"kernel_builder_image"`
+	KernelConfig       string `json:"kernel_config"`
+	// KernelSrcSuffix adds a suffix to the kernel_src manager config. This is needed for cases where
+	// the kernel source root as reported in the coverage UI is a subdirectory of the VCS root.
+	KernelSrcSuffix string `json:"kernel_src_suffix"`
+	// Build-type-specific parameters.
+	// Parameters for concrete types are in Config type in pkg/build/TYPE.go, e.g. pkg/build/android.go.
+	Build json.RawMessage `json:"build"`
 	// Baseline config for bisection, see pkg/bisect.KernelConfig.BaselineConfig.
+	// If not specified, syz-ci generates a `-base.config` path counterpart for `kernel_config` and,
+	// if it exists, uses it as default.
 	KernelBaselineConfig string `json:"kernel_baseline_config"`
 	// File with kernel cmdline values (optional).
 	KernelCmdline string `json:"kernel_cmdline"`
 	// File with sysctl values (e.g. output of sysctl -a, optional).
 	KernelSysctl string      `json:"kernel_sysctl"`
 	Jobs         ManagerJobs `json:"jobs"`
-
+	// Extra commits to cherry pick to older kernel revisions.
+	BisectBackports []vcs.BackportCommit `json:"bisect_backports"`
+	// Base syz-manager config for the instance.
 	ManagerConfig json.RawMessage `json:"manager_config"`
-	managercfg    *mgrconfig.Config
+	// By default we want to archive git commits.
+	// This opt-out is needed for *BSD systems.
+	DisableGitArchive bool `json:"disable_git_archive"`
+	// If the kernel's commit is older than MaxKernelLagDays days,
+	// fuzzing won't be started on this instance.
+	// By default it's 30 days.
+	MaxKernelLagDays int `json:"max_kernel_lag_days"`
+	// Tests to run in run-tests mode after smoke test (optional).
+	Tests      string `json:"tests"`
+	managercfg *mgrconfig.Config
+
+	// Auto-assigned ports used by test instances.
+	testRPCPort int
 }
 
 type ManagerJobs struct {
@@ -163,6 +245,19 @@ type ManagerJobs struct {
 	BisectFix   bool `json:"bisect_fix"`   // do fix bisection
 }
 
+func (m *ManagerJobs) AnyEnabled() bool {
+	return m.TestPatches || m.PollCommits || m.BisectCause || m.BisectFix
+}
+
+func (m *ManagerJobs) Filter(filter *ManagerJobs) *ManagerJobs {
+	return &ManagerJobs{
+		TestPatches: m.TestPatches && filter.TestPatches,
+		PollCommits: m.PollCommits && filter.PollCommits,
+		BisectCause: m.BisectCause && filter.BisectCause,
+		BisectFix:   m.BisectFix && filter.BisectFix,
+	}
+}
+
 func main() {
 	flag.Parse()
 	log.EnableLogCaching(1000, 1<<20)
@@ -170,13 +265,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
+	log.SetName(cfg.Name)
 
 	shutdownPending := make(chan struct{})
 	osutil.HandleInterrupts(shutdownPending)
 
-	serveHTTP(cfg)
+	tool.ServeHTTP(cfg.HTTP)
 
-	os.Unsetenv("GOPATH")
 	if cfg.Goroot != "" {
 		os.Setenv("GOROOT", cfg.Goroot)
 		os.Setenv("PATH", filepath.Join(cfg.Goroot, "bin")+
@@ -184,33 +279,37 @@ func main() {
 	}
 
 	updatePending := make(chan struct{})
-	updater := NewSyzUpdater(cfg)
-	updater.UpdateOnStart(*flagAutoUpdate, shutdownPending)
-	if *flagAutoUpdate {
-		go func() {
-			updater.WaitForUpdate()
-			close(updatePending)
-		}()
+	updateTargets := make(map[updater.Target]bool)
+	for _, mgr := range cfg.Managers {
+		updateTargets[updater.Target{
+			OS:     mgr.managercfg.TargetOS,
+			VMArch: mgr.managercfg.TargetVMArch,
+			Arch:   mgr.managercfg.TargetArch,
+		}] = true
 	}
+	updater, err := updater.New(&updater.Config{
+		ExitOnUpdate: *flagExitOnUpgrade,
+		BuildSem:     buildSem,
+		ReportBuildError: func(commit *vcs.Commit, compilerID string, buildErr error) {
+			uploadSyzkallerBuildError(cfg, commit, compilerID, buildErr)
+		},
+		SyzkallerRepo:         cfg.SyzkallerRepo,
+		SyzkallerBranch:       cfg.SyzkallerBranch,
+		SyzkallerDescriptions: cfg.SyzkallerDescriptions,
+		Targets:               updateTargets,
+		MakeTargets:           []string{"manager", "ci"},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	updater.UpdateOnStart(*flagAutoUpdate, updatePending, shutdownPending)
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	stop := make(chan struct{})
-	go func() {
-		select {
-		case <-shutdownPending:
-		case <-updatePending:
-		}
-		kernelBuildSem <- struct{}{} // wait for all current builds
-		close(stop)
-		wg.Done()
-	}()
-
+	ctx, stop := context.WithCancel(context.Background())
 	var managers []*Manager
 	for _, mgrcfg := range cfg.Managers {
-		mgr, err := createManager(cfg, mgrcfg, stop, *flagDebug)
+		mgr, err := createManager(osutil.Abs(filepath.Join("managers", mgrcfg.Name)), cfg, mgrcfg, *flagDebug)
 		if err != nil {
-			log.Logf(0, "failed to create manager %v: %v", mgrcfg.Name, err)
+			log.Errorf("failed to create manager %v: %v", mgrcfg.Name, err)
 			continue
 		}
 		managers = append(managers, mgr)
@@ -218,57 +317,131 @@ func main() {
 	if len(managers) == 0 {
 		log.Fatalf("failed to create all managers")
 	}
+	var wg sync.WaitGroup
 	if *flagManagers {
 		for _, mgr := range managers {
-			mgr := mgr
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				mgr.loop()
-			}()
+			wg.Go(func() {
+				mgr.loop(ctx)
+			})
 		}
 	}
 
-	jp, err := newJobProcessor(cfg, managers, stop, shutdownPending)
-	if err != nil {
-		log.Fatalf("failed to create dashapi connection %v", err)
+	ctxJobs, stopJobs := context.WithCancel(ctx)
+	wgJobs := sync.WaitGroup{}
+	if cfg.DashboardAddr != "" {
+		jm, err := newJobManager(cfg, managers, shutdownPending)
+		if err != nil {
+			log.Fatalf("failed to create dashapi connection %v", err)
+		}
+		jm.startLoop(ctxJobs, &wgJobs)
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		jp.loop()
-	}()
 
 	// For testing. Racy. Use with care.
 	http.HandleFunc("/upload_cover", func(w http.ResponseWriter, r *http.Request) {
 		for _, mgr := range managers {
-			if err := mgr.uploadCoverReport(); err != nil {
-				w.Write([]byte(fmt.Sprintf("failed for %v: %v <br>\n", mgr.name, err)))
+			if err := mgr.uploadCoverReport(ctx); err != nil {
+				fmt.Fprintf(w, "failed for %v: %v <br>\n", mgr.name, err)
 				return
 			}
-			w.Write([]byte(fmt.Sprintf("upload cover for %v <br>\n", mgr.name)))
+			fmt.Fprintf(w, "upload cover for %v <br>\n", mgr.name)
 		}
 	})
 
-	wg.Wait()
+	wg.Add(1)
+	go deprecateAssets(ctx, cfg, &wg)
 
 	select {
 	case <-shutdownPending:
 	case <-updatePending:
+	}
+	stopJobs()
+	wgJobs.Wait()
+	stop()
+	wg.Wait()
+
+	select {
+	case <-shutdownPending:
+	default:
 		updater.UpdateAndRestart()
 	}
 }
 
-func serveHTTP(cfg *Config) {
-	ln, err := net.Listen("tcp4", cfg.HTTP)
-	if err != nil {
-		log.Fatalf("failed to listen on %v: %v", cfg.HTTP, err)
+func deprecateAssets(ctx context.Context, cfg *Config, wg *sync.WaitGroup) {
+	defer wg.Done()
+	if cfg.DashboardAddr == "" || cfg.AssetStorage.IsEmpty() ||
+		!cfg.AssetStorage.DoDeprecation {
+		return
 	}
-	log.Logf(0, "serving http on http://%v", ln.Addr())
-	go func() {
-		err := http.Serve(ln, nil)
-		log.Fatalf("failed to serve http: %v", err)
-	}()
+	dash, err := dashapi.New(cfg.DashboardClient, cfg.DashboardAddr, cfg.DashboardKey)
+	if err != nil {
+		log.Fatalf("failed to create dashapi during asset deprecation: %v", err)
+		return
+	}
+	assetStorage, err := storage.StorageFromConfig(cfg.AssetStorage, dash)
+	if err != nil {
+		log.Errorf("failed to create asset storage during asset deprecation: %v", err)
+		return
+	}
+loop:
+	for {
+		const sleepDuration = 6 * time.Hour
+		select {
+		case <-ctx.Done():
+			break loop
+		case <-time.After(sleepDuration):
+		}
+		log.Logf(1, "start asset deprecation")
+		stats, err := assetStorage.DeprecateAssets()
+		if err != nil {
+			log.Errorf("asset deprecation failed: %v", err)
+		}
+		log.Logf(0, "asset deprecation: needed=%d, existing=%d, deleted=%d",
+			stats.Needed, stats.Existing, stats.Deleted)
+	}
+}
+
+func uploadSyzkallerBuildError(cfg *Config, commit *vcs.Commit, compilerID string, buildErr error) {
+	var output []byte
+	title := buildErr.Error()
+	if verbose, ok := errors.AsType[*osutil.VerboseError](buildErr); ok {
+		output = verbose.Output
+	}
+	title = "syzkaller: " + title
+	for _, mgrcfg := range cfg.Managers {
+		if cfg.DashboardAddr == "" || mgrcfg.DashboardClient == "" {
+			log.Logf(0, "not uploading build error for %v: no dashboard", mgrcfg.Name)
+			continue
+		}
+		dash, err := dashapi.New(mgrcfg.DashboardClient, cfg.DashboardAddr, mgrcfg.DashboardKey)
+		if err != nil {
+			log.Logf(0, "failed to report build error for %v: %v", mgrcfg.Name, err)
+			return
+		}
+		managercfg := mgrcfg.managercfg
+		req := &dashapi.BuildErrorReq{
+			Build: dashapi.Build{
+				Manager:             managercfg.Name,
+				ID:                  commit.Hash,
+				OS:                  managercfg.TargetOS,
+				Arch:                managercfg.TargetArch,
+				VMArch:              managercfg.TargetVMArch,
+				SyzkallerCommit:     commit.Hash,
+				SyzkallerCommitDate: commit.CommitDate,
+				CompilerID:          compilerID,
+				KernelRepo:          cfg.SyzkallerRepo,
+				KernelBranch:        cfg.SyzkallerBranch,
+				BuildEnv:            extractBuildEnv(managercfg),
+			},
+			Crash: dashapi.Crash{
+				Title: title,
+				Log:   output,
+			},
+		}
+		if err := dash.ReportBuildError(req); err != nil {
+			// TODO: log ReportBuildError error to dashboard.
+			log.Logf(0, "failed to report build error for %v: %v", mgrcfg.Name, err)
+		}
+	}
 }
 
 func loadConfig(filename string) (*Config, error) {
@@ -276,6 +449,7 @@ func loadConfig(filename string) (*Config, error) {
 		SyzkallerRepo:    "https://github.com/google/syzkaller.git",
 		SyzkallerBranch:  "master",
 		ManagerPort:      10000,
+		RPCPort:          30000,
 		Goroot:           os.Getenv("GOROOT"),
 		JobPollPeriod:    10,
 		CommitPollPeriod: 3600,
@@ -306,13 +480,18 @@ func loadConfig(filename string) (*Config, error) {
 	if len(cfg.Managers) == 0 {
 		return nil, fmt.Errorf("no managers specified")
 	}
+	if cfg.AssetStorage != nil {
+		if err := cfg.AssetStorage.Validate(); err != nil {
+			return nil, fmt.Errorf("asset storage config error: %w", err)
+		}
+	}
 	return cfg, nil
 }
 
 func loadManagerConfig(cfg *Config, mgr *ManagerConfig) error {
 	managercfg, err := mgrconfig.LoadPartialData(mgr.ManagerConfig)
 	if err != nil {
-		return fmt.Errorf("manager config: %v", err)
+		return fmt.Errorf("manager config: %w", err)
 	}
 	if managercfg.Name != "" && mgr.Name != "" {
 		return fmt.Errorf("both managercfg.Name=%q and mgr.Name=%q are specified", managercfg.Name, mgr.Name)
@@ -325,24 +504,11 @@ func loadManagerConfig(cfg *Config, mgr *ManagerConfig) error {
 	} else {
 		managercfg.Name = cfg.Name + "-" + mgr.Name
 	}
-	// Manager name must not contain dots because it is used as GCE image name prefix.
-	managerNameRe := regexp.MustCompile("^[a-zA-Z0-9-_]{3,64}$")
-	if !managerNameRe.MatchString(mgr.Name) {
-		return fmt.Errorf("param 'managers.name' has bad value: %q", mgr.Name)
+	if mgr.CompilerType == "" {
+		mgr.CompilerType = "gcc"
 	}
 	if mgr.Branch == "" {
 		mgr.Branch = "master"
-	}
-	if (mgr.Jobs.TestPatches || mgr.Jobs.PollCommits ||
-		mgr.Jobs.BisectCause || mgr.Jobs.BisectFix) &&
-		(cfg.DashboardAddr == "" || cfg.DashboardClient == "") {
-		return fmt.Errorf("manager %v: has jobs but no dashboard info", mgr.Name)
-	}
-	if mgr.Jobs.PollCommits && (cfg.DashboardAddr == "" || mgr.DashboardClient == "") {
-		return fmt.Errorf("manager %v: commit_poll is set but no dashboard info", mgr.Name)
-	}
-	if (mgr.Jobs.BisectCause || mgr.Jobs.BisectFix) && cfg.BisectBinDir == "" {
-		return fmt.Errorf("manager %v: enabled bisection but no bisect_bin_dir", mgr.Name)
 	}
 	mgr.managercfg = managercfg
 	managercfg.Syzkaller = filepath.FromSlash("syzkaller/current")
@@ -350,12 +516,62 @@ func loadManagerConfig(cfg *Config, mgr *ManagerConfig) error {
 		managercfg.HTTP = fmt.Sprintf(":%v", cfg.ManagerPort)
 		cfg.ManagerPort++
 	}
+	if managercfg.RPC == ":0" {
+		managercfg.RPC = fmt.Sprintf(":%v", cfg.RPCPort)
+		cfg.RPCPort++
+	}
+	mgr.testRPCPort = cfg.RPCPort
+	cfg.RPCPort++
 	// Note: we don't change Compiler/Ccache because it may be just "gcc" referring
 	// to the system binary, or pkg/build/netbsd.go uses "g++" and "clang++" as special marks.
 	mgr.Userspace = osutil.Abs(mgr.Userspace)
+	mgr.KernelBuilderImage = osutil.Abs(mgr.KernelBuilderImage)
 	mgr.KernelConfig = osutil.Abs(mgr.KernelConfig)
 	mgr.KernelBaselineConfig = osutil.Abs(mgr.KernelBaselineConfig)
 	mgr.KernelCmdline = osutil.Abs(mgr.KernelCmdline)
 	mgr.KernelSysctl = osutil.Abs(mgr.KernelSysctl)
+	if mgr.KernelConfig != "" && mgr.KernelBaselineConfig == "" {
+		mgr.KernelBaselineConfig = inferBaselineConfig(mgr.KernelConfig)
+	}
+	if mgr.MaxKernelLagDays == 0 {
+		mgr.MaxKernelLagDays = 30
+	}
+	if err := mgr.validate(cfg); err != nil {
+		return err
+	}
+
+	if cfg.PatchVMConfigs[managercfg.Type] != nil {
+		managercfg.VM, err = config.MergeJSONs(managercfg.VM, cfg.PatchVMConfigs[managercfg.Type])
+		if err != nil {
+			return fmt.Errorf("failed to patch manager %v's VM: %w", mgr.Name, err)
+		}
+	}
 	return nil
+}
+
+func extractBuildEnv(managercfg *mgrconfig.Config) dashapi.BuildEnv {
+	var vm struct {
+		MachineType string `json:"machine_type"`
+		QemuArgs    string `json:"qemu_args"`
+	}
+	if len(managercfg.VM) != 0 {
+		_ = json.Unmarshal(managercfg.VM, &vm)
+	}
+	return dashapi.BuildEnv{
+		VMType:      managercfg.Type,
+		MachineType: vm.MachineType,
+		QemuArgs:    vm.QemuArgs,
+	}
+}
+
+func inferBaselineConfig(kernelConfig string) string {
+	suffixPos := strings.LastIndex(kernelConfig, ".config")
+	if suffixPos < 0 {
+		return ""
+	}
+	candidate := kernelConfig[:suffixPos] + "-base.config"
+	if !osutil.IsExist(candidate) {
+		return ""
+	}
+	return candidate
 }

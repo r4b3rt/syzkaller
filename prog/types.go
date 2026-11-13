@@ -5,6 +5,7 @@ package prog
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -19,8 +20,12 @@ type Syscall struct {
 	Ret         Type
 	Attrs       SyscallAttrs
 
-	inputResources  []*ResourceDesc
-	outputResources []*ResourceDesc
+	// Resources that are required for this call to be generated (in/inout).
+	inputResources []*ResourceDesc
+	// Resources that this call can be used to create (out, but excluding no_generate).
+	createsResources []*ResourceDesc
+	// Both inputs and output resources (including no_generate).
+	usesResources []*ResourceDesc
 }
 
 // SyscallAttrs represents call attributes in syzlang.
@@ -29,15 +34,27 @@ type Syscall struct {
 // pkg/compiler uses this structure to parse descriptions.
 // syz-sysgen uses this structure to generate code for executor.
 //
-// Only bool's and uint64's are currently supported.
+// Only `bool`s, `string`s and `uint64`s are currently supported.
 //
 // See docs/syscall_descriptions_syntax.md for description of individual attributes.
 type SyscallAttrs struct {
-	Disabled      bool
-	Timeout       uint64
-	ProgTimeout   uint64
-	IgnoreReturn  bool
-	BreaksReturns bool
+	Disabled        bool
+	Timeout         uint64
+	ProgTimeout     uint64
+	IgnoreReturn    bool
+	BreaksReturns   bool
+	NoGenerate      bool
+	NoMinimize      bool
+	NoSquash        bool
+	RemoteCover     bool
+	Automatic       bool
+	AutomaticHelper bool
+	KFuzzTest       bool
+	Snapshot        bool
+	Fsck            string
+	// Filesystem is used in tools/syz-imagegen when fs name cannot be deduced from
+	// the part after $.
+	Filesystem string
 }
 
 // MaxArgs is maximum number of syscall arguments.
@@ -70,6 +87,10 @@ type Field struct {
 	Type
 	HasDirection bool
 	Direction    Dir
+	Condition    Expression
+
+	// See Target.initRelatedFields.
+	relatedFields map[Type]struct{}
 }
 
 func (f *Field) Dir(def Dir) Dir {
@@ -77,6 +98,69 @@ func (f *Field) Dir(def Dir) Dir {
 		return f.Direction
 	}
 	return def
+}
+
+type ArgFinder func(path []string) Arg
+
+// SquashedArgFound is a special case reply of ArgFinder.
+var SquashedArgFound = &DataArg{}
+
+type Expression interface {
+	fmt.GoStringer
+	ForEachValue(func(*Value))
+	Clone() Expression
+	Evaluate(ArgFinder) (uint64, bool)
+}
+
+type BinaryOperator int
+
+const (
+	OperatorCompareEq BinaryOperator = iota
+	OperatorCompareNeq
+	OperatorBinaryAnd
+	OperatorOr
+)
+
+type BinaryExpression struct {
+	Operator BinaryOperator
+	Left     Expression
+	Right    Expression
+}
+
+func (bo BinaryExpression) GoString() string {
+	return fmt.Sprintf("&prog.BinaryExpression{%#v,%#v,%#v}", bo.Operator, bo.Left, bo.Right)
+}
+
+func (bo BinaryExpression) ForEachValue(cb func(*Value)) {
+	bo.Left.ForEachValue(cb)
+	bo.Right.ForEachValue(cb)
+}
+
+func (bo BinaryExpression) Clone() Expression {
+	return &BinaryExpression{
+		Operator: bo.Operator,
+		Left:     bo.Left.Clone(),
+		Right:    bo.Right.Clone(),
+	}
+}
+
+type Value struct {
+	// If Path is empty, Value is to be used.
+	Value uint64
+	// Path to the field.
+	Path []string
+}
+
+func (v *Value) GoString() string {
+	return fmt.Sprintf("&prog.Value{%#v,%#v}", v.Value, v.Path)
+}
+
+func (v *Value) ForEachValue(cb func(*Value)) {
+	cb(v)
+}
+
+func (v *Value) Clone() Expression {
+	return &Value{v.Value, slices.Clone(v.Path)}
 }
 
 type BinaryFormat int
@@ -112,7 +196,7 @@ type Type interface {
 	isDefaultArg(arg Arg) bool
 	generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call)
 	mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) (calls []*Call, retry, preserve bool)
-	getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool)
+	getMutationPrio(target *Target, arg Arg, ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool)
 	minimize(ctx *minimizeArgsCtx, arg Arg, path string) bool
 	ref() Ref
 	setRef(ref Ref)
@@ -139,15 +223,19 @@ func (ti Ref) DefaultArg(dir Dir) Arg                                { panic("pr
 func (ti Ref) Clone() Type                                           { panic("prog.Ref method called") }
 func (ti Ref) isDefaultArg(arg Arg) bool                             { panic("prog.Ref method called") }
 func (ti Ref) generate(r *randGen, s *state, dir Dir) (Arg, []*Call) { panic("prog.Ref method called") }
+
 func (ti Ref) mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) ([]*Call, bool, bool) {
 	panic("prog.Ref method called")
 }
-func (ti Ref) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (float64, bool) {
+
+func (ti Ref) getMutationPrio(target *Target, arg Arg, ignoreSpecial, ignoreLengths bool) (float64, bool) {
 	panic("prog.Ref method called")
 }
+
 func (ti Ref) minimize(ctx *minimizeArgsCtx, arg Arg, path string) bool {
 	panic("prog.Ref method called")
 }
+
 func (ti Ref) ref() Ref       { panic("prog.Ref method called") }
 func (ti Ref) setRef(ref Ref) { panic("prog.Ref method called") }
 
@@ -174,11 +262,8 @@ func (t *TypeCommon) Name() string {
 }
 
 func (t *TypeCommon) TemplateName() string {
-	name := t.TypeName
-	if pos := strings.IndexByte(name, '['); pos != -1 {
-		name = name[:pos]
-	}
-	return name
+	before, _, _ := strings.Cut(t.TypeName, "[")
+	return before
 }
 
 func (t *TypeCommon) Optional() bool {
@@ -239,6 +324,11 @@ func (t *TypeCommon) Alignment() uint64 {
 	return t.TypeAlign
 }
 
+type FlagDesc struct {
+	Name   string
+	Values []string
+}
+
 type ResourceDesc struct {
 	Name   string
 	Kind   []string
@@ -247,7 +337,7 @@ type ResourceDesc struct {
 }
 
 type ResourceCtor struct {
-	Call    int // index in Target.Syscalls
+	Call    *Syscall
 	Precise bool
 }
 
@@ -290,6 +380,11 @@ type IntTypeCommon struct {
 	BitfieldLen     uint64
 	BitfieldUnit    uint64
 	BitfieldUnitOff uint64
+
+	// Hint values that don't make sense to use for this type
+	// b/c they are expected to be easily guessed by generation/mutation.
+	// For example, flags values or combinations of few flags values.
+	uselessHints map[uint64]struct{}
 }
 
 func (t *IntTypeCommon) String() string {
@@ -300,7 +395,7 @@ func (t *IntTypeCommon) Format() BinaryFormat {
 	return t.ArgFormat
 }
 
-// Returns the size in bits for integers in binary format or 64 for string-formatted integers. The return
+// TypeBitSize returns the size in bits for integers in binary format or 64 for string-formatted integers. The return
 // value is used in computing limits and truncating other values.
 func (t *IntTypeCommon) TypeBitSize() uint64 {
 	if t.ArgFormat != FormatNative && t.ArgFormat != FormatBigEndian {
@@ -336,6 +431,21 @@ func (t *IntTypeCommon) IsBitfield() bool {
 	return t.BitfieldLen != 0
 }
 
+func (t *IntTypeCommon) uselessHint(v uint64) bool {
+	_, ok := t.uselessHints[v]
+	return ok
+}
+
+func (t *IntTypeCommon) setUselessHints(m map[uint64]struct{}) {
+	t.uselessHints = m
+}
+
+type uselessHinter interface {
+	uselessHint(uint64) bool
+	calcUselessHints() []uint64
+	setUselessHints(map[uint64]struct{})
+}
+
 type ConstType struct {
 	IntTypeCommon
 	Val   uint64
@@ -355,6 +465,10 @@ func (t *ConstType) String() string {
 		return fmt.Sprintf("pad[%v]", t.Size())
 	}
 	return fmt.Sprintf("const[%v, %v]", t.Val, t.IntTypeCommon.String())
+}
+
+func (t *ConstType) calcUselessHints() []uint64 {
+	return []uint64{t.Val}
 }
 
 type IntKind int
@@ -380,6 +494,23 @@ func (t *IntType) isDefaultArg(arg Arg) bool {
 	return arg.(*ConstArg).Val == 0
 }
 
+func (t *IntType) calcUselessHints() []uint64 {
+	res := specialInts[:len(specialInts):len(specialInts)]
+	align := max(1, t.Align)
+	rangeVals := (t.RangeEnd - t.RangeBegin) / align
+	if rangeVals != 0 && rangeVals <= 100 {
+		// Count the values instead of comparing against RangeEnd: when the
+		// last step wraps past math.MaxUint64 (e.g. int32be[-3:-1]), v never
+		// exceeds RangeEnd and the loop appends until it runs out of memory.
+		v := t.RangeBegin
+		for i := uint64(0); i <= rangeVals; i++ {
+			res = append(res, v)
+			v += align
+		}
+	}
+	return res
+}
+
 type FlagsType struct {
 	IntTypeCommon
 	Vals    []uint64 // compiler ensures that it's not empty
@@ -392,6 +523,29 @@ func (t *FlagsType) DefaultArg(dir Dir) Arg {
 
 func (t *FlagsType) isDefaultArg(arg Arg) bool {
 	return arg.(*ConstArg).Val == 0
+}
+
+func (t *FlagsType) calcUselessHints() []uint64 {
+	// Combinations of up to 3 flag values + 0.
+	res := []uint64{0}
+	vals := t.Vals
+	for i0 := range len(vals) {
+		v0 := vals[i0]
+		res = append(res, v0)
+		if len(vals) <= 10 {
+			for i1 := i0 + 1; i1 < len(vals); i1++ {
+				v1 := v0 | vals[i1]
+				res = append(res, v1)
+				if len(vals) <= 7 {
+					for i2 := i1 + 1; i2 < len(vals); i2++ {
+						v2 := v1 | vals[i2]
+						res = append(res, v2)
+					}
+				}
+			}
+		}
+	}
+	return res
 }
 
 type LenType struct {
@@ -409,6 +563,14 @@ func (t *LenType) isDefaultArg(arg Arg) bool {
 	return arg.(*ConstArg).Val == 0
 }
 
+func (t *LenType) calcUselessHints() []uint64 {
+	return nil
+}
+
+func (t *LenType) uselessHint(v uint64) bool {
+	return v <= maxArrayLen || v > 1<<20
+}
+
 type ProcType struct {
 	IntTypeCommon
 	ValuesStart   uint64
@@ -416,6 +578,8 @@ type ProcType struct {
 }
 
 const (
+	// Some aspects of the linux kernel configs also know about this const,
+	// e.g. they create that many devices of various types (usually these parameters are in CMDLINE).
 	MaxPids          = 32
 	procDefaultValue = 0xffffffffffffffff // special value denoting 0 for all procs
 )
@@ -482,6 +646,7 @@ const (
 	BufferFilename
 	BufferText
 	BufferGlob
+	BufferCompressed
 )
 
 type TextKind int
@@ -494,6 +659,7 @@ const (
 	TextX86bit64
 	TextArm64
 	TextPpc64
+	TextRiscv64
 )
 
 type BufferType struct {
@@ -552,6 +718,10 @@ func (t *BufferType) isDefaultArg(arg Arg) bool {
 	return true
 }
 
+func (t *BufferType) IsCompressed() bool {
+	return t.Kind == BufferCompressed
+}
+
 type ArrayKind int
 
 const (
@@ -596,8 +766,9 @@ func (t *ArrayType) isDefaultArg(arg Arg) bool {
 
 type PtrType struct {
 	TypeCommon
-	Elem    Type
-	ElemDir Dir
+	Elem           Type
+	ElemDir        Dir
+	SquashableElem bool
 }
 
 func (t *PtrType) String() string {
@@ -621,8 +792,9 @@ func (t *PtrType) isDefaultArg(arg Arg) bool {
 
 type StructType struct {
 	TypeCommon
-	Fields    []Field
-	AlignAttr uint64
+	Fields       []Field
+	AlignAttr    uint64
+	OverlayField int // index of the field marked with out_overlay attribute (0 if no attribute)
 }
 
 func (t *StructType) String() string {
@@ -657,13 +829,43 @@ func (t *UnionType) String() string {
 }
 
 func (t *UnionType) DefaultArg(dir Dir) Arg {
-	f := t.Fields[0]
-	return MakeUnionArg(t, dir, f.DefaultArg(f.Dir(dir)), 0)
+	idx, _ := t.defaultField()
+	f := t.Fields[idx]
+	arg := MakeUnionArg(t, dir, f.DefaultArg(f.Dir(dir)), idx)
+	arg.transient = t.isConditional()
+	return arg
+}
+
+func (t *UnionType) defaultField() (int, bool) {
+	// If it's a conditional union, the last field is usually a safe choice for the default value as
+	// it must have no condition.
+	// Auto-generated wrappers for conditional fields are an exception since both fields will have
+	// conditions, and, moreover, these conditions will be mutually exclusive.
+	if t.isConditional() {
+		if t.Fields[len(t.Fields)-1].Condition != nil {
+			// There's no correct default index.
+			return 0, false
+		}
+		return len(t.Fields) - 1, true
+	}
+	// Otherwise, just take the first.
+	return 0, true
+}
+
+func (t *UnionType) isConditional() bool {
+	// Either all fields will have a conditions, or all except the last one, or none.
+	// So checking for the first one is always enough.
+	return t.Fields[0].Condition != nil
 }
 
 func (t *UnionType) isDefaultArg(arg Arg) bool {
 	a := arg.(*UnionArg)
-	return a.Index == 0 && isDefault(a.Option)
+	defIdx, ok := t.defaultField()
+	if !ok {
+		// Any value is the only possible option.
+		return isDefault(a.Option)
+	}
+	return a.Index == defIdx && isDefault(a.Option)
 }
 
 type ConstValue struct {
@@ -672,74 +874,112 @@ type ConstValue struct {
 }
 
 type TypeCtx struct {
-	Meta *Syscall
-	Dir  Dir
-	Ptr  *Type
+	Meta     *Syscall
+	Dir      Dir
+	Ptr      *Type
+	Optional bool
+	Stop     bool // If set by the callback, subtypes of this type are not visited.
 }
 
-func ForeachType(syscalls []*Syscall, f func(t Type, ctx TypeCtx)) {
+func ForeachType(syscalls []*Syscall, f func(t Type, ctx *TypeCtx)) {
 	for _, meta := range syscalls {
-		foreachTypeImpl(meta, true, f)
+		foreachCallTypeImpl(meta, true, f)
 	}
 }
 
-func ForeachTypePost(syscalls []*Syscall, f func(t Type, ctx TypeCtx)) {
+func ForeachTypePost(syscalls []*Syscall, f func(t Type, ctx *TypeCtx)) {
 	for _, meta := range syscalls {
-		foreachTypeImpl(meta, false, f)
+		foreachCallTypeImpl(meta, false, f)
 	}
 }
 
-func ForeachCallType(meta *Syscall, f func(t Type, ctx TypeCtx)) {
-	foreachTypeImpl(meta, true, f)
+func ForeachCallType(meta *Syscall, f func(t Type, ctx *TypeCtx)) {
+	foreachCallTypeImpl(meta, true, f)
 }
 
-func foreachTypeImpl(meta *Syscall, preorder bool, f func(t Type, ctx TypeCtx)) {
+// We need seen to be keyed by the type, the direction, and the optionality
+// bit. Even if the first time we see a type it is optional or DirOut, it
+// could be required or DirIn on another path. So to ensure that the
+// information we report to the caller is correct, we need to visit both
+// occurrences.
+type seenKey struct {
+	t Type
+	d Dir
+	o bool
+}
+
+func foreachCallTypeImpl(meta *Syscall, preorder bool, f func(t Type, ctx *TypeCtx)) {
 	// Note: we specifically don't create seen in ForeachType.
 	// It would prune recursion more (across syscalls), but lots of users need to
 	// visit each struct per-syscall (e.g. prio, used resources).
-	seen := make(map[Type]bool)
-	var rec func(*Type, Dir)
-	rec = func(ptr *Type, dir Dir) {
-		if preorder {
-			f(*ptr, TypeCtx{Meta: meta, Dir: dir, Ptr: ptr})
-		}
-		switch a := (*ptr).(type) {
-		case *PtrType:
-			rec(&a.Elem, a.ElemDir)
-		case *ArrayType:
-			rec(&a.Elem, dir)
-		case *StructType:
-			if seen[a] {
-				break // prune recursion via pointers to structs/unions
-			}
-			seen[a] = true
-			for i, f := range a.Fields {
-				rec(&a.Fields[i].Type, f.Dir(dir))
-			}
-		case *UnionType:
-			if seen[a] {
-				break // prune recursion via pointers to structs/unions
-			}
-			seen[a] = true
-			for i, f := range a.Fields {
-				rec(&a.Fields[i].Type, f.Dir(dir))
-			}
-		case *ResourceType, *BufferType, *VmaType, *LenType, *FlagsType,
-			*ConstType, *IntType, *ProcType, *CsumType:
-		case Ref:
-			// This is only needed for pkg/compiler.
-		default:
-			panic("unknown type")
-		}
-		if !preorder {
-			f(*ptr, TypeCtx{Meta: meta, Dir: dir, Ptr: ptr})
-		}
-	}
+	seen := make(map[seenKey]bool)
 	for i := range meta.Args {
-		rec(&meta.Args[i].Type, DirIn)
+		foreachTypeRec(f, meta, seen, &meta.Args[i].Type, DirIn, preorder, false)
 	}
 	if meta.Ret != nil {
-		rec(&meta.Ret, DirOut)
+		foreachTypeRec(f, meta, seen, &meta.Ret, DirOut, preorder, false)
+	}
+}
+
+func ForeachArgType(typ Type, f func(t Type, ctx *TypeCtx)) {
+	foreachTypeRec(f, nil, make(map[seenKey]bool), &typ, DirIn, true, false)
+}
+
+func foreachTypeRec(cb func(t Type, ctx *TypeCtx), meta *Syscall, seen map[seenKey]bool, ptr *Type,
+	dir Dir, preorder, optional bool) {
+	if _, ref := (*ptr).(Ref); !ref {
+		optional = optional || (*ptr).Optional()
+	}
+	ctx := &TypeCtx{Meta: meta, Dir: dir, Ptr: ptr, Optional: optional}
+	if preorder {
+		cb(*ptr, ctx)
+		if ctx.Stop {
+			return
+		}
+	}
+	switch a := (*ptr).(type) {
+	case *PtrType:
+		foreachTypeRec(cb, meta, seen, &a.Elem, a.ElemDir, preorder, optional)
+	case *ArrayType:
+		foreachTypeRec(cb, meta, seen, &a.Elem, dir, preorder, optional)
+	case *StructType:
+		key := seenKey{
+			t: a,
+			d: dir,
+			o: optional,
+		}
+		if seen[key] {
+			break // prune recursion via pointers to structs/unions
+		}
+		seen[key] = true
+		for i, f := range a.Fields {
+			foreachTypeRec(cb, meta, seen, &a.Fields[i].Type, f.Dir(dir), preorder, optional)
+		}
+	case *UnionType:
+		key := seenKey{
+			t: a,
+			d: dir,
+			o: optional,
+		}
+		if seen[key] {
+			break // prune recursion via pointers to structs/unions
+		}
+		seen[key] = true
+		for i, f := range a.Fields {
+			foreachTypeRec(cb, meta, seen, &a.Fields[i].Type, f.Dir(dir), preorder, optional)
+		}
+	case *ResourceType, *BufferType, *VmaType, *LenType, *FlagsType,
+		*ConstType, *IntType, *ProcType, *CsumType:
+	case Ref:
+		// This is only needed for pkg/compiler.
+	default:
+		panic("unknown type")
+	}
+	if !preorder {
+		cb(*ptr, ctx)
+		if ctx.Stop {
+			panic("Stop is set in post-order iteration")
+		}
 	}
 }
 

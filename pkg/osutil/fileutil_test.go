@@ -5,8 +5,6 @@ package osutil
 
 import (
 	"fmt"
-	"io/ioutil"
-	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -14,17 +12,13 @@ import (
 )
 
 func TestProcessTempDir(t *testing.T) {
-	for try := 0; try < 10; try++ {
+	for range 10 {
 		func() {
-			tmp, err := ioutil.TempDir("", "syz")
-			if err != nil {
-				t.Fatalf("failed to create a temp dir: %v", err)
-			}
-			defer os.RemoveAll(tmp)
+			tmp := t.TempDir()
 			const P = 16
 			// Pre-create half of the instances with stale pid.
 			var dirs []string
-			for i := 0; i < P/2; i++ {
+			for range P / 2 {
 				dir, err := ProcessTempDir(tmp)
 				if err != nil {
 					t.Fatalf("failed to create process temp dir")
@@ -40,11 +34,11 @@ func TestProcessTempDir(t *testing.T) {
 			done := make(chan error)
 			allDirs := make(map[string]bool)
 			var mu sync.Mutex
-			for p := 0; p < P; p++ {
+			for range P {
 				go func() {
 					dir, err := ProcessTempDir(tmp)
 					if err != nil {
-						done <- fmt.Errorf("failed to create temp dir: %v", err)
+						done <- fmt.Errorf("failed to create temp dir: %w", err)
 						return
 					}
 					mu.Lock()
@@ -58,7 +52,7 @@ func TestProcessTempDir(t *testing.T) {
 					done <- nil
 				}()
 			}
-			for p := 0; p < P; p++ {
+			for range P {
 				if err := <-done; err != nil {
 					t.Error(err)
 				}

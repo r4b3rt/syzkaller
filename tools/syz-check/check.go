@@ -3,12 +3,20 @@
 
 // syz-check does best-effort static correctness checking of the syscall descriptions in sys/os/*.txt.
 // Use:
+//
 //	$ go install ./tools/syz-check
 //	$ syz-check -obj-amd64 /linux_amd64/vmlinux -obj-arm64 /linux_arm64/vmlinux \
 //		-obj-386 /linux_386/vmlinux -obj-arm /linux_arm/vmlinux
 //
 // The vmlinux files should include debug info, enable all relevant configs (since we parse dwarf),
-// and be compiled with -fno-eliminate-unused-debug-types -fno-eliminate-unused-debug-symbols flags.
+// and be compiled with -gdwarf-3 -fno-eliminate-unused-debug-types -fno-eliminate-unused-debug-symbols flags.
+// -gdwarf-3 is required because version 4 changes the way bitfields are encoded and Go before 1.18
+// does not support then new encoding and at least earlier versions mis-handle it, see:
+// https://go-review.googlesource.com/c/go/+/328709/comments/edf0619d_daec236f
+//
+// Use the following configs for kernels (x86_64 config for i386 as well):
+// upstream-apparmor-kasan.config, upstream-arm-full.config, upstream-arm64-full.config
+//
 // You may check only one arch as well (but then don't commit changes to warn files):
 //
 //	$ syz-check -obj-amd64 /linux_amd64/vmlinux
@@ -102,7 +110,7 @@ func check(OS, arch, obj string, dwarf, netlink bool) ([]Warn, error) {
 		warnings = append(warnings, warnings2...)
 	}
 	if netlink {
-		warnings3, err := checkNetlink(OS, arch, obj, structTypes, locs)
+		warnings3, err := checkNetlink(arch, obj, structTypes, locs)
 		if err != nil {
 			return nil, err
 		}
@@ -146,10 +154,6 @@ func writeWarnings(OS string, narches int, warnings []Warn) error {
 	}
 	byFile := make(map[string][]Warn)
 	for _, warn := range warnings {
-		// KVM is not supported on ARM completely.
-		if OS == targets.Linux && warn.arch == targets.ARM && strings.HasSuffix(warn.pos.File, "_kvm.txt") {
-			continue
-		}
 		byFile[warn.pos.File] = append(byFile[warn.pos.File], warn)
 	}
 	for file, warns := range byFile {
@@ -167,6 +171,7 @@ func writeWarnings(OS string, narches int, warnings []Warn) error {
 			return w1.arch < w2.arch
 		})
 		buf := new(bytes.Buffer)
+		//nolint:syz-linter // i is modified inside the loop
 		for i := 0; i < len(warns); i++ {
 			warn := warns[i]
 			arch := warn.arch
@@ -206,7 +211,16 @@ func checkImpl(structs map[string]*dwarf.StructType, structTypes []prog.Type,
 		if astStruct == nil {
 			continue
 		}
-		warns, err := checkStruct(typ, astStruct, structs[name])
+		if _, ok := isNetlinkPolicy(typ); ok {
+			continue // netlink policies are not structs even if we describe them as structs
+		}
+		// In some cases we split a single struct into multiple ones
+		// (more precise description), so try to match our foo$bar with kernel foo.
+		kernelStruct := structs[name]
+		if delim := strings.LastIndexByte(name, '$'); kernelStruct == nil && delim != -1 {
+			kernelStruct = structs[name[:delim]]
+		}
+		warns, err := checkStruct(typ, astStruct, kernelStruct)
 		if err != nil {
 			return nil, err
 		}
@@ -217,7 +231,7 @@ func checkImpl(structs map[string]*dwarf.StructType, structTypes []prog.Type,
 
 func checkStruct(typ prog.Type, astStruct *ast.Struct, str *dwarf.StructType) ([]Warn, error) {
 	var warnings []Warn
-	warn := func(pos ast.Pos, typ, msg string, args ...interface{}) {
+	warn := func(pos ast.Pos, typ, msg string, args ...any) {
 		warnings = append(warnings, Warn{pos: pos, typ: typ, msg: fmt.Sprintf(msg, args...)})
 	}
 	name := typ.TemplateName()
@@ -233,6 +247,14 @@ func checkStruct(typ prog.Type, astStruct *ast.Struct, str *dwarf.StructType) ([
 	}
 	// TODO: handle unions, currently we should report some false errors.
 	if _, ok := typ.(*prog.UnionType); ok || str.Kind == "union" {
+		return warnings, nil
+	}
+	// Ignore structs with out_overlay attribute.
+	// They are never described in the kernel as a simple struct.
+	// We could only match and check fields based on some common conventions,
+	// but since we have very few of them it's unclear what are these conventions
+	// and implementing something complex will have low RoI.
+	if typ.(*prog.StructType).OverlayField != 0 {
 		return warnings, nil
 	}
 	// TODO: we could also check enums (elements match corresponding flags in syzkaller).
@@ -351,7 +373,7 @@ func parseDescriptions(OS, arch string) ([]prog.Type, map[string]*ast.Struct, []
 // Then read in the symbol data, which is an array of nla_policy structs.
 // These structs allow to easily figure out type/size of attributes.
 // Finally we compare our descriptions with the kernel policy description.
-func checkNetlink(OS, arch, obj string, structTypes []prog.Type,
+func checkNetlink(arch, obj string, structTypes []prog.Type,
 	locs map[string]*ast.Struct) ([]Warn, error) {
 	if arch != targets.AMD64 {
 		// Netlink policies are arch-independent (?),
@@ -367,8 +389,7 @@ func checkNetlink(OS, arch, obj string, structTypes []prog.Type,
 	if rodata == nil {
 		return nil, fmt.Errorf("object file %v does not contain .rodata section", obj)
 	}
-	symb := symbolizer.NewSymbolizer(targets.Get(OS, arch))
-	symbols, err := symb.ReadRodataSymbols(obj)
+	symbols, err := symbolizer.ReadRodataSymbols(obj)
 	if err != nil {
 		return nil, err
 	}
@@ -396,31 +417,16 @@ func checkNetlinkStruct(locs map[string]*ast.Struct, symbols map[string][]symbol
 	if astStruct == nil {
 		return nil, nil
 	}
-	var fields []prog.Field
-	switch t := typ.(type) {
-	case *prog.StructType:
-		fields = t.Fields
-	case *prog.UnionType:
-		fields = t.Fields
-	}
-	if !isNetlinkPolicy(fields) {
+	fields, ok := isNetlinkPolicy(typ)
+	if !ok {
 		return nil, nil
 	}
-	kernelName := name
-	var ss []symbolizer.Symbol
-	// In some cases we split a single policy into multiple ones
-	// (more precise description), so try to match our foo_bar_baz
-	// with kernel foo_bar and foo as well.
-	for kernelName != "" {
+	// In some cases we split a single policy into multiple ones (more precise description),
+	// so try to match our foo$bar with kernel foo as well.
+	kernelName, ss := name, symbols[name]
+	if delim := strings.LastIndexByte(name, '$'); len(ss) == 0 && delim != -1 {
+		kernelName = name[:delim]
 		ss = symbols[kernelName]
-		if len(ss) != 0 {
-			break
-		}
-		underscore := strings.LastIndexByte(kernelName, '_')
-		if underscore == -1 {
-			break
-		}
-		kernelName = kernelName[:underscore]
 	}
 	if len(ss) == 0 {
 		return []Warn{{pos: astStruct.Pos, typ: WarnNoNetlinkPolicy, msg: name}}, nil
@@ -433,14 +439,17 @@ func checkNetlinkStruct(locs map[string]*ast.Struct, symbols map[string][]symbol
 	// in such case we choose the one that produces fewer warnings.
 	for _, symb := range ss {
 		if symb.Size == 0 || symb.Size%int(unsafe.Sizeof(nlaPolicy{})) != 0 {
-			warnings = append(warnings, Warn{pos: astStruct.Pos, typ: WarnNetlinkBadSize,
-				msg: fmt.Sprintf("%v (%v), size %v", kernelName, name, ss[0].Size)})
+			warnings = append(warnings, Warn{
+				pos: astStruct.Pos,
+				typ: WarnNetlinkBadSize,
+				msg: fmt.Sprintf("%v (%v), size %v", kernelName, name, ss[0].Size),
+			})
 			continue
 		}
 		binary := make([]byte, symb.Size)
 		addr := symb.Addr - rodata.Addr
 		if _, err := rodata.ReadAt(binary, int64(addr)); err != nil {
-			return nil, fmt.Errorf("failed to read policy %v (%v) at %v: %v",
+			return nil, fmt.Errorf("failed to read policy %v (%v) at %v: %w",
 				kernelName, name, symb.Addr, err)
 		}
 		policy := (*[1e6]nlaPolicy)(unsafe.Pointer(&binary[0]))[:symb.Size/int(unsafe.Sizeof(nlaPolicy{}))]
@@ -509,7 +518,16 @@ func checkMissingAttrs(checkedAttrs map[string]*checkAttr) []Warn {
 	return warnings
 }
 
-func isNetlinkPolicy(fields []prog.Field) bool {
+func isNetlinkPolicy(typ prog.Type) ([]prog.Field, bool) {
+	var fields []prog.Field
+	switch t := typ.(type) {
+	case *prog.StructType:
+		fields = t.Fields
+	case *prog.UnionType:
+		fields = t.Fields
+	default:
+		return nil, false
+	}
 	haveAttr := false
 	for _, fld := range fields {
 		field := fld.Type
@@ -523,19 +541,12 @@ func isNetlinkPolicy(fields []prog.Field) bool {
 		if arr, ok := field.(*prog.ArrayType); ok {
 			field = arr.Elem
 		}
-		if field1, ok := field.(*prog.StructType); ok {
-			if isNetlinkPolicy(field1.Fields) {
-				continue
-			}
+		if _, ok := isNetlinkPolicy(field); ok {
+			continue
 		}
-		if field1, ok := field.(*prog.UnionType); ok {
-			if isNetlinkPolicy(field1.Fields) {
-				continue
-			}
-		}
-		return false
+		return nil, false
 	}
-	return haveAttr
+	return fields, haveAttr
 }
 
 const (
@@ -551,7 +562,7 @@ func isNlattr(typ prog.Type) bool {
 func checkNetlinkPolicy(structMap map[string]prog.Type, typ prog.Type, fields []prog.Field,
 	astStruct *ast.Struct, policy []nlaPolicy) ([]Warn, map[int]bool, error) {
 	var warnings []Warn
-	warn := func(pos ast.Pos, typ, msg string, args ...interface{}) {
+	warn := func(pos ast.Pos, typ, msg string, args ...any) {
 		warnings = append(warnings, Warn{pos: pos, typ: typ, msg: fmt.Sprintf(msg, args...)})
 	}
 	checked := make(map[int]bool)
@@ -613,7 +624,7 @@ func checkNetlinkAttr(typ *prog.StructType, policy nlaPolicy) string {
 				// This is a common case that occurs several times: limit on min value of 1.
 				// Not worth fixing (at least not in initial batch), it just crosses out a
 				// single value of 0, which we shuold test anyway.
-				if !(policy.validation == NLA_VALIDATE_MIN && policy.minVal == 1) {
+				if policy.validation != NLA_VALIDATE_MIN || policy.minVal != 1 {
 					return fmt.Sprintf("bad min value %v, expect %v",
 						int64(valMin), policy.minVal)
 				}
@@ -629,25 +640,39 @@ func checkNetlinkAttr(typ *prog.StructType, policy nlaPolicy) string {
 	return ""
 }
 
-func minTypeSize(typ prog.Type) int {
-	if !typ.Varlen() {
-		return int(typ.Size())
+func minTypeSize(t prog.Type) int {
+	if !t.Varlen() {
+		return int(t.Size())
 	}
-	if str, ok := typ.(*prog.StructType); ok {
+	switch typ := t.(type) {
+	case *prog.StructType:
+		if typ.OverlayField != 0 {
+			// Overlayed structs are not supported here
+			// (and should not be used in netlink).
+			// Make this always produce a warning.
+			return -1
+		}
 		// Some struct args has trailing arrays, but are only checked for min size.
 		// Try to get some estimation for min size of this struct.
 		size := 0
-		for _, field := range str.Fields {
+		for _, field := range typ.Fields {
 			if !field.Varlen() {
 				size += int(field.Size())
 			}
 		}
 		return size
-	}
-	if arr, ok := typ.(*prog.ArrayType); ok {
-		if arr.Kind == prog.ArrayRangeLen && !arr.Elem.Varlen() {
-			return int(arr.RangeBegin * arr.Elem.Size())
+	case *prog.ArrayType:
+		if typ.Kind == prog.ArrayRangeLen && !typ.Elem.Varlen() {
+			return int(typ.RangeBegin * typ.Elem.Size())
 		}
+	case *prog.UnionType:
+		size := 0
+		for _, field := range typ.Fields {
+			if size1 := minTypeSize(field.Type); size1 != -1 && size > size1 || size == 0 {
+				size = size1
+			}
+		}
+		return size
 	}
 	return -1
 }
@@ -667,7 +692,9 @@ func checkAttrType(typ *prog.StructType, payload prog.Type, policy nlaPolicy) st
 			return "should be nlattr[nla_bitfield32]"
 		}
 	case NLA_NESTED_ARRAY:
-		return "unhandled type NLA_NESTED_ARRAY"
+		if _, ok := payload.(*prog.ArrayType); !ok {
+			return "expect array"
+		}
 	case NLA_REJECT:
 		return "NLA_REJECT attribute will always be rejected"
 	}
@@ -702,7 +729,7 @@ func attrSize(policy nlaPolicy) (int, int, int) {
 	return -1, -1, -1
 }
 
-func typeMinMaxValue(payload prog.Type) (min, max uint64, ok bool) {
+func typeMinMaxValue(payload prog.Type) (minVal, maxVal uint64, ok bool) {
 	switch typ := payload.(type) {
 	case *prog.ConstType:
 		return typ.Val, typ.Val, true
@@ -712,16 +739,12 @@ func typeMinMaxValue(payload prog.Type) (min, max uint64, ok bool) {
 		}
 		return 0, ^uint64(0), true
 	case *prog.FlagsType:
-		min, max := ^uint64(0), uint64(0)
+		minVal, maxVal := ^uint64(0), uint64(0)
 		for _, v := range typ.Vals {
-			if min > v {
-				min = v
-			}
-			if max < v {
-				max = v
-			}
+			minVal = min(minVal, v)
+			maxVal = max(maxVal, v)
 		}
-		return min, max, true
+		return minVal, maxVal, true
 	}
 	return 0, 0, false
 }
@@ -736,7 +759,7 @@ type nlaPolicy struct {
 	_          int32
 }
 
-// nolint
+// nolint:staticcheck
 const (
 	NLA_UNSPEC = iota
 	NLA_U8
@@ -761,7 +784,7 @@ const (
 	NLA_MIN_LEN
 )
 
-// nolint
+// nolint:staticcheck
 const (
 	_ = iota
 	NLA_VALIDATE_RANGE

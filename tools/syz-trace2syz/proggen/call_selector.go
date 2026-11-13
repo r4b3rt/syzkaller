@@ -97,7 +97,7 @@ func (cs *selectorCommon) callSet(callName string) []*prog.Syscall {
 		return calls
 	}
 	for _, call := range cs.target.Syscalls {
-		if call.CallName == callName {
+		if !call.Attrs.Automatic && call.CallName == callName { // Do not take automatic system calls into consideration.
 			calls = append(calls, call)
 		}
 	}
@@ -145,7 +145,10 @@ func (cs *openCallSelector) matchOpen(meta *prog.Syscall, call *parser.Syscall) 
 	if _, ok := syzFileArg.(*prog.PtrType); !ok {
 		return false, -1
 	}
-	syzBuf := syzFileArg.(*prog.PtrType).Elem.(*prog.BufferType)
+	syzBuf, ok := syzFileArg.(*prog.PtrType).Elem.(*prog.BufferType)
+	if !ok {
+		return false, -1
+	}
 	if syzBuf.Kind != prog.BufferString {
 		return false, -1
 	}

@@ -5,12 +5,14 @@ package prog
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sort"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRotationResourceless(t *testing.T) {
@@ -19,15 +21,12 @@ func TestRotationResourceless(t *testing.T) {
 		target.SyscallMap["test$int"]: true,
 	}
 	got := MakeRotator(target, calls, rand.New(rs)).Select()
-	if diff := cmp.Diff(calls, got); diff != "" {
-		t.Fatal(diff)
-	}
+	require.Equal(t, calls, got)
 }
 
 func TestRotationRandom(t *testing.T) {
 	target, rs, _ := initTest(t)
 	for _, ncalls := range []int{10, 100, 1000, 1e9} {
-		ncalls := ncalls
 		rnd := rand.New(rand.NewSource(rs.Int63()))
 		t.Run(fmt.Sprint(ncalls), func(t *testing.T) {
 			t.Parallel()
@@ -43,8 +42,8 @@ func TestRotationRandom(t *testing.T) {
 			for call := range calls {
 				array = append(array, call)
 			}
-			sort.Slice(array, func(i, j int) bool {
-				return array[i].Name < array[j].Name
+			slices.SortFunc(array, func(a, b *Syscall) int {
+				return cmp.Compare(a.Name, b.Name)
 			})
 			for _, call := range array {
 				fmt.Fprintf(buf, "%v\n", call.Name)
@@ -59,14 +58,24 @@ func TestRotationCoverage(t *testing.T) {
 	calls := make(map[*Syscall]bool)
 	counters := make(map[string]int)
 	for _, call := range target.Syscalls {
+		if call.Attrs.Disabled || call.Attrs.Automatic {
+			continue
+		}
 		calls[call] = true
 		counters[call.Name] = 0
 	}
 	rotator := MakeRotator(target, calls, rand.New(rs))
-	for iter := 0; iter < 2e3; iter++ {
+nextIter:
+	for range 10000 {
 		for call := range rotator.Select() {
 			counters[call.Name]++
 		}
+		for _, count := range counters {
+			if count == 0 {
+				continue nextIter
+			}
+		}
+		break
 	}
 	type pair struct {
 		name  string
@@ -117,8 +126,8 @@ retry:
 			for call := range calls {
 				array = append(array, call)
 			}
-			sort.Slice(array, func(i, j int) bool {
-				return array[i].ID < array[j].ID
+			slices.SortFunc(array, func(a, b *Syscall) int {
+				return cmp.Compare(a.ID, b.ID)
 			})
 			rnd.Shuffle(len(calls), func(i, j int) {
 				array[i], array[j] = array[j], array[i]
@@ -132,4 +141,18 @@ retry:
 			}
 		}
 	}
+}
+
+func TestRotationDeterminism(t *testing.T) {
+	target, rs, _ := initTest(t)
+	calls := make(map[*Syscall]bool)
+	for _, call := range target.Syscalls {
+		calls[call] = true
+	}
+	seed := rs.Int63()
+	rnd0 := rand.New(rand.NewSource(seed))
+	calls0 := MakeRotator(target, calls, rnd0).Select()
+	rnd1 := rand.New(rand.NewSource(seed))
+	calls1 := MakeRotator(target, calls, rnd1).Select()
+	require.Equal(t, calls0, calls1)
 }

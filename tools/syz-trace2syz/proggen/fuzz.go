@@ -2,13 +2,14 @@
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 //go:build !codeanalysis
-// +build !codeanalysis
 
 package proggen
 
 import (
+	"runtime"
+
 	"github.com/google/syzkaller/prog"
-	_ "github.com/google/syzkaller/sys/linux/gen" // pull in the target
+	_ "github.com/google/syzkaller/sys"
 	"github.com/google/syzkaller/sys/targets"
 )
 
@@ -30,4 +31,9 @@ func Fuzz(data []byte) int {
 		return 0
 	}
 	return len(progs)
+}
+
+func init() {
+	// Mark as used for deadcode checker.
+	runtime.KeepAlive(Fuzz)
 }

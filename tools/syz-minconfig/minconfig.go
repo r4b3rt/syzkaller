@@ -3,9 +3,10 @@
 
 // syz-minconfig is a tool for manual checking of config minimization functionality in pkg/kconfig/minimize.go.
 // Example use:
-// $ go run tools/syz-minconfig/minconfig.go -sourcedir /src/linux -configs CAIF_NETDEV,CAIF_USB \
-//	-base dashboard/config/linux/upstream-kasan-base.config \
-//	-full dashboard/config/linux/upstream-kasan.config \
+//
+//	$ go run tools/syz-minconfig/minconfig.go -sourcedir /src/linux -configs CAIF_NETDEV,CAIF_USB \
+//		-base dashboard/config/linux/upstream-kasan-base.config \
+//		-full dashboard/config/linux/upstream-kasan.config \
 package main
 
 import (
@@ -43,7 +44,7 @@ func main() {
 		tool.Fail(err)
 	}
 	pred := func(candidate *kconfig.ConfigFile) (bool, error) {
-		for _, cfg := range strings.Split(*flagConfigs, ",") {
+		for cfg := range strings.SplitSeq(*flagConfigs, ",") {
 			if candidate.Value(cfg) == kconfig.No {
 				return false, nil
 			}
@@ -53,7 +54,7 @@ func main() {
 	gt := &debugtracer.GenericTracer{
 		TraceWriter: os.Stdout,
 	}
-	res, err := kconf.Minimize(base, full, pred, gt)
+	res, err := kconf.Minimize(base, full, pred, 0, gt)
 	if err != nil {
 		tool.Fail(err)
 	}

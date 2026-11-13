@@ -7,35 +7,51 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"maps"
 	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
 	"net/mail"
+	"net/url"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
+	"time"
+	"unicode"
 )
 
 type Email struct {
-	BugID       string
-	MessageID   string
-	Link        string
-	Subject     string
-	From        string
-	Cc          []string
-	Body        string  // text/plain part
-	Patch       string  // attached patch, if any
-	Command     Command // command to bot
-	CommandStr  string  // string representation of the command
-	CommandArgs string  // arguments for the command
+	BugIDs            []string
+	OwnEmailsCcd      bool
+	MessageID         string
+	InReplyTo         string
+	Date              time.Time
+	Link              string
+	Subject           string
+	MailingList       string
+	Author            string
+	AuthorName        string
+	OwnEmail          bool
+	Cc                []string
+	RawCc             []string // unstripped emails
+	Body              string   // text/plain part
+	Patch             string   // attached patch, if any
+	BaseCommitHint    string   // Hash of base-commit, if provided.
+	Commands          []*SingleCommand
+	XStable           string
+	XKernelTestBranch string
+}
+
+type SingleCommand struct {
+	Command Command
+	Str     string // string representation
+	Args    string // arguments for the command
 }
 
 type Command int
 
 const (
 	CmdUnknown Command = iota
-	CmdNone
 	CmdUpstream
 	CmdFix
 	CmdUnFix
@@ -44,21 +60,39 @@ const (
 	CmdTest
 	CmdInvalid
 	CmdUnCC
+	CmdSet
+	CmdUnset
+	CmdRegenerate
+	CmdReject
+	CmdUnreject
 
 	cmdTest5
 )
 
-var groupsLinkRe = regexp.MustCompile("\nTo view this discussion on the web visit" +
-	" (https://groups\\.google\\.com/.*?)\\.(?:\r)?\n")
+const ForwardedPrefix = "Forwarded: "
 
-func Parse(r io.Reader, ownEmails []string) (*Email, error) {
+var groupsLinkRe = regexp.MustCompile(`(?m)\nTo view this discussion (?:on the web )?visit` +
+	` (https://groups\.google\.com/.*?)\.(:?$|\n|\r)`)
+
+func prepareEmails(list []string) map[string]bool {
+	ret := make(map[string]bool)
+	for _, email := range list {
+		ret[email] = true
+		if addr, err := mail.ParseAddress(email); err == nil {
+			ret[addr.Address] = true
+		}
+	}
+	return ret
+}
+
+func Parse(r io.Reader, ownEmails, goodLists, domains []string) (*Email, error) {
 	msg, err := mail.ReadMessage(r)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read email: %v", err)
+		return nil, fmt.Errorf("failed to read email: %w", err)
 	}
 	from, err := msg.Header.AddressList("From")
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse email header 'From': %v", err)
+		return nil, fmt.Errorf("failed to parse email header 'From': %w", err)
 	}
 	if len(from) == 0 {
 		return nil, fmt.Errorf("failed to parse email header 'To': no senders")
@@ -67,15 +101,8 @@ func Parse(r io.Reader, ownEmails []string) (*Email, error) {
 	to, _ := msg.Header.AddressList("To")
 	// AddressList fails if the header is not present.
 	cc, _ := msg.Header.AddressList("Cc")
-	bugID := ""
 	var ccList []string
-	ownAddrs := make(map[string]bool)
-	for _, email := range ownEmails {
-		ownAddrs[email] = true
-		if addr, err := mail.ParseAddress(email); err == nil {
-			ownAddrs[addr.Address] = true
-		}
-	}
+	ownAddrs := prepareEmails(ownEmails)
 	fromMe := false
 	for _, addr := range from {
 		cleaned, _, _ := RemoveAddrContext(addr.Address)
@@ -83,56 +110,105 @@ func Parse(r io.Reader, ownEmails []string) (*Email, error) {
 			fromMe = true
 		}
 	}
-	for _, addr := range append(append(cc, to...), from...) {
+
+	originalFrom := ""
+	// Ignore error since the header might not be present.
+	originalFroms, _ := msg.Header.AddressList("X-Original-From")
+	if len(originalFroms) > 0 {
+		originalFrom = originalFroms[0].String()
+	}
+
+	bugIDs := []string{}
+	ownEmailsCcd := false
+	rawCcList := append(append(append(cc, to...), from...), originalFroms...)
+	for _, addr := range rawCcList {
 		cleaned, context, _ := RemoveAddrContext(addr.Address)
 		if addr, err := mail.ParseAddress(cleaned); err == nil {
 			cleaned = addr.Address
 		}
 		if ownAddrs[cleaned] {
-			if bugID == "" {
-				bugID = context
+			ownEmailsCcd = true
+			if context != "" {
+				bugIDs = append(bugIDs, context)
 			}
 		} else {
-			ccList = append(ccList, cleaned)
+			ccList = append(ccList, CanonicalEmail(cleaned))
 		}
 	}
 	ccList = MergeEmailLists(ccList)
+
+	sender := ""
+	// Ignore error since the header might not be present.
+	senders, _ := msg.Header.AddressList("Sender")
+	if len(senders) > 0 {
+		sender = senders[0].Address
+	}
+
 	body, attachments, err := parseBody(msg.Body, msg.Header)
 	if err != nil {
 		return nil, err
 	}
 	bodyStr := string(body)
-	subject := msg.Header.Get("Subject")
-	cmd := CmdNone
-	patch, cmdStr, cmdArgs := "", "", ""
-	if !fromMe {
-		for _, a := range attachments {
-			_, patch, _ = ParsePatch(string(a))
-			if patch != "" {
-				break
-			}
+	subject := decodeSubject(msg.Header.Get("Subject"))
+	var cmds []*SingleCommand
+	var patch string
+	for _, a := range attachments {
+		patch = ParsePatch(a)
+		if patch != "" {
+			break
 		}
-		if patch == "" {
-			_, patch, _ = ParsePatch(bodyStr)
-		}
-		cmd, cmdStr, cmdArgs = extractCommand(subject + "\n" + bodyStr)
 	}
+	if patch == "" {
+		patch = ParsePatch(body)
+	}
+	cmds = extractCommands(subject + "\n" + bodyStr)
+	bugIDs = append(bugIDs, extractBodyBugIDs(bodyStr, ownAddrs, domains)...)
 	link := ""
 	if match := groupsLinkRe.FindStringSubmatchIndex(bodyStr); match != nil {
 		link = bodyStr[match[2]:match[3]]
+		if unescaped, err := url.QueryUnescape(link); err == nil {
+			link = unescaped
+		}
 	}
+
+	author := CanonicalEmail(from[0].Address)
+	authorName := from[0].Name
+	mailingList := ""
+
+	goodListsMap := prepareEmails(goodLists)
+	if goodListsMap[author] {
+		// In some cases, the mailing list would change From and introduce X-Original-From.
+		mailingList = author
+		if originalFrom != "" {
+			author = CanonicalEmail(originalFrom)
+		}
+		// Not sure if `else` can happen here, but let it be mailingList == author in this case.
+	} else if goodListsMap[CanonicalEmail(sender)] {
+		// In other cases, the mailing list would preserve From and just change Sender.
+		mailingList = CanonicalEmail(sender)
+	}
+	date, _ := mail.ParseDate(msg.Header.Get("Date"))
+	date = date.UTC()
 	email := &Email{
-		BugID:       bugID,
-		MessageID:   msg.Header.Get("Message-ID"),
-		Link:        link,
-		Subject:     subject,
-		From:        from[0].String(),
-		Cc:          ccList,
-		Body:        bodyStr,
-		Patch:       patch,
-		Command:     cmd,
-		CommandStr:  cmdStr,
-		CommandArgs: cmdArgs,
+		BugIDs:            unique(bugIDs),
+		MessageID:         msg.Header.Get("Message-ID"),
+		InReplyTo:         ExtractInReplyTo(msg.Header),
+		Date:              date,
+		Link:              link,
+		Author:            author,
+		AuthorName:        authorName,
+		OwnEmail:          fromMe,
+		OwnEmailsCcd:      ownEmailsCcd,
+		MailingList:       mailingList,
+		Subject:           subject,
+		Cc:                ccList,
+		RawCc:             mergeRawAddresses(from, originalFroms, to, cc),
+		Body:              bodyStr,
+		Patch:             patch,
+		Commands:          cmds,
+		BaseCommitHint:    extractBaseCommitHint(bodyStr),
+		XStable:           msg.Header.Get("X-stable"),
+		XKernelTestBranch: msg.Header.Get("X-KernelTest-Branch"),
 	}
 	return email, nil
 }
@@ -142,13 +218,17 @@ func Parse(r io.Reader, ownEmails []string) (*Email, error) {
 func AddAddrContext(email, context string) (string, error) {
 	addr, err := mail.ParseAddress(email)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse %q as email: %v", email, err)
+		return "", fmt.Errorf("failed to parse %q as email: %w", email, err)
 	}
 	at := strings.IndexByte(addr.Address, '@')
 	if at == -1 {
 		return "", fmt.Errorf("failed to parse %q as email: no @", email)
 	}
-	result := addr.Address[:at] + "+" + context + addr.Address[at:]
+	result := addr.Address[:at]
+	if context != "" {
+		result += "+" + context
+	}
+	result += addr.Address[at:]
 	if addr.Name != "" {
 		addr.Address = result
 		result = addr.String()
@@ -161,7 +241,7 @@ func AddAddrContext(email, context string) (string, error) {
 func RemoveAddrContext(email string) (string, string, error) {
 	addr, err := mail.ParseAddress(email)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to parse %q as email: %v", email, err)
+		return "", "", fmt.Errorf("failed to parse %q as email: %w", email, err)
 	}
 	at := strings.IndexByte(addr.Address, '@')
 	if at == -1 {
@@ -177,40 +257,100 @@ func RemoveAddrContext(email string) (string, string, error) {
 }
 
 func CanonicalEmail(email string) string {
-	addr, err := mail.ParseAddress(email)
+	user, domain, err := Split(email)
 	if err != nil {
 		return email
 	}
-	at := strings.IndexByte(addr.Address, '@')
-	if at == -1 {
+	return strings.ToLower(user + domain)
+}
+
+// EmailsMatch parses the emails and compares their addresses case-insensitively, ignoring names.
+// If either email fails to parse, it falls back to an exact string comparison.
+func EmailsMatch(val1, val2 string) bool {
+	addr1, err1 := mail.ParseAddress(val1)
+	addr2, err2 := mail.ParseAddress(val2)
+	if err1 == nil && err2 == nil {
+		return strings.EqualFold(addr1.Address, addr2.Address)
+	}
+	return val1 == val2
+}
+
+// ContainsEmail reports whether list contains an address matching addr (using EmailsMatch, preserving +tags).
+func ContainsEmail(list []string, addr string) bool {
+	return slices.ContainsFunc(list, func(val string) bool { return EmailsMatch(val, addr) })
+}
+
+// SubtractEmails returns elements of list that do not match any address in remove
+// (using EmailsMatch, preserving +tags).
+func SubtractEmails(list, remove []string) []string {
+	res := slices.DeleteFunc(slices.Clone(list), func(addr string) bool { return ContainsEmail(remove, addr) })
+	if len(res) == 0 {
+		return nil
+	}
+	return res
+}
+
+// FormatAddress formats name and email as an RFC 5322 address.
+// Multi-word display names like "First Last <user@email.com>" are valid unquoted in RFC 5322,
+// but names containing delimiters (such as commas in "Last, First") require double quotes.
+// Since net/mail.Address.String() conservatively quotes any display name with whitespace,
+// we verify if the unquoted form is already valid RFC 5322 before falling back to quoted formatting.
+func FormatAddress(name, email string) string {
+	if name == "" {
 		return email
 	}
-	if plus := strings.IndexByte(addr.Address[:at], '+'); plus != -1 {
-		addr.Address = addr.Address[:plus] + addr.Address[at:]
+	raw := fmt.Sprintf("%s <%s>", name, email)
+	if _, err := mail.ParseAddress(raw); err == nil {
+		return raw
 	}
-	return strings.ToLower(addr.Address)
+	return (&mail.Address{Name: name, Address: email}).String()
+}
+
+// Split splits email into user (without context) and domain (with @ prefix).
+func Split(email string) (string, string, error) {
+	addr, err := mail.ParseAddress(email)
+	if err != nil {
+		return "", "", err
+	}
+	user, domain, ok := strings.Cut(addr.Address, "@")
+	if !ok {
+		return "", "", fmt.Errorf("no @ in email address")
+	}
+	domain = "@" + domain
+	user, _, _ = strings.Cut(user, "+")
+	return user, domain, nil
+}
+
+func extractCommands(body string) []*SingleCommand {
+	var ret []*SingleCommand
+	for body != "" {
+		cmd, end := extractCommand(body)
+		if cmd == nil {
+			break
+		}
+		ret = append(ret, cmd)
+		body = body[end:]
+	}
+	return ret
 }
 
 const commandPrefix = "#syz"
 
+var commandStartRe = regexp.MustCompile(`(?:^|\n)(` + regexp.QuoteMeta(commandPrefix) + `[ \t-:])`)
+
 // extractCommand extracts command to syzbot from email body.
 // Commands are of the following form:
 // ^#syz cmd args...
-func extractCommand(body string) (cmd Command, str, args string) {
-	nbody := "\n" + body
-	cmdPos := -1
-	for _, delim := range []string{" ", "\t", "-", ":"} {
-		cmdPos = strings.Index(nbody, "\n"+commandPrefix+delim)
-		if cmdPos != -1 {
-			break
-		}
+func extractCommand(body string) (*SingleCommand, int) {
+	var cmd Command
+	var str, args string
+
+	match := commandStartRe.FindStringSubmatchIndex(body)
+	if match == nil {
+		return nil, 0
 	}
-	if cmdPos == -1 {
-		cmd = CmdNone
-		return
-	}
-	cmdPos += len(commandPrefix) + 1
-	for cmdPos < len(body) && (body[cmdPos] == ' ' || body[cmdPos] == '\t') {
+	cmdPos := match[2] + len(commandPrefix) + 1
+	for cmdPos < len(body) && unicode.IsSpace(rune(body[cmdPos])) {
 		cmdPos++
 	}
 	cmdEnd := strings.IndexByte(body[cmdPos:], '\n')
@@ -234,21 +374,32 @@ func extractCommand(body string) (cmd Command, str, args string) {
 	// For "fix:"/"dup:" we need a whole non-empty line of text.
 	switch cmd {
 	case CmdTest:
-		args = extractArgsTokens(body[cmdPos+cmdEnd:], 2)
+		if strings.HasSuffix(str, ":") {
+			// For "#syz test:", we do want to query 2 arguments.
+			args = extractArgsTokens(body[cmdPos+cmdEnd:], 2)
+		} else {
+			// For "#syz test", it's likely there won't be anything else, so let's only parse
+			// the first line.
+			args = extractArgsLine(body[cmdPos+cmdEnd:], false)
+		}
+	case CmdSet, CmdUnset:
+		args = extractArgsLine(body[cmdPos+cmdEnd:], true)
 	case cmdTest5:
 		args = extractArgsTokens(body[cmdPos+cmdEnd:], 5)
 	case CmdFix, CmdDup:
-		args = extractArgsLine(body[cmdPos+cmdEnd:])
+		args = extractArgsLine(body[cmdPos+cmdEnd:], true)
 	}
-	return
+	return &SingleCommand{
+		Command: cmd,
+		Str:     str,
+		Args:    args,
+	}, cmdPos + cmdEnd
 }
 
 func strToCmd(str string) Command {
 	switch str {
 	default:
 		return CmdUnknown
-	case "":
-		return CmdNone
 	case "upstream":
 		return CmdUpstream
 	case "fix", "fix:":
@@ -265,6 +416,16 @@ func strToCmd(str string) Command {
 		return CmdInvalid
 	case "uncc", "uncc:":
 		return CmdUnCC
+	case "set", "set:":
+		return CmdSet
+	case "unset", "unset:":
+		return CmdUnset
+	case "regenerate":
+		return CmdRegenerate
+	case "reject":
+		return CmdReject
+	case "unreject":
+		return CmdUnreject
 	case "test_5_arg_cmd":
 		return cmdTest5
 	}
@@ -277,9 +438,9 @@ func extractArgsTokens(body string, num int) string {
 		if lineEnd == -1 {
 			lineEnd = len(body) - pos
 		}
-		line := strings.TrimSpace(strings.Replace(body[pos:pos+lineEnd], "\t", " ", -1))
+		line := strings.TrimSpace(strings.ReplaceAll(body[pos:pos+lineEnd], "\t", " "))
 		for {
-			line1 := strings.Replace(line, "  ", " ", -1)
+			line1 := strings.ReplaceAll(line, "  ", " ")
 			if line == line1 {
 				break
 			}
@@ -293,11 +454,12 @@ func extractArgsTokens(body string, num int) string {
 	return strings.TrimSpace(strings.Join(args, " "))
 }
 
-func extractArgsLine(body string) string {
+func extractArgsLine(body string, skipWs bool) string {
 	pos := 0
-	for pos < len(body) && (body[pos] == ' ' || body[pos] == '\t' ||
-		body[pos] == '\n' || body[pos] == '\r') {
-		pos++
+	if skipWs {
+		for pos < len(body) && unicode.IsSpace(rune(body[pos])) {
+			pos++
+		}
 	}
 	lineEnd := strings.IndexByte(body[pos:], '\n')
 	if lineEnd == -1 {
@@ -314,7 +476,7 @@ func parseBody(r io.Reader, headers mail.Header) ([]byte, [][]byte, error) {
 		var err error
 		mediaType, params, err = mime.ParseMediaType(headers.Get("Content-Type"))
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to parse email header 'Content-Type': %v", err)
+			return nil, nil, fmt.Errorf("failed to parse email header 'Content-Type': %w", err)
 		}
 	}
 	switch strings.ToLower(headers.Get("Content-Transfer-Encoding")) {
@@ -325,16 +487,16 @@ func parseBody(r io.Reader, headers mail.Header) ([]byte, [][]byte, error) {
 	}
 	disp, _, _ := mime.ParseMediaType(headers.Get("Content-Disposition"))
 	if disp == "attachment" {
-		attachment, err := ioutil.ReadAll(r)
+		attachment, err := io.ReadAll(r)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to read email body: %v", err)
+			return nil, nil, fmt.Errorf("failed to read email body: %w", err)
 		}
 		return nil, [][]byte{attachment}, nil
 	}
 	if mediaType == "text/plain" {
-		body, err := ioutil.ReadAll(r)
+		body, err := io.ReadAll(r)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to read email body: %v", err)
+			return nil, nil, fmt.Errorf("failed to read email body: %w", err)
 		}
 		return body, nil, nil
 	}
@@ -350,7 +512,7 @@ func parseBody(r io.Reader, headers mail.Header) ([]byte, [][]byte, error) {
 			return body, attachments, nil
 		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to parse MIME parts: %v", err)
+			return nil, nil, fmt.Errorf("failed to parse MIME parts: %w", err)
 		}
 		body1, attachments1, err1 := parseBody(p, mail.Header(p.Header))
 		if err1 != nil {
@@ -361,6 +523,67 @@ func parseBody(r io.Reader, headers mail.Header) ([]byte, [][]byte, error) {
 		}
 		attachments = append(attachments, attachments1...)
 	}
+}
+
+var extractMessageIDs = regexp.MustCompile(`<.+?>`)
+
+func ExtractInReplyTo(header mail.Header) string {
+	value := header.Get("In-Reply-To")
+	// Normally there should be just one message, to which we reply.
+	// However, there have been some cases when multiple addresses were mentioned.
+	// For now let's just take the first one.
+	ret := extractMessageIDs.FindStringSubmatch(value)
+	if ret != nil {
+		return ret[0]
+	}
+	return ""
+}
+
+func extractBodyBugIDs(body string, ownEmailMap map[string]bool, domains []string) []string {
+	// Let's build a regular expression.
+	var rb strings.Builder
+	for email := range ownEmailMap {
+		escaped := regexp.QuoteMeta(email)
+		part := strings.ReplaceAll(escaped, `@`, `\+(\w+?)@`)
+		if rb.Len() > 0 {
+			rb.WriteString(`|`)
+		}
+		rb.WriteString(part)
+	}
+	for _, domain := range domains {
+		escaped := regexp.QuoteMeta(domain + "/bug?extid=")
+		if rb.Len() > 0 {
+			rb.WriteString(`|`)
+		}
+		rb.WriteString(escaped)
+		rb.WriteString(`([\w]+)`)
+	}
+	rg := regexp.MustCompile(rb.String())
+	ids := []string{}
+	for _, match := range rg.FindAllStringSubmatch(body, -1) {
+		// Take all non-empty group matches.
+		for i := 1; i < len(match); i++ {
+			if match[i] == "" {
+				continue
+			}
+			ids = append(ids, match[i])
+		}
+	}
+	return ids
+}
+
+func unique(list []string) []string {
+	// We preserve the original order since it's necessary for bug IDs.
+	var ret []string
+	dup := map[string]struct{}{}
+	for _, v := range list {
+		if _, ok := dup[v]; ok {
+			continue
+		}
+		dup[v] = struct{}{}
+		ret = append(ret, v)
+	}
+	return ret
 }
 
 // MergeEmailLists merges several email lists removing duplicates and invalid entries.
@@ -379,15 +602,27 @@ func MergeEmailLists(lists ...[]string) []string {
 			merged[addr.Address] = true
 		}
 	}
-	var result []string
-	for e := range merged {
-		result = append(result, e)
+	if len(merged) == 0 {
+		// Return non-nil empty slice because callers/tests expect it (e.g. JSON serialization).
+		return []string{}
 	}
-	sort.Strings(result)
+	result := slices.Sorted(maps.Keys(merged))
 	if len(result) > maxEmails {
 		result = result[:maxEmails]
 	}
 	return result
+}
+
+func mergeRawAddresses(lists ...[]*mail.Address) []string {
+	var emails []string
+	for _, list := range lists {
+		for _, item := range list {
+			emails = append(emails, item.Address)
+		}
+	}
+	emails = unique(emails)
+	slices.Sort(emails)
+	return emails
 }
 
 func RemoveFromEmailList(list []string, toRemove string) []string {
@@ -399,4 +634,33 @@ func RemoveFromEmailList(list []string, toRemove string) []string {
 		}
 	}
 	return result
+}
+
+// Decode RFC 2047-encoded subjects.
+func decodeSubject(rawSubject string) string {
+	decoder := new(mime.WordDecoder)
+	decodedSubject, err := decoder.DecodeHeader(rawSubject)
+	if err != nil {
+		return rawSubject
+	}
+	return decodedSubject
+}
+
+var baseCommitRegex = regexp.MustCompile(`(?m)^base-commit:\s*([0-9a-fA-F]{40})\r?$`)
+
+func extractBaseCommitHint(email string) string {
+	matches := baseCommitRegex.FindStringSubmatch(email)
+	if matches != nil {
+		return matches[1]
+	}
+	return ""
+}
+
+// DirectlyAddressedTo returns true if the specified bugID was explicitly mentioned
+// in the raw To/Cc headers of the email.
+func (email *Email) DirectlyAddressedTo(bugID string) bool {
+	return slices.ContainsFunc(email.RawCc, func(addr string) bool {
+		_, context, _ := RemoveAddrContext(addr)
+		return context == bugID
+	})
 }

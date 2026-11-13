@@ -3,7 +3,7 @@
 If you want to contribute to the project, feel free to send a pull request following the [guidelines](contributing.md#guidelines) below.
 
 In case this is your first pull request to syzkaller, you will need to [sign Google CLA](https://cla.developers.google.com/)
-and add yourself to [AUTHORS](/AUTHORS)/[CONTRIBUTORS](/CONTRIBUTORS) files in the first commit.
+and add yourself to [AUTHORS](/AUTHORS) _AND_ [CONTRIBUTORS](/CONTRIBUTORS) files in the first commit.
 
 ## What to work on
 
@@ -74,25 +74,24 @@ in the same commit.
 
 - Rebase your working branch onto the master branch before sending a pull request to avoid merge conflicts.
 - Run `make presubmit` and ensure that it passes before sending a PR.
-  It may require some additional packages to be installed (try `sudo make install_prerequisites`).
+  This may require some additional packages to be installed (try `sudo make install_prerequisites`).
 - Provide a brief high-level description in the pull request title.
   The pull request text is mostly irrelevant, all the details should be in the commit messages.
 - If you're asked to add some fixes to your pull request, please squash the fixes into the old commits.
 
 ### How to create a pull request on Github
 
-- First, you need an own git fork of syzkaller repository. Nagivate to
+- First, you need your own git fork of syzkaller repository. Navigate to
 [github.com/google/syzkaller](https://github.com/google/syzkaller) and press `Fork` button in the top-right corner of
 the page. This will create `https://github.com/YOUR_GITHUB_USERNAME/syzkaller` repository.
 
-- Checkout main syzkaller repository if you have not already. To work with `go` command the checkout must be under
-`$GOPATH`. The simplest way to do it is to run `go get -u -d github.com/google/syzkaller/prog`, this will checkout
-the repository in `$GOPATH/src/github.com/google/syzkaller`.
+- Checkout main syzkaller repository if you have not already. The simplest way to do it is to run `git clone https://github.com/google/syzkaller`, this will checkout
+the repository in the current working directory.
 - Remember to `export PATH=$GOPATH/bin:$PATH` if you have not already.
 - Then add your repository as an additional origin:
 
     ```shell
-    cd $GOPATH/src/github.com/google/syzkaller
+    cd syzkaller
     git remote add my-origin https://github.com/YOUR_GITHUB_USERNAME/syzkaller.git
     git fetch my-origin
     git checkout -b my-branch my-origin/master
@@ -104,14 +103,14 @@ This adds git origin `my-origin` with your repository and checks out new branch 
 - Commit changes locally. For this you need to run `git add` for all changed files, e.g. `git add sys/linux/sys.txt`. You can run `git status` to see what files were changed/created. When all files are added (`git status` shows no files in `Changes not staged for commit` section and no relevant files in `Untracked files` section), run `git commit` and enter commit description in your editor.
 - Run tests locally (`make install_prerequisites` followed by `make presubmit`).
 - Push the commit to your fork on github with `git push my-origin my-branch`.
-- Nagivate to [github.com/google/syzkaller](https://github.com/google/syzkaller) and you should see green `Compare & pull request` button, press it. Then press `Create pull request`. Now your pull request should show up on [pull requests page](https://github.com/google/syzkaller/pulls).
-- If you don't see `Create pull request` button for any reason, you can create pull request manually. For that nagivate to [pull requests page](https://github.com/google/syzkaller/pulls), press `New pull request`, then `compare across forks` and choose `google/syzkaller`/`master` as base and `YOUR_GITHUB_USERNAME/syzkaller`/`my-branch` as compare and press `Create pull request`.
+- Navigate to [github.com/google/syzkaller](https://github.com/google/syzkaller) and you should see green `Compare & pull request` button, press it. Then press `Create pull request`. Now your pull request should show up on [pull requests page](https://github.com/google/syzkaller/pulls).
+- If you don't see `Create pull request` button for any reason, you can create pull request manually. For that navigate to [pull requests page](https://github.com/google/syzkaller/pulls), press `New pull request`, then `compare across forks` and choose `google/syzkaller`/`master` as base and `YOUR_GITHUB_USERNAME/syzkaller`/`my-branch` as compare and press `Create pull request`.
 - If you decided to rebase commits in `my-branch` (e.g. to rebase them onto updated master) after you created a pull-request, you will need to do a force push: `git push -f my-origin my-branch`.
 
 ### Using syz-env
 
 Developing syzkaller requires a number of tools installed (Go toolchain, C/C++ cross-compilers, golangci-lint, etc).
-Installing all of them may be cumbersome, e.g. due broken/missing packages.
+Installing all of them may be cumbersome, e.g. due to broken/missing packages.
 [syz-env](/tools/syz-env) provides a working hermetic development environment based on a Docker container.
 If you don't yet have Docker installed, see [documentation](https://docs.docker.com/engine/install),
 in particular regarding enabling [sudo-less](https://docs.docker.com/engine/install/linux-postinstall)
@@ -139,15 +138,21 @@ To update `syz-env` container to the latest version do:
 docker pull gcr.io/syzkaller/env
 ```
 
-If you do not have access to the `gcr.io` registry, there is also a mirror in `docker.pkg.github.com` registry.
-In order to use it, you need to
-[authenticate Docker](https://docs.github.com/en/packages/using-github-packages-with-your-projects-ecosystem/configuring-docker-for-use-with-github-packages)
-with your Github account with:
+You can also build the container from the respective `Dockerfile` by setting the `SYZ_ENV_BUILD` environment variable, i.e.:
 ```
-docker login https://docker.pkg.github.com
+SYZ_ENV_BUILD=1 syz-env
 ```
-and then pull the image and retag it to the name expacted by `syz-env`:
+This can be useful to test local changes that have not been pushed to the registry yet.
+
+### Using [act](https://github.com/nektos/act)
+.github/workflows has more tests compared to `syz-env make presubmit`. To have the same tests as the workflow, we can run these workflow jobs locally.
 ```
-docker pull docker.pkg.github.com/google/syzkaller/env
-docker tag docker.pkg.github.com/google/syzkaller/env gcr.io/syzkaller/env
+# install act
+make act
+# list all jobs
+bin/act -l
+# run all jobs
+bin/act
+# run job with name build
+bin/act -j build
 ```

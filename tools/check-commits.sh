@@ -23,15 +23,19 @@ for HASH in ${HASHES}; do
 	((COMMITS+=1))
 	SUBJECT=$(git show --format="%s" --no-patch ${HASH})
 	BODY=$(git show --format="%B" --no-patch ${HASH})
-	if ! [[ ${SUBJECT} =~ ^(Revert \"|(([a-z0-9/_.-]+|Makefile|CONTRIBUTORS|README.md)(, )?)+:\ [^A-Z].+[^.]$) ]]; then
+	PATTERN="^(Revert \"|(([a-z0-9/_.-]+|Makefile|AUTHORS|CONTRIBUTORS|README.md)(, )?)+:\ [^A-Z].+[^.]$)"
+	if ! [[ ${SUBJECT} =~ $PATTERN ]]; then
 		echo "##[error]Wrong commit subject format: '${SUBJECT}'.\
  Please use 'main/affected/package: short change description'.\
- See docs/contributing.md for details."
+ See docs/contributing.md for details.\
+ Regex pattern used to check commit subjects is '$PATTERN'."
 		FAILED="1"
 	fi
 	LONGLINE='[^\
 ]{121}'
-	if [[ ${BODY} =~ ${LONGLINE} ]]; then
+	# dependabot may generate descriptions longer than 120 chars
+	DEPENDABOT_SUBJ='^mod:\ bump'
+	if [[ ! ${SUBJECT} =~ ${DEPENDABOT_SUBJ} ]] && [[ ${BODY} =~ ${LONGLINE} ]] ; then
 		echo "##[error]Please limit commit description line length to 120 characters."
 		echo "${BODY}"
 		FAILED="1"

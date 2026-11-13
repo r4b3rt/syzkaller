@@ -24,11 +24,41 @@ define newline
 
 
 endef
+
+RED := $(shell tput setaf 1)
+RESET := $(shell tput sgr0)
+ifndef SYZ_ENV
+$(warning $(RED)run command via tools/syz-env for best compatibility, see:$(RESET))
+$(warning $(RED)https://github.com/google/syzkaller/blob/master/docs/contributing.md#using-syz-env$(RESET))
+endif
+
+include tools/version.mk
+
+# Don't generate symbol table and DWARF debug info.
+# Reduces build time and binary sizes considerably.
+# That's only needed if you use gdb or nm.
+# If you need that, build manually with DEBUG=true env.
+GLFLAGS :=
+GGFLAGS :=
+ifeq ("$(DEBUG)", "true")
+	GGFLAGS := -gcflags="all=-N -l"
+else
+	GLFLAGS := -s -w
+endif
+GOFLAGS := -ldflags="$(GLFLAGS) -X github.com/google/syzkaller/prog.GitRevision=$(REV) -X github.com/google/syzkaller/prog.gitRevisionDate=$(GITREVDATE)" $(GGFLAGS)
+ifneq ("$(GOTAGS)", "")
+	GOFLAGS += " -tags=$(GOTAGS)"
+endif
+
+
+GOHOSTFLAGS ?= $(GOFLAGS)
+GOTARGETFLAGS ?= $(GOFLAGS)
+
 ENV := $(subst \n,$(newline),$(shell CI=$(CI)\
 	SOURCEDIR=$(SOURCEDIR) HOSTOS=$(HOSTOS) HOSTARCH=$(HOSTARCH) \
 	TARGETOS=$(TARGETOS) TARGETARCH=$(TARGETARCH) TARGETVMARCH=$(TARGETVMARCH) \
 	SYZ_CLANG=$(SYZ_CLANG) \
-	go run tools/syz-make/make.go))
+	go run $(GOHOSTFLAGS) tools/syz-make/make.go))
 # Uncomment in case of emergency.
 # $(info $(ENV))
 $(eval $(ENV))
@@ -53,33 +83,7 @@ TARGETGOARCH := $(TARGETVMARCH)
 export GO111MODULE=on
 export GOBIN=$(shell pwd -P)/bin
 
-GITREV=$(shell git rev-parse HEAD)
-ifeq ("$(shell git diff --shortstat)", "")
-	REV=$(GITREV)
-else
-	REV=$(GITREV)+
-endif
-GITREVDATE=$(shell git log -n 1 --format="%cd" --date=format:%Y%m%d-%H%M%S)
-
-# Don't generate symbol table and DWARF debug info.
-# Reduces build time and binary sizes considerably.
-# That's only needed if you use gdb or nm.
-# If you need that, build manually without these flags.
-GOFLAGS := "-ldflags=-s -w -X github.com/google/syzkaller/prog.GitRevision=$(REV) -X 'github.com/google/syzkaller/prog.gitRevisionDate=$(GITREVDATE)'"
-
-GOHOSTFLAGS := $(GOFLAGS)
-GOTARGETFLAGS := $(GOFLAGS)
-ifneq ("$(GOTAGS)", "")
-	GOHOSTFLAGS += "-tags=$(GOTAGS)"
-endif
-GOTARGETFLAGS += "-tags=syz_target syz_os_$(TARGETOS) syz_arch_$(TARGETVMARCH) $(GOTAGS)"
-
 ifeq ("$(TARGETOS)", "test")
-	TARGETGOOS := $(HOSTOS)
-	TARGETGOARCH := $(HOSTARCH)
-endif
-
-ifeq ("$(TARGETOS)", "akaros")
 	TARGETGOOS := $(HOSTOS)
 	TARGETGOARCH := $(HOSTARCH)
 endif
@@ -95,20 +99,21 @@ ifeq ("$(TARGETOS)", "trusty")
 endif
 
 .PHONY: all clean host target \
-	manager runtest fuzzer executor \
-	ci hub \
-	execprog mutate prog2c trace2syz stress repro upgrade db \
-	usbgen symbolize cover kconf crush \
+	manager executor kfuzztest ci hub agent lore-relay \
+	execprog mutate prog2c trace2syz repro upgrade db \
+	usbgen symbolize cover kconf syz-build crush aflow \
 	bin/syz-extract bin/syz-fmt \
-	extract generate generate_go generate_sys \
+	extract generate generate_go generate_rpc generate_sys \
 	format format_go format_cpp format_sys \
-	tidy test test_race \
-	check_copyright check_language check_whitespace check_links check_diff check_commits check_shebang \
-	presubmit presubmit_smoke presubmit_build presubmit_arch presubmit_big presubmit_race presubmit_old
+	tidy lint deadcode test test_race \
+	check_copyright check_language check_whitespace check_sql_newlines check_links check_diff check_commits check_shebang check_html \
+	presubmit presubmit_aux presubmit_build presubmit_arch_linux presubmit_arch_freebsd \
+	presubmit_arch_netbsd presubmit_arch_openbsd presubmit_arch_darwin presubmit_arch_windows \
+	presubmit_arch_executor presubmit_dashboard presubmit_race presubmit_race_dashboard presubmit_old
 
 all: host target
-host: manager runtest repro mutate prog2c db upgrade
-target: fuzzer execprog stress executor
+host: manager repro mutate prog2c db upgrade
+target: execprog executor check_syzos
 
 executor: descriptions
 ifeq ($(TARGETOS),fuchsia)
@@ -128,8 +133,8 @@ ifneq ("$(NO_CROSS_COMPILER)", "")
 	$(info ************************************************************************************)
 else
 	mkdir -p ./bin/$(TARGETOS)_$(TARGETARCH)
-	$(CC) -o ./bin/$(TARGETOS)_$(TARGETARCH)/syz-executor$(EXE) executor/executor.cc \
-		$(ADDCFLAGS) $(CFLAGS) -DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1 \
+	$(CXX) -o ./bin/$(TARGETOS)_$(TARGETARCH)/syz-executor$(EXE) executor/executor.cc \
+		$(ADDCXXFLAGS) $(CXXFLAGS) $(LDFLAGS) -DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1 \
 		-DHOSTGOOS_$(HOSTOS)=1 -DGIT_REVISION=\"$(REV)\"
 endif
 endif
@@ -140,21 +145,22 @@ endif
 # syz-sysgen generates them all at once, so we can't make each of them an independent target.
 .PHONY: descriptions
 descriptions:
-	go list -f '{{.Stale}}' ./sys/syz-sysgen | grep -q false || go install ./sys/syz-sysgen
+	go list -f '{{.Stale}}' $(GOHOSTFLAGS) ./sys/syz-sysgen | grep -q false || go install $(GOHOSTFLAGS) ./sys/syz-sysgen
 	$(MAKE) .descriptions
 
 .descriptions: sys/*/*.txt sys/*/*.const bin/syz-sysgen
 	bin/syz-sysgen
 	touch .descriptions
 
+go-flags:
+	@echo "${GOHOSTFLAGS}"
+
+aflow: descriptions
+	# syz-aflow uses codesearch clang tool which requires cgo.
+	CGO_ENABLED=1 GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-aflow github.com/google/syzkaller/tools/syz-aflow
+
 manager: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-manager github.com/google/syzkaller/syz-manager
-
-runtest: descriptions
-	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-runtest github.com/google/syzkaller/tools/syz-runtest
-
-fuzzer: descriptions
-	GOOS=$(TARGETGOOS) GOARCH=$(TARGETGOARCH) $(GO) build $(GOTARGETFLAGS) -o ./bin/$(TARGETOS)_$(TARGETVMARCH)/syz-fuzzer$(EXE) github.com/google/syzkaller/syz-fuzzer
 
 execprog: descriptions
 	GOOS=$(TARGETGOOS) GOARCH=$(TARGETGOARCH) $(GO) build $(GOTARGETFLAGS) -o ./bin/$(TARGETOS)_$(TARGETVMARCH)/syz-execprog$(EXE) github.com/google/syzkaller/tools/syz-execprog
@@ -165,11 +171,21 @@ ci: descriptions
 hub: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-hub github.com/google/syzkaller/syz-hub
 
+agent: descriptions
+	# syz-agent uses codesearch clang tool which requires cgo.
+	CGO_ENABLED=1 GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-agent github.com/google/syzkaller/syz-agent/agent
+
+lore-relay:
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-lore-relay github.com/google/syzkaller/syz-agent/lore-relay
+
 repro: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-repro github.com/google/syzkaller/tools/syz-repro
 
 mutate: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-mutate github.com/google/syzkaller/tools/syz-mutate
+
+diff: descriptions target
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-diff github.com/google/syzkaller/tools/syz-diff
 
 prog2c: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-prog2c github.com/google/syzkaller/tools/syz-prog2c
@@ -179,9 +195,6 @@ crush: descriptions
 
 reporter: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-reporter github.com/google/syzkaller/tools/syz-reporter
-
-stress: descriptions
-	GOOS=$(TARGETGOOS) GOARCH=$(TARGETGOARCH) $(GO) build $(GOTARGETFLAGS) -o ./bin/$(TARGETOS)_$(TARGETVMARCH)/syz-stress$(EXE) github.com/google/syzkaller/tools/syz-stress
 
 db: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-db github.com/google/syzkaller/tools/syz-db
@@ -204,24 +217,26 @@ cover:
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-cover github.com/google/syzkaller/tools/syz-cover
 kconf:
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-kconf github.com/google/syzkaller/tools/syz-kconf
+syz-build:
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-build github.com/google/syzkaller/tools/syz-build
 
 bisect: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-bisect github.com/google/syzkaller/tools/syz-bisect
 
+ifeq ($(HOSTOS), linux)
+kfuzztest: descriptions
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-kfuzztest github.com/google/syzkaller/syz-kfuzztest
+else
+kfuzztest:
+	@echo "Skipping kfuzztest build (it's Linux-only)"
+endif
+
 verifier: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-verifier github.com/google/syzkaller/syz-verifier
-
-runner:  descriptions
-	GOOS=$(TARGETGOOS) GOARCH=$(TARGETGOARCH) $(GO) build $(GOTARGETFLAGS) -o ./bin/$(TARGETOS)_$(TARGETVMARCH)/syz-runner$(EXE) github.com/google/syzkaller/syz-runner
 
 # `extract` extracts const files from various kernel sources, and may only
 # re-generate parts of files.
 extract: bin/syz-extract
-ifeq ($(TARGETOS),fuchsia)
-	$(MAKE) generate_fidl TARGETARCH=amd64
-	$(MAKE) generate_fidl TARGETARCH=arm64
-else
-endif
 	bin/syz-extract -build -os=$(TARGETOS) -sourcedir=$(SOURCEDIR) $(FILES)
 
 bin/syz-extract:
@@ -232,31 +247,40 @@ bin/syz-extract:
 generate:
 	$(MAKE) descriptions
 	$(MAKE) generate_go
+	$(MAKE) generate_rpc
 	$(MAKE) format
 
 generate_go: format_cpp
-	$(GO) generate ./pkg/csource ./executor ./pkg/ifuzz ./pkg/build ./pkg/html
+	$(GO) generate ./...
+	$(GO) tool mockery --log-level="error"
 
-generate_fidl:
-ifeq ($(TARGETOS),fuchsia)
-	$(HOSTGO) generate ./sys/fuchsia
-	$(MAKE) format_sys
-else
-endif
+generate_rpc:
+	flatc -o pkg/flatrpc --warnings-as-errors --gen-object-api --filename-suffix "" --go --gen-onefile --go-namespace flatrpc pkg/flatrpc/flatrpc.fbs
+	flatc -o pkg/flatrpc --warnings-as-errors --gen-object-api --filename-suffix "" --cpp --scoped-enums pkg/flatrpc/flatrpc.fbs
+	$(GO) fmt ./pkg/flatrpc/flatrpc.go
 
 generate_trace2syz:
 	(cd tools/syz-trace2syz/parser; ragel -Z -G2 -o lex.go straceLex.rl)
-	(cd tools/syz-trace2syz/parser; goyacc -o strace.go -p Strace -v="" strace.y)
+	(cd tools/syz-trace2syz/parser; $(HOSTGO) tool goyacc -o strace.go -p Strace -v="" strace.y)
 
-format: format_go format_cpp format_sys
+format: format_go format_cpp format_sys format_keep_sorted
 
 format_go:
 	$(GO) fmt ./...
 
+format_keep_sorted:
+	$(HOSTGO) install github.com/google/keep-sorted
+	find . -name "*.go" -exec bin/keep-sorted {} \;
+	find . -name "*.yml" -exec bin/keep-sorted {} \;
+
 format_cpp:
-	clang-format --style=file -i executor/*.cc executor/*.h \
-		executor/android/android_seccomp.h \
-		tools/kcovtrace/*.c tools/kcovfuzzer/*.c tools/fops_probe/*.cc
+	# Exclude auto-generated and canned files.
+	git ls-files '*.h' '*.c' '*.cc' '*.cpp' | grep -Ev \
+"executor/_include/flatbuffers/\
+|pkg/flatrpc/flatrpc.h\
+|pkg/covermerger/testdata/integration/\
+|executor/android/.*_policy.h" \
+	| xargs -I {} -P 100 clang-format --style=file -i {}
 
 format_sys: bin/syz-fmt
 	bin/syz-fmt all
@@ -265,107 +289,134 @@ bin/syz-fmt:
 	$(HOSTGO) build $(GOHOSTFLAGS) -o $@ ./tools/syz-fmt
 
 configs: kconf
-	bin/syz-kconf -config dashboard/config/linux/main.yml -sourcedir $(SOURCEDIR)
+	SYZ_DISABLE_SANDBOXING=yes bin/syz-kconf -config dashboard/config/linux/main.yml -sourcedir $(SOURCEDIR) -instance=$(INSTANCE)
 
 tidy: descriptions
-	clang-tidy -quiet -header-filter=.* -warnings-as-errors=* \
-		-checks=-*,misc-definitions-in-headers,bugprone-macro-parentheses,clang-analyzer-*,-clang-analyzer-security.insecureAPI*,-clang-analyzer-optin.performance* \
+	clang-tidy -quiet -header-filter=executor/[^_].* -warnings-as-errors=* \
+		-checks=-*,misc-definitions-in-headers,bugprone-macro-parentheses,clang-analyzer-*,-clang-analyzer-security.insecureAPI*,-clang-analyzer-optin.performance*,-clang-analyzer-optin.core.EnumCastOutOfRange \
 		-extra-arg=-DGOOS_$(TARGETOS)=1 -extra-arg=-DGOARCH_$(TARGETARCH)=1 \
 		-extra-arg=-DHOSTGOOS_$(HOSTOS)=1 -extra-arg=-DGIT_REVISION=\"$(REV)\" \
+		--extra-arg=-I. --extra-arg=-Iexecutor/_include \
+		--extra-arg=-std=c++17 \
 		executor/*.cc
 
-lint:
-	# This should install the command from our vendor dir.
-	CGO_ENABLED=1 $(HOSTGO) install github.com/golangci/golangci-lint/cmd/golangci-lint
+bin/golangci-lint: go.mod
+	CGO_ENABLED=1 $(HOSTGO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint
+
+lint: bin/golangci-lint check_whitespace check_sql_newlines check_links check_html check_shebang
 	CGO_ENABLED=1 $(HOSTGO) build -buildmode=plugin -o bin/syz-linter.so ./tools/syz-linter
 	bin/golangci-lint run ./...
 
+deadcode:
+	# If deadcode flags an unused function that is used externally,
+	# use runtime.KeepAlive call with a comment in an init function to suppress the warning.
+	go run $(GOHOSTFLAGS) golang.org/x/tools/cmd/deadcode -test ./... | awk '{print} /unreachable/{fail=1} END{exit fail}'
+
 presubmit:
-	$(MAKE) presubmit_smoke
-	$(MAKE) presubmit_arch
+	$(MAKE) presubmit_aux
+	$(MAKE) presubmit_build
+	$(MAKE) presubmit_arch_linux
+	$(MAKE) presubmit_arch_freebsd
+	$(MAKE) presubmit_arch_netbsd
+	$(MAKE) presubmit_arch_openbsd
+	$(MAKE) presubmit_arch_darwin
+	$(MAKE) presubmit_arch_windows
+	$(MAKE) presubmit_arch_executor
 	$(MAKE) presubmit_race
+	$(MAKE) presubmit_race_dashboard
 
-presubmit_smoke:
+presubmit_aux:
 	$(MAKE) generate
-	$(MAKE) -j100 check_commits check_diff check_copyright check_language check_whitespace check_links check_shebang presubmit_build tidy
-	$(MAKE) test
+	$(MAKE) -j100 check_commits check_diff check_copyright check_language check_k8s tidy deadcode
+	$(GO) mod tidy
 
-presubmit_build:
+presubmit_build: descriptions
 	# Run go build before lint for better error messages if build is broken.
 	# This does not check build of test files, but running go test takes too long (even for building).
 	$(GO) build ./...
 	$(MAKE) lint
+	SYZ_SKIP_DEV_APPSERVER_TESTS=1 $(MAKE) test
 
-presubmit_arch: descriptions
-	env HOSTOS=linux HOSTARCH=amd64 $(MAKE) host
-	env HOSTOS=freebsd HOSTARCH=amd64 $(MAKE) host
-	env HOSTOS=netbsd HOSTARCH=amd64 $(MAKE) host
-	env HOSTOS=openbsd HOSTARCH=amd64 $(MAKE) host
-	env HOSTOS=darwin HOSTARCH=amd64 $(MAKE) host
-	env TARGETOS=linux TARGETARCH=amd64 $(MAKE) target
-	env TARGETOS=linux TARGETARCH=amd64 SYZ_CLANG=yes $(MAKE) executor
-	env TARGETOS=linux TARGETARCH=386 $(MAKE) target
-	env TARGETOS=linux TARGETARCH=arm64 $(MAKE) target
-	env TARGETOS=linux TARGETARCH=arm $(MAKE) target
-	env TARGETOS=linux TARGETARCH=mips64le $(MAKE) target
-	env TARGETOS=linux TARGETARCH=ppc64le $(MAKE) target
-	env TARGETOS=linux TARGETARCH=riscv64 $(MAKE) target
-	env TARGETOS=linux TARGETARCH=s390x $(MAKE) target
-	env TARGETOS=freebsd TARGETARCH=amd64 $(MAKE) target
-	env TARGETOS=freebsd TARGETARCH=386 $(MAKE) target
-	env TARGETOS=netbsd TARGETARCH=amd64 $(MAKE) target
-	env TARGETOS=openbsd TARGETARCH=amd64 $(MAKE) target
-	env TARGETOS=windows TARGETARCH=amd64 $(MAKE) target
-	env TARGETOS=akaros TARGETARCH=amd64 $(MAKE) executor
-	env TARGETOS=fuchsia TARGETARCH=amd64 $(MAKE) executor
-	env TARGETOS=fuchsia TARGETARCH=arm64 $(MAKE) executor
-	env TARGETOS=test TARGETARCH=64 $(MAKE) executor
-	env TARGETOS=test TARGETARCH=64_fork $(MAKE) executor
-	env TARGETOS=test TARGETARCH=32_shmem $(MAKE) executor
-	env TARGETOS=test TARGETARCH=32_fork_shmem $(MAKE) executor
+presubmit_arch_linux: descriptions
+	HOSTOS=linux HOSTARCH=amd64 $(MAKE) host
+	TARGETOS=linux TARGETARCH=amd64 TARGETVMARCH=amd64 $(MAKE) target
+	TARGETOS=linux TARGETARCH=386 TARGETVMARCH=386 $(MAKE) target
+	TARGETOS=linux TARGETARCH=arm64 TARGETVMARCH=arm64 $(MAKE) target
+	TARGETOS=linux TARGETARCH=arm TARGETVMARCH=arm $(MAKE) target
+	TARGETOS=linux TARGETARCH=loong64 TARGETVMARCH=loong64 $(MAKE) target
+	TARGETOS=linux TARGETARCH=mips64le TARGETVMARCH=mips64le $(MAKE) target
+	TARGETOS=linux TARGETARCH=ppc64le TARGETVMARCH=ppc64le $(MAKE) target
+	TARGETOS=linux TARGETARCH=riscv64 TARGETVMARCH=riscv64 $(MAKE) target
+	TARGETOS=linux TARGETARCH=s390x TARGETVMARCH=s390x $(MAKE) target
 
-presubmit_big: descriptions
-	# This target runs on CI in syz-big-env,
-	# so we test packages that need GCloud SDK or OS toolchains.
-ifneq (, $(shell which go1.12))
-	# Test Appengine app build locally with Go 1.12 (syz-big-env has it).
-	# The actual build happens with Go 1.11, but local build fails with 1.11,
-	# so we use 1.12 as the best working approximation.
-	GO111MODULE=off go1.12 install ./dashboard/app
-endif
-	# Run tests with clang on Linux.
-	# big-env also contains toolchains for NetBSD/Fuchsia/Akaros,
-	# but these OSes use fixed toolchains and are not affected by SYZ_CLANG=yes.
-	# This way we get maximum coverage: smoke run tests Linux/gcc,
-	# while this run tests Linux/clang + the additional OSes.
-	SYZ_CLANG=yes $(GO) test -short -coverprofile=.coverage.txt ./dashboard/app ./pkg/csource ./pkg/cover
+presubmit_arch_freebsd: descriptions
+	HOSTOS=freebsd HOSTARCH=amd64 $(MAKE) host
+	TARGETOS=freebsd TARGETARCH=amd64 TARGETVMARCH=amd64 $(MAKE) target
+	TARGETOS=freebsd TARGETARCH=386 TARGETVMARCH=386 $(MAKE) target
+	TARGETOS=freebsd TARGETARCH=arm64 TARGETVMARCH=arm64 $(MAKE) target
+	TARGETOS=freebsd TARGETARCH=riscv64 TARGETVMARCH=riscv64 $(MAKE) target
+
+presubmit_arch_netbsd: descriptions
+	HOSTOS=netbsd HOSTARCH=amd64 $(MAKE) host
+	TARGETOS=netbsd TARGETARCH=amd64 TARGETVMARCH=amd64 $(MAKE) target
+
+presubmit_arch_openbsd: descriptions
+	HOSTOS=openbsd HOSTARCH=amd64 $(MAKE) host
+	TARGETOS=openbsd TARGETARCH=amd64 TARGETVMARCH=amd64 $(MAKE) target
+
+presubmit_arch_darwin: descriptions
+	HOSTOS=darwin HOSTARCH=amd64 $(MAKE) host
+
+presubmit_arch_windows: descriptions
+	TARGETOS=windows TARGETARCH=amd64 TARGETVMARCH=amd64 $(MAKE) target
+
+presubmit_arch_executor: descriptions
+	TARGETOS=linux TARGETARCH=amd64 TARGETVMARCH=amd64 SYZ_CLANG=yes $(MAKE) executor
+	TARGETOS=fuchsia TARGETARCH=amd64 TARGETVMARCH=amd64 $(MAKE) executor
+	TARGETOS=fuchsia TARGETARCH=arm64 TARGETVMARCH=arm64 $(MAKE) executor
+	TARGETOS=test TARGETARCH=64 TARGETVMARCH=64 $(MAKE) executor
+	TARGETOS=test TARGETARCH=64_fork TARGETVMARCH=64_fork $(MAKE) executor
+	TARGETOS=test TARGETARCH=32 TARGETVMARCH=32 $(MAKE) executor
+	TARGETOS=test TARGETARCH=32_fork TARGETVMARCH=32_fork $(MAKE) executor
+
+presubmit_dashboard: descriptions
+	SYZ_CLANG=yes $(GO) test -short -vet=off -coverprofile=.coverage.txt ./dashboard/app
 
 presubmit_race: descriptions
 	# -race requires cgo
-	env CGO_ENABLED=1 $(GO) test -race; if test $$? -ne 2; then \
-	env CGO_ENABLED=1 $(GO) test -race -short -bench=.* -benchtime=.2s ./... ;\
+	CGO_ENABLED=1 $(GO) test -race; if test $$? -ne 2; then \
+	CGO_ENABLED=1 SYZ_SKIP_DEV_APPSERVER_TESTS=1 $(GO) test -race -short -vet=off -bench=.* -benchtime=.2s ./... ;\
+	fi
+
+presubmit_race_dashboard: descriptions
+	# -race requires cgo
+	CGO_ENABLED=1 $(GO) test -race; if test $$? -ne 2; then \
+	CGO_ENABLED=1 $(GO) test -race -short -vet=off -bench=.* -benchtime=.2s ./dashboard/app/... ;\
 	fi
 
 presubmit_old: descriptions
 	# Binaries we can compile in syz-old-env. 386 is broken, riscv64 is missing.
-	TARGETARCH=amd64 $(MAKE) target
-	TARGETARCH=arm64 $(MAKE) target
-	TARGETARCH=arm $(MAKE) target
-	TARGETARCH=ppc64le $(MAKE) target
-	TARGETARCH=mips64le $(MAKE) target
-	TARGETARCH=s390x $(MAKE) target
+	TARGETARCH=amd64 TARGETVMARCH=amd64 $(MAKE) target
+	TARGETARCH=arm64 TARGETVMARCH=arm64 $(MAKE) target
+	TARGETARCH=arm TARGETVMARCH=arm $(MAKE) target
+	TARGETARCH=ppc64le TARGETVMARCH=ppc64le $(MAKE) target
+	TARGETARCH=mips64le TARGETVMARCH=mips64le $(MAKE) target
+	TARGETARCH=s390x TARGETVMARCH=s390x $(MAKE) target
+
+presubmit_gvisor: host target
+	./tools/gvisor-smoke-test.sh
 
 test: descriptions
-	$(GO) test -short -coverprofile=.coverage.txt ./...
+	# Clang tools require cgo.
+	CGO_ENABLED=1 $(GO) test -short -coverprofile=.coverage.txt ./...
 
 clean:
-	rm -rf ./bin .descriptions executor/defs.h executor/syscalls.h
-	find sys/*/gen -type f -not -name empty.go -delete
+	rm -rf ./bin .descriptions executor/defs.h executor/syscalls.h sys/gen sys/register.go
 
 # For a tupical Ubuntu/Debian distribution.
 # We use "|| true" for apt-get install because packages are all different on different distros.
 # Also see tools/syz-env for container approach.
-install_prerequisites:
+install_prerequisites: act
 	uname -a
 	sudo apt-get update
 	sudo apt-get install -y -q libc6-dev-i386 linux-libc-dev \
@@ -376,11 +427,12 @@ install_prerequisites:
 	sudo apt-get install -y -q g++-mips64el-linux-gnuabi64 || true
 	sudo apt-get install -y -q g++-s390x-linux-gnu || true
 	sudo apt-get install -y -q g++-riscv64-linux-gnu || true
+	sudo apt-get install -y -q g++-loongarch64-linux-gnu || true
 	sudo apt-get install -y -q g++ || true
 	[ -z "$(shell which python)" -a -n "$(shell which python3)" ] && sudo apt-get install -y -q python-is-python3 || true
 	sudo apt-get install -y -q clang-tidy || true
 	sudo apt-get install -y -q clang clang-format ragel
-	GO111MODULE=off go get -u golang.org/x/tools/cmd/goyacc
+	sudo apt-get install -y -q flatbuffers-compiler libflatbuffers-dev
 
 check_copyright:
 	./tools/check-copyright.sh
@@ -391,11 +443,20 @@ check_language:
 check_whitespace:
 	./tools/check-whitespace.sh
 
+check_sql_newlines:
+	./tools/check-sql-newlines.sh
+
 check_commits:
 	./tools/check-commits.sh
 
 check_links:
-	python ./tools/check_links.py $$(pwd) $$(find . -name '*.md' | grep -v "./vendor/")
+	python ./tools/check_links.py $$(pwd) $$(git ls-files '*.md')
+
+check_html:
+	./tools/check-html.sh
+
+check_syzos: executor
+	./tools/check-syzos.sh 2>/dev/null
 
 # Check that the diff is empty. This is meant to be executed after generating
 # and formatting the code to make sure that everything is committed.
@@ -409,3 +470,9 @@ check_diff:
 
 check_shebang:
 	./tools/check-shebang.sh
+
+check_k8s:
+	./tools/check-k8s.sh
+
+act:
+	curl https://raw.githubusercontent.com/nektos/act/master/install.sh | bash

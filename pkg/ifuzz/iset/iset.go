@@ -11,6 +11,8 @@ import (
 const (
 	ArchX86     = "x86"
 	ArchPowerPC = "powerpc"
+	ArchArm64   = "arm64"
+	ArchRiscv64 = "riscv64"
 )
 
 var Arches = make(map[string]InsnSet)
@@ -61,13 +63,13 @@ const (
 	TypeLast
 )
 
-var SpecialNumbers = [...]uint64{0, 1 << 15, 1 << 16, 1 << 31, 1 << 32, 1 << 47, 1 << 47, 1 << 63}
+var SpecialNumbers = [...]uint64{0, 1 << 15, 1 << 16, 1 << 31, 1 << 32, 1 << 47, 1 << 48, 1 << 63}
 
 type ModeInsns [ModeLast][TypeLast][]Insn
 
 func (modeInsns *ModeInsns) Add(insn Insn) {
 	_, mode, pseudo, priv := insn.Info()
-	for m := Mode(0); m < ModeLast; m++ {
+	for m := range ModeLast {
 		if mode&(1<<uint(m)) == 0 {
 			continue
 		}

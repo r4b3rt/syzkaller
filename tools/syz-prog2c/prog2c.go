@@ -6,12 +6,13 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"runtime"
 
 	"github.com/google/syzkaller/pkg/csource"
+	"github.com/google/syzkaller/pkg/kfuzztest"
+	pkgfeatures "github.com/google/syzkaller/pkg/vminfo/features"
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys"
 )
@@ -21,33 +22,33 @@ var (
 	flagArch       = flag.String("arch", runtime.GOARCH, "target arch")
 	flagBuild      = flag.Bool("build", false, "also build the generated program")
 	flagThreaded   = flag.Bool("threaded", false, "create threaded program")
-	flagCollide    = flag.Bool("collide", false, "create collide program")
 	flagRepeat     = flag.Int("repeat", 1, "repeat program that many times (<=0 - infinitely)")
 	flagProcs      = flag.Int("procs", 1, "number of parallel processes")
 	flagSlowdown   = flag.Int("slowdown", 1, "execution slowdown caused by emulation/instrumentation")
-	flagSandbox    = flag.String("sandbox", "", "sandbox to use (none, setuid, namespace)")
+	flagSandbox    = flag.String("sandbox", "", "sandbox to use (none, setuid, namespace, android)")
+	flagSandboxArg = flag.Int("sandbox_arg", 0, "argument for executor to customize its behavior")
 	flagProg       = flag.String("prog", "", "file with program to convert (required)")
 	flagHandleSegv = flag.Bool("segv", false, "catch and ignore SIGSEGV")
 	flagUseTmpDir  = flag.Bool("tmpdir", false, "create a temporary dir and execute inside it")
 	flagTrace      = flag.Bool("trace", false, "trace syscall results")
-	flagRepro      = flag.Bool("repro", false, "add heartbeats used by pkg/repro")
 	flagStrict     = flag.Bool("strict", false, "parse input program in strict mode")
 	flagLeak       = flag.Bool("leak", false, "do leak checking")
 	flagEnable     = flag.String("enable", "none", "enable only listed additional features")
 	flagDisable    = flag.String("disable", "none", "enable all additional features except listed")
+	flagVmlinux    = flag.String("vmlinux", "", "path to vmlinux binary (required for dynamically discovered calls")
 )
 
 func main() {
 	flag.Usage = func() {
 		flag.PrintDefaults()
-		csource.PrintAvailableFeaturesFlags()
+		pkgfeatures.PrintAvailableFlags()
 	}
 	flag.Parse()
 	if *flagProg == "" {
 		flag.Usage()
 		os.Exit(1)
 	}
-	features, err := csource.ParseFeaturesFlags(*flagEnable, *flagDisable, false)
+	features, err := pkgfeatures.ParseFlags(*flagEnable, *flagDisable, false)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
@@ -56,7 +57,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
-	data, err := ioutil.ReadFile(*flagProg)
+	if *flagVmlinux != "" {
+		_, err = kfuzztest.ActivateKFuzzTargets(target, *flagVmlinux)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+	}
+	data, err := os.ReadFile(*flagProg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to read prog file: %v\n", err)
 		os.Exit(1)
@@ -72,12 +80,12 @@ func main() {
 	}
 	opts := csource.Options{
 		Threaded:      *flagThreaded,
-		Collide:       *flagCollide,
 		Repeat:        *flagRepeat != 1,
 		RepeatTimes:   *flagRepeat,
 		Procs:         *flagProcs,
 		Slowdown:      *flagSlowdown,
 		Sandbox:       *flagSandbox,
+		SandboxArg:    *flagSandboxArg,
 		Leak:          *flagLeak,
 		NetInjection:  features["tun"].Enabled,
 		NetDevices:    features["net_dev"].Enabled,
@@ -87,15 +95,17 @@ func main() {
 		CloseFDs:      features["close_fds"].Enabled,
 		KCSAN:         features["kcsan"].Enabled,
 		DevlinkPCI:    features["devlink_pci"].Enabled,
+		NicVF:         features["nic_vf"].Enabled,
 		USB:           features["usb"].Enabled,
 		VhciInjection: features["vhci"].Enabled,
 		Wifi:          features["wifi"].Enabled,
 		IEEE802154:    features["ieee802154"].Enabled,
 		Sysctl:        features["sysctl"].Enabled,
+		Swap:          features["swap"].Enabled,
 		UseTmpDir:     *flagUseTmpDir,
 		HandleSegv:    *flagHandleSegv,
-		Repro:         *flagRepro,
 		Trace:         *flagTrace,
+		CallComments:  true,
 	}
 	src, err := csource.Write(p, opts)
 	if err != nil {

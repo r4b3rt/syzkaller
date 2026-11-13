@@ -12,67 +12,107 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
+	"github.com/google/syzkaller/executor"
+	"github.com/google/syzkaller/pkg/testutil"
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys"
 	"github.com/google/syzkaller/sys/targets"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func init() {
+	// csource tests consume too much memory under race detector (>1GB),
+	// and periodically timeout on Travis. So we skip them.
+	if testutil.RaceEnabled {
+		for _, arg := range os.Args[1:] {
+			if strings.Contains(arg, "-test.short") {
+				fmt.Printf("skipping race testing in short mode\n")
+				os.Exit(0)
+			}
+		}
+	}
+}
 
 func TestGenerate(t *testing.T) {
 	t.Parallel()
 	checked := make(map[string]bool)
 	for _, target := range prog.AllTargets() {
-		target := target
+		// Auto-generated descriptions currently do not properly mark arch-specific syscalls, see
+		// https://github.com/google/syzkaller/issues/5410#issuecomment-3570190241.
+		// Until it's fixed, let's remove these syscalls from csource tests.
+		ct := target.NoAutoChoiceTable()
 		sysTarget := targets.Get(target.OS, target.Arch)
 		if runtime.GOOS != sysTarget.BuildOS {
 			continue
 		}
 		t.Run(target.OS+"/"+target.Arch, func(t *testing.T) {
-			full := !checked[target.OS]
-			if !full && testing.Short() {
-				return
-			}
 			if err := sysTarget.BrokenCompiler; err != "" {
 				t.Skipf("target compiler is broken: %v", err)
 			}
-			checked[target.OS] = true
-			t.Parallel()
-			testTarget(t, target, full)
+			full := !checked[target.OS]
+			if full || !testing.Short() {
+				checked[target.OS] = true
+				t.Parallel()
+				testTarget(t, target, full, ct)
+			}
+			testPseudoSyscalls(t, target, ct)
 		})
 	}
 }
 
-func testTarget(t *testing.T, target *prog.Target, full bool) {
-	seed := time.Now().UnixNano()
-	if os.Getenv("CI") != "" {
-		seed = 0 // required for deterministic coverage reports
+func testPseudoSyscalls(t *testing.T, target *prog.Target, ct *prog.ChoiceTable) {
+	// Use options that are as minimal as possible.
+	// We want to ensure that the code can always be compiled.
+	opts := Options{
+		Slowdown: 1,
 	}
-	rs := rand.NewSource(seed)
-	t.Logf("seed=%v", seed)
-	p := target.Generate(rs, 10, target.DefaultChoiceTable())
+	rs := testutil.RandSource(t)
+	for _, meta := range target.PseudoSyscalls() {
+		if meta.Attrs.KFuzzTest {
+			// KFuzzTest syscalls are generated and serialized in a very special way.
+			continue
+		}
+		p := target.GenSampleProg(meta, rs, ct)
+		t.Run(fmt.Sprintf("single_%s", meta.CallName), func(t *testing.T) {
+			t.Parallel()
+			testOne(t, p, opts)
+		})
+	}
+}
+
+func testTarget(t *testing.T, target *prog.Target, full bool, ct *prog.ChoiceTable) {
+	rs := testutil.RandSource(t)
+	p := target.Generate(rs, 10, ct)
 	// Turns out that fully minimized program can trigger new interesting warnings,
 	// e.g. about NULL arguments for functions that require non-NULL arguments in syz_ functions.
 	// We could append both AllSyzProg as-is and a minimized version of it,
 	// but this makes the NULL argument warnings go away (they showed up in ".constprop" versions).
 	// Testing 2 programs takes too long since we have lots of options permutations and OS/arch.
 	// So we use the as-is in short tests and minimized version in full tests.
-	syzProg := target.GenerateAllSyzProg(rs)
+	syzProg := target.GenerateAllSyzProg(rs, ct)
 	var opts []Options
 	if !full || testing.Short() {
 		p.Calls = append(p.Calls, syzProg.Calls...)
 		opts = allOptionsSingle(target.OS)
 		opts = append(opts, ExecutorOpts)
 	} else {
-		minimized, _ := prog.Minimize(syzProg, -1, false, func(p *prog.Prog, call int) bool {
+		minimized, _ := prog.Minimize(syzProg, -1, prog.MinimizeCorpus, func(p *prog.Prog, call int) bool {
 			return len(p.Calls) == len(syzProg.Calls)
 		})
 		p.Calls = append(p.Calls, minimized.Calls...)
 		opts = allOptionsPermutations(target.OS)
 	}
+	// Test various call properties.
 	if len(p.Calls) > 0 {
-		// Test fault injection code generation as well.
 		p.Calls[0].Props.FailNth = 1
+	}
+	if len(p.Calls) > 1 {
+		p.Calls[1].Props.Async = true
+	}
+	if len(p.Calls) > 2 {
+		p.Calls[2].Props.Rerun = 4
 	}
 	for opti, opts := range opts {
 		if testing.Short() && opts.HandleSegv {
@@ -81,7 +121,6 @@ func testTarget(t *testing.T, target *prog.Target, full bool) {
 			// compilation time from 1.94s to 104.73s and memory consumption from 136MB to 8116MB.
 			continue
 		}
-		opts := opts
 		t.Run(fmt.Sprintf("%v", opti), func(t *testing.T) {
 			t.Parallel()
 			testOne(t, p, opts)
@@ -89,7 +128,7 @@ func testTarget(t *testing.T, target *prog.Target, full bool) {
 	}
 }
 
-var failedTests uint32
+var failedTests atomic.Uint32
 
 func testOne(t *testing.T, p *prog.Prog, opts Options) {
 	// Each failure produces lots of output (including full C source).
@@ -99,23 +138,27 @@ func testOne(t *testing.T, p *prog.Prog, opts Options) {
 	if os.Getenv("CI") != "" {
 		maxFailures = 1
 	}
-	if atomic.LoadUint32(&failedTests) > maxFailures {
+	if failedTests.Load() > maxFailures {
 		return
 	}
 	src, err := Write(p, opts)
 	if err != nil {
-		if atomic.AddUint32(&failedTests, 1) > maxFailures {
+		if failedTests.Add(1) > maxFailures {
 			t.Fatal()
 		}
-		t.Logf("opts: %+v\nprogram:\n%s\n", opts, p.Serialize())
+		t.Logf("opts: %+v\nprogram:\n%s", opts, p.Serialize())
 		t.Fatalf("%v", err)
 	}
+	// Executor headers are embedded into the C source. Make sure there are no leftover include guards.
+	matches := regexp.MustCompile(`(?m)^#define\s+\S+_H\s*\n`).FindAllString(string(src), -1)
+	require.Empty(t, matches, "source contains leftover include guards: %v\nopts: %+v\nprogram:\n%s",
+		matches, opts, p.Serialize())
 	bin, err := Build(p.Target, src)
 	if err != nil {
-		if atomic.AddUint32(&failedTests, 1) > maxFailures {
+		if failedTests.Add(1) > maxFailures {
 			t.Fatal()
 		}
-		t.Logf("opts: %+v\nprogram:\n%s\n", opts, p.Serialize())
+		t.Logf("opts: %+v\nprogram:\n%s", opts, p.Serialize())
 		t.Fatalf("%v", err)
 	}
 	defer os.Remove(bin)
@@ -130,26 +173,33 @@ func TestExecutorMacros(t *testing.T) {
 	expected["SYZ_HAVE_SETUP_LOOP"] = true
 	expected["SYZ_HAVE_RESET_LOOP"] = true
 	expected["SYZ_HAVE_SETUP_TEST"] = true
-	macros := regexp.MustCompile("SYZ_[A-Za-z0-9_]+").FindAllString(commonHeader, -1)
+	expected["SYZ_TEST_COMMON_EXT_EXAMPLE"] = true
+	macros := regexp.MustCompile("SYZ_[A-Za-z0-9_]+").FindAllString(string(executor.CommonHeader), -1)
 	for _, macro := range macros {
 		if strings.HasPrefix(macro, "SYZ_HAVE_") {
 			continue
 		}
-		if _, ok := expected[macro]; !ok {
-			t.Errorf("unexpected macro: %v", macro)
-		}
+		assert.Contains(t, expected, macro)
 	}
 }
 
 func TestSource(t *testing.T) {
 	t.Parallel()
-	target, err := prog.GetTarget(targets.TestOS, targets.TestArch64)
+
+	target32, err := prog.GetTarget(targets.TestOS, targets.TestArch32)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	target64, err := prog.GetTarget(targets.TestOS, targets.TestArch64)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	type Test struct {
 		input  string
 		output string
+		target *prog.Target // target64 by default.
 	}
 	tests := []Test{
 		{
@@ -158,10 +208,10 @@ r0 = csource0(0x1)
 csource1(r0)
 `,
 			output: `
-res = syscall(SYS_csource0, 1);
+res = syscall(SYS_csource0, /*num=*/1);
 if (res != -1)
 	r[0] = res;
-syscall(SYS_csource1, r[0]);
+syscall(SYS_csource1, /*fd=*/r[0]);
 `,
 		},
 		{
@@ -172,38 +222,152 @@ csource4(&AUTO)
 csource5(&AUTO)
 csource6(&AUTO)
 `,
-			output: `
-NONFAILING(memcpy((void*)0x20000040, "\x12\x34\x56\x78", 4));
-syscall(SYS_csource2, 0x20000040ul);
-NONFAILING(memset((void*)0x20000080, 0, 10));
-syscall(SYS_csource3, 0x20000080ul);
-NONFAILING(memset((void*)0x200000c0, 48, 10));
-syscall(SYS_csource4, 0x200000c0ul);
-NONFAILING(memcpy((void*)0x20000100, "0101010101", 10));
-syscall(SYS_csource5, 0x20000100ul);
-NONFAILING(memcpy((void*)0x20000140, "101010101010", 12));
-syscall(SYS_csource6, 0x20000140ul);
+			output: fmt.Sprintf(`
+NONFAILING(memcpy((void*)0x%x, "\x12\x34\x56\x78", 4));
+syscall(SYS_csource2, /*buf=*/0x%xul);
+NONFAILING(memset((void*)0x%x, 0, 10));
+syscall(SYS_csource3, /*buf=*/0x%xul);
+NONFAILING(memset((void*)0x%x, 48, 10));
+syscall(SYS_csource4, /*buf=*/0x%xul);
+NONFAILING(memcpy((void*)0x%x, "0101010101", 10));
+syscall(SYS_csource5, /*buf=*/0x%xul);
+NONFAILING(memcpy((void*)0x%x, "101010101010", 12));
+syscall(SYS_csource6, /*buf=*/0x%xul);
 `,
+				target64.DataOffset+0x40, target64.DataOffset+0x40,
+				target64.DataOffset+0x80, target64.DataOffset+0x80,
+				target64.DataOffset+0xc0, target64.DataOffset+0xc0,
+				target64.DataOffset+0x100, target64.DataOffset+0x100,
+				target64.DataOffset+0x140, target64.DataOffset+0x140),
+		},
+		{
+			input: `
+csource7(0x0)
+csource7(0x1)
+csource7(0x2)
+csource7(0x3)
+csource7(0x4)
+csource7(0x5)
+`,
+			output: `
+syscall(SYS_csource7, /*flag=*/0ul);
+syscall(SYS_csource7, /*flag=BIT_0*/1ul);
+syscall(SYS_csource7, /*flag=BIT_1*/2ul);
+syscall(SYS_csource7, /*flag=BIT_0_AND_1*/3ul);
+syscall(SYS_csource7, /*flag=*/4ul);
+syscall(SYS_csource7, /*flag=BIT_0|0x4*/5ul);
+`,
+		},
+
+		{
+			input: `
+csource0(0xffffffff)
+csource8(0xffffffffffffffff)
+`,
+			output: `
+syscall(SYS_csource0, /*num=*/(intptr_t)-1);
+syscall(SYS_csource8, /*num=*/(intptr_t)-1);
+`,
+		},
+		{
+			input: `
+csource0(0xffffffff)
+csource8(0xffffffffffffffff)
+`,
+			output: `
+syscall(SYS_csource0, /*num=*/(intptr_t)-1);
+syscall(SYS_csource8, /*num=*/(intptr_t)-1);
+`,
+			target: target32,
 		},
 	}
 	for i, test := range tests {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
-			p, err := target.Deserialize([]byte(test.input), prog.Strict)
-			if err != nil {
-				t.Fatal(err)
+			if test.target == nil {
+				test.target = target64
 			}
+			p, err := test.target.Deserialize([]byte(test.input), prog.Strict)
+			require.NoError(t, err)
 			ctx := &context{
-				target:    target,
-				sysTarget: targets.Get(target.OS, target.Arch),
+				p:         p,
+				target:    test.target,
+				sysTarget: targets.Get(test.target.OS, test.target.Arch),
 			}
-			calls, _, err := ctx.generateProgCalls(p, false)
-			if err != nil {
-				t.Fatal(err)
-			}
+			// Disable comment generation, as it's not the focus of these tests.
+			// This simplifies the expected output. For tests covering comments, see
+			// /pkg/csource/syscall_generation_test.go.
+			calls, _, err := ctx.generateProgCalls(p, false, false)
+			require.NoError(t, err)
 			got := regexp.MustCompile(`(\n|^)\t`).ReplaceAllString(strings.Join(calls, ""), "\n")
-			if test.output != got {
-				t.Fatalf("input:\n%v\nwant:\n%v\ngot:\n%v", test.input, test.output, got)
-			}
+			require.True(t, test.output == got, "input:\n%v\nwant:\n%v\ngot:\n%v", test.input, test.output, got)
 		})
 	}
+}
+
+func generateSandboxFunctionSignatureTestCase(t *testing.T, sandbox string, sandboxArg int, expected, message string) {
+	actual := generateSandboxFunctionSignature(sandbox, sandboxArg)
+	assert.Equal(t, actual, expected, message)
+}
+
+func TestGenerateSandboxFunctionSignature(t *testing.T) {
+	// This test-case intentionally omits the following edge cases:
+	// - sandbox name as whitespaces, tabs
+	// - control chars \r, \n and unprintables
+	// - unsuitable chars - punctuation, emojis, '#', '*', etc
+	// - character case mismatching function prototype defined in common_linux.h.
+	//   For example 'do_sandbox_android' and 'AnDroid'.
+	// - non english letters, unicode compound characters
+	// and focuses on correct handling of sandboxes supporting and not 'sandbox_arg'
+	// config setting.
+	generateSandboxFunctionSignatureTestCase(t,
+		"",        // sandbox name
+		0,         // sandbox arg
+		"loop();", // expected
+		"Empty sandbox name should produce 'loop();'")
+
+	generateSandboxFunctionSignatureTestCase(t,
+		"abrakadabra",               // sandbox name
+		0,                           // sandbox arg
+		"do_sandbox_abrakadabra();", // expected
+		"Empty sandbox name should produce 'loop();'")
+
+	generateSandboxFunctionSignatureTestCase(t,
+		"android",                    // sandbox name
+		-1234,                        // sandbox arg
+		"do_sandbox_android(-1234);", // expected
+		"Android sandbox function requires an argument")
+}
+
+func TestWriteLLM(t *testing.T) {
+	t.Parallel()
+	target, err := prog.GetTarget(targets.TestOS, targets.TestArch64)
+	require.NoError(t, err)
+	sysTarget := targets.Get(target.OS, target.Arch)
+	if sysTarget.BrokenCompiler != "" {
+		t.Skipf("compiler is broken: %v", sysTarget.BrokenCompiler)
+	}
+
+	p, err := target.Deserialize([]byte(`
+r0 = csource0(0x1)
+csource1(r0)
+`), prog.Strict)
+	require.NoError(t, err)
+
+	src, err := WriteLLM(p)
+	require.NoError(t, err)
+	require.NotEmpty(t, src)
+
+	require.Contains(t, string(src), "csource0 arguments:")
+	require.NotContains(t, string(src), "loop()")
+	require.NotContains(t, string(src), "do_sandbox_")
+
+	mainIndex := strings.Index(string(src), "int main(")
+	syscallIndex := strings.LastIndex(string(src), "csource0")
+	require.NotEqual(t, -1, syscallIndex, "csource0 call not found in output")
+
+	require.Greater(t, syscallIndex, mainIndex, "syscall appears before main()!")
+
+	bin, err := Build(p.Target, src)
+	require.NoError(t, err)
+	defer os.Remove(bin)
 }

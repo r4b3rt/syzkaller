@@ -13,7 +13,6 @@ import (
 	"github.com/google/syzkaller/pkg/build"
 	"github.com/google/syzkaller/pkg/compiler"
 	"github.com/google/syzkaller/pkg/osutil"
-	"github.com/google/syzkaller/sys/targets"
 )
 
 type linux struct{}
@@ -34,7 +33,7 @@ func (*linux) prepare(sourcedir string, build bool, arches []*Arch) error {
 				out, err := osutil.RunCmd(time.Hour, sourcedir, "make", "mrproper", "ARCH="+arch,
 					"-j", fmt.Sprint(runtime.NumCPU()))
 				if err != nil {
-					return fmt.Errorf("make mrproper failed: %v\n%s", err, out)
+					return fmt.Errorf("make mrproper failed: %w\n%s", err, out)
 				}
 			}
 		}
@@ -51,8 +50,8 @@ func (*linux) prepareArch(arch *Arch) error {
 	// So we create empty stubs in buildDir/syzkaller and add -IbuildDir/syzkaller
 	// as the last flag so it won't override real kernel headers.
 	for hdr, data := range map[string]string{
-		// This is the only compiler header kernel uses,
-		// need to provide it since we use -nostdinc below.
+		// Compiler headers used by kernel code need local replacements since
+		// constant extraction uses -nostdinc below.
 		"stdarg.h": `
 #pragma once
 #define va_list __builtin_va_list
@@ -62,9 +61,18 @@ func (*linux) prepareArch(arch *Arch) error {
 #define va_copy __builtin_va_copy
 #define __va_copy __builtin_va_copy
 `,
-		"asm/a.out.h": "",
-		"asm/prctl.h": "",
-		"asm/mce.h":   "",
+		// LoongArch constants do not need the compiler intrinsics themselves.
+		"larchintrin.h": "",
+		"asm/kvm.h": `
+struct kvm_debug_exit_arch {};
+struct kvm_guest_debug_arch {};
+struct kvm_sync_regs {};
+`,
+		"asm/a.out.h":    "",
+		"asm/prctl.h":    "",
+		"asm/mce.h":      "",
+		"asm/msr.h":      "",
+		"uapi/asm/msr.h": "",
 	} {
 		fullPath := filepath.Join(arch.buildDir, "syzkaller", hdr)
 		if err := osutil.MkdirAll(filepath.Dir(fullPath)); err != nil {
@@ -78,15 +86,24 @@ func (*linux) prepareArch(arch *Arch) error {
 		return nil
 	}
 	kernelDir := arch.sourceDir
-	makeArgs := build.LinuxMakeArgs(arch.target, "", "", arch.buildDir)
-	out, err := osutil.RunCmd(time.Hour, kernelDir, "make", append(makeArgs, "defconfig")...)
-	if err != nil {
-		return fmt.Errorf("make defconfig failed: %v\n%s", err, out)
+	makeArgs := build.LinuxMakeArgs(arch.target, "", "", "", arch.buildDir, runtime.NumCPU())
+	if arch.configFile != "" {
+		err := osutil.CopyFile(arch.configFile, filepath.Join(arch.buildDir, ".config"))
+		if err != nil {
+			return fmt.Errorf("failed to copy config file: %w", err)
+		}
+	} else {
+		out, err := osutil.RunCmd(time.Hour, kernelDir, "make", append(makeArgs, "defconfig")...)
+		if err != nil {
+			return fmt.Errorf("make defconfig failed: %w\n%s", err, out)
+		}
 	}
-	_, err = osutil.RunCmd(time.Minute, arch.buildDir, filepath.Join(kernelDir, "scripts", "config"),
+	_, err := osutil.RunCmd(time.Minute, arch.buildDir, filepath.Join(kernelDir, "scripts", "config"),
 		// powerpc arch is configured to be big-endian by default, but we want little-endian powerpc.
 		// Since all of our archs are little-endian for now, we just blindly switch it.
 		"-d", "CPU_BIG_ENDIAN", "-e", "CPU_LITTLE_ENDIAN",
+		// s390 enables BTF in defconfig, but our packaged toolchains can't build it.
+		"-d", "DEBUG_INFO_BTF",
 		// Without CONFIG_NETFILTER kernel does not build.
 		"-e", "NETFILTER",
 		// include/net/mptcp.h is the only header in kernel that guards some
@@ -97,41 +114,45 @@ func (*linux) prepareArch(arch *Arch) error {
 		"-e", "SECURITY_SMACK",
 		// include/net/nl802154.h does not define some consts without this.
 		"-e", "IEEE802154", "-e", "IEEE802154_NL802154_EXPERIMENTAL",
+		// Needed for socket_vnet.txt includes.
+		"-e", "VSOCKETS",
 	)
 	if err != nil {
 		return err
 	}
-	out, err = osutil.RunCmd(time.Hour, kernelDir, "make", append(makeArgs, "olddefconfig")...)
+	out, err := osutil.RunCmd(time.Hour, kernelDir, "make", append(makeArgs, "olddefconfig")...)
 	if err != nil {
-		return fmt.Errorf("make olddefconfig failed: %v\n%s", err, out)
+		return fmt.Errorf("make olddefconfig failed: %w\n%s", err, out)
 	}
 	out, err = osutil.RunCmd(time.Hour, kernelDir, "make", append(makeArgs, "init/main.o")...)
 	if err != nil {
-		return fmt.Errorf("make failed: %v\n%s", err, out)
+		return fmt.Errorf("make failed: %w\n%s", err, out)
 	}
 	return nil
 }
 
 func (*linux) processFile(arch *Arch, info *compiler.ConstInfo) (map[string]uint64, map[string]bool, error) {
-	if strings.HasSuffix(info.File, "_kvm.txt") &&
-		(arch.target.Arch == targets.ARM || arch.target.Arch == targets.RiscV64) {
-		// Hack: KVM is not supported on ARM anymore. We may want some more official support
-		// for marking descriptions arch-specific, but so far this combination is the only
-		// one. For riscv64, KVM is not supported yet but might be in the future.
-		// Note: syz-sysgen also ignores this file for arm and riscv64.
-		return nil, nil, nil
-	}
 	headerArch := arch.target.KernelHeaderArch
 	sourceDir := arch.sourceDir
 	buildDir := arch.buildDir
 	args := []string{
+		"-std=gnu11",
+		// EFI kernel headers use wide character constants.
+		"-fshort-wchar",
+		// Avoid implicit declaration errors.
+		"-Wno-implicit-function-declaration",
+		// Otherwise it does not recognize anonymous struct members.
+		"-fms-extensions",
 		// This makes the build completely hermetic, only kernel headers are used.
 		"-nostdinc",
 		"-w", "-fmessage-length=0",
 		"-O3", // required to get expected values for some __builtin_constant_p
 		"-I.",
 		"-D__KERNEL__",
+		"-D__DVB_CORE__",
 		"-DKBUILD_MODNAME=\"-\"",
+		"-DKBUILD_MODFILE=\"-\"",
+		"-D__LINUX_ARM_ARCH__=7", // arm does not build w/o this
 		"-I" + sourceDir + "/arch/" + headerArch + "/include",
 		"-I" + buildDir + "/arch/" + headerArch + "/include/generated/uapi",
 		"-I" + buildDir + "/arch/" + headerArch + "/include/generated",
@@ -140,20 +161,25 @@ func (*linux) processFile(arch *Arch, info *compiler.ConstInfo) (map[string]uint
 		"-I" + buildDir + "/include",
 		"-I" + sourceDir + "/include",
 		"-I" + sourceDir + "/arch/" + headerArch + "/include/uapi",
-		"-I" + buildDir + "/arch/" + headerArch + "/include/generated/uapi",
 		"-I" + sourceDir + "/include/uapi",
 		"-I" + buildDir + "/include/generated/uapi",
 		"-I" + sourceDir,
 		"-I" + sourceDir + "/include/linux",
+		"-I" + sourceDir + "/fs/xfs/libxfs",
 		"-I" + buildDir + "/syzkaller",
 		"-include", sourceDir + "/include/linux/kconfig.h",
+	}
+	if headerArch == "arm64" {
+		// arch/arm64/Makefile adds this to KBUILD_CPPFLAGS since the arm64 headers
+		// are shared with s390 (without it, e.g. asm/sysreg.h misses most definitions).
+		args = append(args, "-DARM64_S390_COMMON=1")
 	}
 	args = append(args, arch.target.CFlags...)
 	for _, incdir := range info.Incdirs {
 		args = append(args, "-I"+sourceDir+"/"+incdir)
 	}
 	if arch.includeDirs != "" {
-		for _, dir := range strings.Split(arch.includeDirs, ",") {
+		for dir := range strings.SplitSeq(arch.includeDirs, ",") {
 			args = append(args, "-I"+dir)
 		}
 	}

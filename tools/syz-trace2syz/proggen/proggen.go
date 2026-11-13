@@ -2,15 +2,15 @@
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 //go:build !codeanalysis
-// +build !codeanalysis
 
+// Package proggen generates syzkaller programs from parsed execution traces.
 package proggen
 
 import (
 	"encoding/binary"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
+	"os"
 
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/prog"
@@ -18,7 +18,7 @@ import (
 )
 
 func ParseFile(filename string, target *prog.Target) ([]*prog.Prog, error) {
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("error reading file: %v", err)
 	}
@@ -245,9 +245,11 @@ func (ctx *context) genStruct(syzType *prog.StructType, dir prog.Dir, traceType 
 }
 
 // recurseStructs handles cases where syzType corresponds to struct descriptions like
-// sockaddr_storage_in6 {
-//        addr    sockaddr_in6
-// } [size[SOCKADDR_STORAGE_SIZE], align_ptr]
+//
+//	sockaddr_storage_in6 {
+//	       addr    sockaddr_in6
+//	} [size[SOCKADDR_STORAGE_SIZE], align_ptr]
+//
 // which need to be recursively generated. It returns true if we needed to recurse
 // along with the generated argument and false otherwise.
 func (ctx *context) recurseStructs(syzType *prog.StructType, dir prog.Dir, traceType *parser.GroupType) (prog.Arg, bool) {

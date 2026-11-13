@@ -1,0 +1,67 @@
+// Copyright 2026 syzkaller project authors. All rights reserved.
+// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
+
+//go:build !linux
+
+package osutil
+
+import (
+	"errors"
+	"io/fs"
+	"os"
+	"os/exec"
+	"testing"
+	"time"
+)
+
+func fileTimes(file string) (time.Time, time.Time, error) {
+	stat, err := os.Stat(file)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	// Creation time is not present in stat, so we use modification time for both.
+	modTime := stat.ModTime()
+	return modTime, modTime, nil
+}
+
+func SystemMemorySize() uint64 {
+	return 0
+}
+
+func AvailableMemorySize() (uint64, error) {
+	return 0, errors.New("AvailableMemorySize is only supported on linux")
+}
+
+func prolongPipe(r, w *os.File) {
+}
+
+func Sandbox(cmd *exec.Cmd, user, net bool) error {
+	return nil
+}
+
+func SandboxChown(files ...string) error {
+	return nil
+}
+
+func sandboxChownFile(f *os.File) error {
+	return nil
+}
+
+func RequireSandbox(t *testing.T) {
+	t.Skip("sandboxing is only supported on linux")
+}
+
+func IsSandboxOwned(t *testing.T, path string) bool {
+	t.Skip("sandboxing is only supported on linux")
+	return false
+}
+
+func setPdeathsig(cmd *exec.Cmd, hardKill bool) {
+}
+
+func killPgroup(cmd *exec.Cmd) {
+}
+
+func sysDiskUsage(info fs.FileInfo) uint64 {
+	return uint64(max(0, info.Size()))
+}

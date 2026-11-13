@@ -13,12 +13,12 @@ import (
 func TestChecksumCalcRandom(t *testing.T) {
 	target, rs, iters := InitTest(t)
 	ct := target.DefaultChoiceTable()
-	for i := 0; i < iters; i++ {
+	for range iters {
 		p := target.Generate(rs, 10, ct)
 		for _, call := range p.Calls {
 			CalcChecksumsCall(call)
 		}
-		p.Mutate(rs, 10, ct, nil)
+		p.Mutate(rs, 10, ct, nil, nil)
 		for _, call := range p.Calls {
 			CalcChecksumsCall(call)
 		}

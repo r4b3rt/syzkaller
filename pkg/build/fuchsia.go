@@ -43,7 +43,7 @@ func (fu fuchsia) build(params Params) (ImageDetails, error) {
 		"scripts/fx", "--dir", "out/"+arch,
 		"set", product,
 		"--args", fmt.Sprintf(`syzkaller_dir="%s"`, syzDir),
-		"--with-base", "//bundles:tools",
+		"--with-base", "//bundles/tools",
 		"--with-base", "//src/testing/fuzzing/syzkaller",
 		"--variant", "kasan",
 		"--no-goma",
@@ -72,7 +72,7 @@ func (fu fuchsia) build(params Params) (ImageDetails, error) {
 	// Copy and extend the fvm.
 	fvmTool := filepath.Join("out", arch, "host_x64", "fvm")
 	fvmDst := filepath.Join(params.OutputDir, "image")
-	fvmSrc := filepath.Join(params.KernelDir, "out", arch, "obj/build/images/fvm.blk")
+	fvmSrc := filepath.Join(params.KernelDir, "out", arch, "obj", "build", "images", "fuchsia", "fuchsia", "fvm.blk")
 	if err := osutil.CopyFile(fvmSrc, fvmDst); err != nil {
 		return ImageDetails{}, err
 	}
@@ -87,13 +87,13 @@ func (fu fuchsia) build(params Params) (ImageDetails, error) {
 		fullSrc := filepath.Join(params.KernelDir, filepath.FromSlash(src))
 		fullDst := filepath.Join(params.OutputDir, filepath.FromSlash(dst))
 		if err := osutil.CopyFile(fullSrc, fullDst); err != nil {
-			return ImageDetails{}, fmt.Errorf("failed to copy %v: %v", src, err)
+			return ImageDetails{}, fmt.Errorf("failed to copy %v: %w", src, err)
 		}
 	}
 	return ImageDetails{}, nil
 }
 
-func (fu fuchsia) clean(kernelDir, targetArch string) error {
+func (fu fuchsia) clean(params Params) error {
 	// We always do clean build because incremental build is frequently broken.
 	// So no need to clean separately.
 	return nil

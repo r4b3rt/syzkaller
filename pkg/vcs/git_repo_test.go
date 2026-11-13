@@ -5,48 +5,36 @@ package vcs
 
 import (
 	"fmt"
-	"io/ioutil"
-	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"testing"
+	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/google/syzkaller/pkg/debugtracer"
+	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func init() {
-	// Disable sandboxing entirely because we create test repos without sandboxing.
-	os.Setenv("SYZ_DISABLE_SANDBOXING", "yes")
-}
-
 func TestGitRepo(t *testing.T) {
-	t.Parallel()
-	baseDir, err := ioutil.TempDir("", "syz-git-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(baseDir)
+	osutil.RequireSandbox(t)
+	baseDir := osutil.SandboxTempDir(t)
 	repo1 := CreateTestRepo(t, baseDir, "repo1")
 	repo2 := CreateTestRepo(t, baseDir, "repo2")
-	repo := newGit(filepath.Join(baseDir, "repo"), nil, nil)
+	repo := newGitRepo(filepath.Join(baseDir, "repo"), nil, nil)
 	{
 		com, err := repo.Poll(repo1.Dir, "master")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if diff := cmp.Diff(com, repo1.Commits["master"]["1"]); diff != "" {
-			t.Fatal(diff)
-		}
+		require.Equal(t, repo1.Commits["master"]["1"], com)
 	}
 	{
 		com, err := repo.CheckoutBranch(repo1.Dir, "branch1")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if diff := cmp.Diff(com, repo1.Commits["branch1"]["1"]); diff != "" {
-			t.Fatal(diff)
-		}
+		require.Equal(t, repo1.Commits["branch1"]["1"], com)
 	}
 	{
 		want := repo1.Commits["branch1"]["0"]
@@ -54,19 +42,7 @@ func TestGitRepo(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if diff := cmp.Diff(com, want); diff != "" {
-			t.Fatal(diff)
-		}
-	}
-	{
-		commits, err := repo.ListRecentCommits(repo1.Commits["branch1"]["1"].Hash)
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := []string{"repo1-branch1-1", "repo1-branch1-0", "repo1-master-0"}
-		if diff := cmp.Diff(commits, want); diff != "" {
-			t.Fatal(diff)
-		}
+		require.Equal(t, want, com)
 	}
 	{
 		want := repo2.Commits["branch1"]["0"]
@@ -74,9 +50,7 @@ func TestGitRepo(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if diff := cmp.Diff(com, want); diff != "" {
-			t.Fatal(diff)
-		}
+		require.Equal(t, want, com)
 	}
 	{
 		want := repo2.Commits["branch1"]["1"]
@@ -84,18 +58,14 @@ func TestGitRepo(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if diff := cmp.Diff(com, want); diff != "" {
-			t.Fatal(diff)
-		}
+		require.Equal(t, want, com)
 	}
 	{
 		com, err := repo.CheckoutBranch(repo2.Dir, "branch2")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if diff := cmp.Diff(com, repo2.Commits["branch2"]["1"]); diff != "" {
-			t.Fatal(diff)
-		}
+		require.Equal(t, repo2.Commits["branch2"]["1"], com)
 	}
 	{
 		want := repo2.Commits["branch2"]["0"]
@@ -103,9 +73,7 @@ func TestGitRepo(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if diff := cmp.Diff(com, want); diff != "" {
-			t.Fatal(diff)
-		}
+		require.Equal(t, want, com)
 	}
 	{
 		type Test struct {
@@ -138,18 +106,40 @@ func TestGitRepo(t *testing.T) {
 	}
 }
 
+func TestCheckoutCommitLocal(t *testing.T) {
+	osutil.RequireSandbox(t)
+	baseDir := osutil.SandboxTempDir(t)
+
+	// Create a remote repo and a local checkout.
+	remote := CreateTestRepo(t, baseDir, "remote")
+	local := newGitRepo(filepath.Join(baseDir, "local"), nil, nil)
+
+	// Initial poll to populate local repo.
+	com0, err := local.Poll(remote.Dir, "master")
+	require.NoError(t, err)
+	require.Equal(t, remote.Commits["master"]["1"], com0)
+
+	// Get a commit that exists in both.
+	want := remote.Commits["master"]["0"]
+
+	// Now try to fetch the same commit but from a DIFFERENT remote that doesn't have it.
+	otherRemote := CreateTestRepo(t, baseDir, "otherRemote")
+
+	// This should fail if it tries to fetch from otherRemote,
+	// but succeed because it finds the commit locally.
+	com, err := local.CheckoutCommit(otherRemote.Dir, want.Hash)
+	require.NoError(t, err)
+	require.Equal(t, want.Hash, com.Hash)
+}
+
 func TestMetadata(t *testing.T) {
 	t.Parallel()
-	repoDir, err := ioutil.TempDir("", "syz-git-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(repoDir)
+	repoDir := t.TempDir()
 	repo := MakeTestRepo(t, repoDir)
 	prevHash := ""
 	for i, test := range metadataTests {
 		repo.CommitChange(test.description)
-		com, err := repo.repo.HeadCommit()
+		com, err := repo.repo.Commit(HEAD)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -172,7 +162,7 @@ func TestMetadata(t *testing.T) {
 			if title == "" {
 				continue
 			}
-			com, err := repo.repo.GetCommitByTitle(title)
+			com, err := repo.repo.GetCommitByTitle(title, time.Time{})
 			if err != nil {
 				t.Error(err)
 			} else if com == nil {
@@ -197,12 +187,11 @@ func checkCommit(t *testing.T, idx int, test testCommit, com *Commit, checkTags 
 	if userName != com.AuthorName {
 		t.Errorf("#%v: want author name %q, got %q", idx, userName, com.Author)
 	}
-	if diff := cmp.Diff(test.cc, com.Recipients.GetEmails(To)); diff != "" {
+	if !assert.Equal(t, test.cc, com.Recipients.GetEmails(To)) {
 		t.Logf("%#v", com.Recipients)
-		t.Error(diff)
 	}
-	if diff := cmp.Diff(test.tags, com.Tags); checkTags && diff != "" {
-		t.Error(diff)
+	if checkTags {
+		assert.Equal(t, test.tags, com.Tags)
 	}
 }
 
@@ -329,16 +318,12 @@ Comment out an assertion that's now bogus and add a comment.
 
 func TestBisect(t *testing.T) {
 	t.Parallel()
-	repoDir, err := ioutil.TempDir("", "syz-git-test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(repoDir)
+	repoDir := t.TempDir()
 	repo := MakeTestRepo(t, repoDir)
 	var commits []string
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		repo.CommitChange(fmt.Sprintf("commit %v", i))
-		com, err := repo.repo.HeadCommit()
+		com, err := repo.repo.Commit(HEAD)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -352,7 +337,7 @@ func TestBisect(t *testing.T) {
 	}
 	makePred := func(res1, res2, res3 BisectResult) predFunc {
 		return func() (BisectResult, error) {
-			current, err := repo.repo.HeadCommit()
+			current, err := repo.repo.Commit(HEAD)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -416,11 +401,11 @@ func TestBisect(t *testing.T) {
 		for _, com := range result {
 			got = append(got, com.Hash)
 		}
-		sort.Strings(got) // git result order is non-deterministic (wat)
-		sort.Strings(test.result)
-		if diff := cmp.Diff(test.result, got); diff != "" {
+		slices.Sort(got) // git result order is non-deterministic (wat)
+		slices.Sort(test.result)
+		if !assert.Equal(t, test.result, got) {
 			t.Logf("result: %+v", got)
-			t.Fatal(diff)
+			t.FailNow()
 		}
 	}
 }

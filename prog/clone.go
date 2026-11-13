@@ -5,29 +5,54 @@ package prog
 
 import (
 	"fmt"
+	"slices"
 )
 
 func (p *Prog) Clone() *Prog {
+	return p.cloneWithMap(make(map[*ResultArg]*ResultArg))
+}
+
+func (p *Prog) cloneWithMap(newargs map[*ResultArg]*ResultArg) *Prog {
+	if p.isUnsafe {
+		// We could clone it, but since we prohibit mutation
+		// of unsafe programs, it's unclear why we would clone it.
+		// Note: this also covers cloning of corpus programs
+		// during mutation, so if this is removed, we may need
+		// additional checks during mutation.
+		panic("cloning of unsafe programs is not supposed to be done")
+	}
 	p1 := &Prog{
 		Target: p.Target,
-		Calls:  make([]*Call, len(p.Calls)),
-	}
-	newargs := make(map[*ResultArg]*ResultArg)
-	for ci, c := range p.Calls {
-		c1 := new(Call)
-		c1.Meta = c.Meta
-		if c.Ret != nil {
-			c1.Ret = clone(c.Ret, newargs).(*ResultArg)
-		}
-		c1.Args = make([]Arg, len(c.Args))
-		for ai, arg := range c.Args {
-			c1.Args[ai] = clone(arg, newargs)
-		}
-		c1.Props = c.Props
-		p1.Calls[ci] = c1
+		Calls:  cloneCalls(p.Calls, newargs),
 	}
 	p1.debugValidate()
 	return p1
+}
+
+func cloneCalls(origCalls []*Call, newargs map[*ResultArg]*ResultArg) []*Call {
+	calls := make([]*Call, len(origCalls))
+	for ci, c := range origCalls {
+		calls[ci] = cloneCall(c, newargs)
+	}
+	return calls
+}
+
+func cloneCall(c *Call, newargs map[*ResultArg]*ResultArg) *Call {
+	c1 := new(Call)
+	c1.Meta = c.Meta
+	if c.Ret != nil {
+		c1.Ret = clone(c.Ret, newargs).(*ResultArg)
+	}
+	c1.Args = make([]Arg, len(c.Args))
+	for ai, arg := range c.Args {
+		c1.Args[ai] = clone(arg, newargs)
+	}
+	c1.Props = c.Props
+	return c1
+}
+
+func CloneArg(arg Arg) Arg {
+	return clone(arg, nil)
 }
 
 func clone(arg Arg, newargs map[*ResultArg]*ResultArg) Arg {
@@ -47,7 +72,7 @@ func clone(arg Arg, newargs map[*ResultArg]*ResultArg) Arg {
 	case *DataArg:
 		a1 := new(DataArg)
 		*a1 = *a
-		a1.data = append([]byte{}, a.data...)
+		a1.data = slices.Clone(a.data)
 		arg1 = a1
 	case *GroupArg:
 		a1 := new(GroupArg)
@@ -67,15 +92,20 @@ func clone(arg Arg, newargs map[*ResultArg]*ResultArg) Arg {
 		*a1 = *a
 		arg1 = a1
 		if a1.Res != nil {
-			r := newargs[a1.Res]
-			a1.Res = r
+			r := a1.Res
+			if newargs != nil {
+				r = newargs[a1.Res]
+				a1.Res = r
+			}
 			if r.uses == nil {
 				r.uses = make(map[*ResultArg]bool)
 			}
 			r.uses[a1] = true
 		}
 		a1.uses = nil // filled when we clone the referent
-		newargs[a] = a1
+		if newargs != nil {
+			newargs[a] = a1
+		}
 	default:
 		panic(fmt.Sprintf("bad arg kind: %#v", arg))
 	}

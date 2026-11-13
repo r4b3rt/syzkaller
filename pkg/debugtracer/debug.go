@@ -1,6 +1,7 @@
 // Copyright 2020 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package debugtracer provides interfaces and implementations for logging debug traces and artifacts.
 package debugtracer
 
 import (
@@ -8,16 +9,18 @@ import (
 	"io"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/syzkaller/pkg/osutil"
 )
 
 type DebugTracer interface {
-	Log(msg string, args ...interface{})
+	Logf(msg string, args ...any)
 	SaveFile(filename string, data []byte)
 }
 
 type GenericTracer struct {
+	WithTime    bool
 	TraceWriter io.Writer
 	OutDir      string
 }
@@ -29,8 +32,14 @@ type TestTracer struct {
 type NullTracer struct {
 }
 
-func (gt *GenericTracer) Log(msg string, args ...interface{}) {
-	fmt.Fprintf(gt.TraceWriter, msg+"\n", args...)
+func (gt *GenericTracer) Logf(msg string, args ...any) {
+	if gt.WithTime {
+		timeStr := time.Now().Format("02-Jan-2006 15:04:05")
+		newArgs := append([]any{timeStr}, args...)
+		fmt.Fprintf(gt.TraceWriter, "%s: "+msg+"\n", newArgs...)
+	} else {
+		fmt.Fprintf(gt.TraceWriter, msg+"\n", args...)
+	}
 }
 
 func (gt *GenericTracer) SaveFile(filename string, data []byte) {
@@ -41,15 +50,15 @@ func (gt *GenericTracer) SaveFile(filename string, data []byte) {
 	osutil.WriteFile(filepath.Join(gt.OutDir, filename), data)
 }
 
-func (tt *TestTracer) Log(msg string, args ...interface{}) {
-	tt.T.Log(msg, args)
+func (tt *TestTracer) Logf(msg string, args ...any) {
+	tt.T.Logf(msg, args...)
 }
 
 func (tt *TestTracer) SaveFile(filename string, data []byte) {
 	// Not implemented.
 }
 
-func (nt *NullTracer) Log(msg string, args ...interface{}) {
+func (nt *NullTracer) Logf(msg string, args ...any) {
 	// Not implemented.
 }
 

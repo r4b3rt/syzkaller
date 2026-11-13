@@ -8,13 +8,17 @@
 package vmimpl
 
 import (
+	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/big"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/syzkaller/pkg/log"
@@ -29,7 +33,7 @@ type Pool interface {
 	Count() int
 
 	// Create creates and boots a new VM instance.
-	Create(workdir string, index int) (Instance, error)
+	Create(ctx context.Context, workdir string, index int) (Instance, error)
 }
 
 // Instance represents a single VM.
@@ -44,8 +48,8 @@ type Instance interface {
 	// Run runs cmd inside of the VM (think of ssh cmd).
 	// outc receives combined cmd and kernel console output.
 	// errc receives either command Wait return error or vmimpl.ErrTimeout.
-	// Command is terminated after timeout. Send on the stop chan can be used to terminate it earlier.
-	Run(timeout time.Duration, stop <-chan bool, command string) (outc <-chan []byte, errc <-chan error, err error)
+	// Command terminates with context. Use context.WithTimeout to terminate it earlier.
+	Run(ctx context.Context, command string) (outc <-chan Chunk, errc <-chan error, err error)
 
 	// Diagnose retrieves additional debugging info from the VM
 	// (e.g. by sending some sys-rq's or SIGABORT'ing a Go program).
@@ -57,7 +61,7 @@ type Instance interface {
 	Diagnose(rep *report.Report) (diagnosis []byte, wait bool)
 
 	// Close stops and destroys the VM.
-	Close()
+	io.Closer
 }
 
 // Infoer is an optional interface that can be implemented by Instance.
@@ -70,66 +74,114 @@ type Infoer interface {
 type Env struct {
 	// Unique name
 	// Can be used for VM name collision resolution if several pools share global name space.
-	Name     string
-	OS       string // target OS
-	Arch     string // target arch
-	Workdir  string
-	Image    string
-	SSHKey   string
-	SSHUser  string
-	Timeouts targets.Timeouts
-	Debug    bool
-	Config   []byte // json-serialized VM-type-specific config
+	Name      string
+	OS        string // target OS
+	Arch      string // target arch
+	Workdir   string
+	Image     string
+	SSHKey    string
+	SSHUser   string
+	Timeouts  targets.Timeouts
+	Snapshot  bool
+	Debug     bool
+	Config    []byte // json-serialized VM-type-specific config
+	KernelSrc string
 }
 
 // BootError is returned by Pool.Create when VM does not boot.
+// It should not be used for VMM intfrastructure errors, i.e. for problems not related
+// to the tested kernel itself.
 type BootError struct {
 	Title  string
 	Output []byte
 }
 
 func MakeBootError(err error, output []byte) error {
-	switch err1 := err.(type) {
-	case *osutil.VerboseError:
-		return BootError{err1.Title, append(err1.Output, output...)}
-	default:
-		return BootError{err.Error(), output}
+	if len(output) == 0 {
+		// In reports, it may be helpful to distinguish the case when the boot output
+		// was collected, but turned out to be empty.
+		output = []byte("<empty boot output>")
 	}
+	if verboseError, ok := errors.AsType[*osutil.VerboseError](err); ok {
+		return BootError{verboseError.Error(), append(verboseError.Output, output...)}
+	}
+	return BootError{err.Error(), output}
 }
 
 func (err BootError) Error() string {
 	return fmt.Sprintf("%v\n%s", err.Title, err.Output)
 }
 
-func (err BootError) BootError() (string, []byte) {
+func (err BootError) Details() (string, []byte) {
+	return err.Title, err.Output
+}
+
+// InfraError is used when we want to attach console output to the error title.
+// By default, all Pool.Create() errors are treated as infrastructure problems.
+type InfraError struct {
+	Title  string
+	Output []byte
+}
+
+func (err InfraError) Error() string {
+	return fmt.Sprintf("%v\n%s", err.Title, err.Output)
+}
+
+func (err InfraError) Details() (string, []byte) {
 	return err.Title, err.Output
 }
 
 // Register registers a new VM type within the package.
-func Register(typ string, ctor ctorFunc, allowsOvercommit bool) {
-	Types[typ] = Type{
-		Ctor:       ctor,
-		Overcommit: allowsOvercommit,
-	}
+func Register(typ string, desc Type) {
+	Types[typ] = desc
 }
 
 type Type struct {
-	Ctor       ctorFunc
+	Ctor ctorFunc
+	// It's possible to create out-of-thin-air instances of this type.
+	// Out-of-thin-air instances are used by syz-ci for image testing, patch testing, bisection, etc.
 	Overcommit bool
+	// Instances of this type can be preempted and lost connection as the result.
+	// For preempted instances executor prints "SYZ-EXECUTOR: PREEMPTED" and then
+	// the host understands that the lost connection was expected and is not a bug.
+	Preemptible bool
 }
 
 type ctorFunc func(env *Env) (Pool, error)
 
 var (
 	// Close to interrupt all pending operations in all VMs.
-	Shutdown   = make(chan struct{})
-	ErrTimeout = errors.New("timeout")
+	Shutdown     = make(chan struct{})
+	ErrTimeout   = errors.New("timeout")
+	ErrPreempted = errors.New("instance is preempted")
 
 	Types = make(map[string]Type)
 )
 
-func Multiplex(cmd *exec.Cmd, merger *OutputMerger, console io.Closer, timeout time.Duration,
-	stop, closed <-chan bool, debug bool) (<-chan []byte, <-chan error, error) {
+type CmdCloser struct {
+	*exec.Cmd
+}
+
+func (cc CmdCloser) Close() error {
+	cc.Process.Kill()
+	return cc.Wait()
+}
+
+var WaitForOutputTimeout = 10 * time.Second
+
+type MultiplexConfig struct {
+	Console         io.Closer
+	Close           <-chan bool
+	Debug           bool
+	Scale           time.Duration
+	PreemptionError func(err error) bool
+}
+
+func Multiplex(ctx context.Context, cmd *exec.Cmd, merger *OutputMerger, config MultiplexConfig) (
+	<-chan Chunk, <-chan error, error) {
+	if config.Scale <= 0 {
+		panic("slowdown must be set")
+	}
 	errc := make(chan error, 1)
 	signal := func(err error) {
 		select {
@@ -138,38 +190,82 @@ func Multiplex(cmd *exec.Cmd, merger *OutputMerger, console io.Closer, timeout t
 		}
 	}
 	go func() {
+		errCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 		select {
-		case <-time.After(timeout):
+		case <-ctx.Done():
 			signal(ErrTimeout)
-		case <-stop:
-			signal(ErrTimeout)
-		case <-closed:
-			if debug {
+		case <-config.Close:
+			if config.Debug {
 				log.Logf(0, "instance closed")
 			}
 			signal(fmt.Errorf("instance closed"))
-		case err := <-merger.Err:
-			cmd.Process.Kill()
-			console.Close()
-			merger.Wait()
-			if cmdErr := cmd.Wait(); cmdErr == nil {
+		case err := <-merger.Errors(errCtx):
+			// EOF is not always in perfect sync with exit, so we should wait a bit.
+			if cmdErr := waitAndKill(ctx, cmd); cmdErr == nil {
 				// If the command exited successfully, we got EOF error from merger.
 				// But in this case no error has happened and the EOF is expected.
 				err = nil
+			} else if config.PreemptionError != nil && config.PreemptionError(err) {
+				err = ErrPreempted
+			}
+			// Once the command has failed, we might want to let the full console
+			// output accumulate before we abort the console connection too.
+			if err != nil {
+				time.Sleep(WaitForOutputTimeout * config.Scale)
+			}
+			if config.Console != nil {
+				// Only wait for the merger if we're able to control the console stream.
+				config.Console.Close()
+				merger.Wait()
 			}
 			signal(err)
 			return
 		}
 		cmd.Process.Kill()
-		console.Close()
-		merger.Wait()
+		if config.Console != nil {
+			config.Console.Close()
+			merger.Wait()
+		}
 		cmd.Wait()
 	}()
 	return merger.Output, errc, nil
 }
 
+func waitAndKill(ctx context.Context, cmd *exec.Cmd) error {
+	err := make(chan error)
+	go func() {
+		err <- cmd.Wait()
+	}()
+	// The processes sometimes first close their output streams and only then exit,
+	// with some time in between.
+	// This can be e.g. observed when running ssh (the common case for the package).
+	// There might be smarter ways to enforce the ordering/atomicity, but for now
+	// let's just use a timeout.
+	const waitTimeout = 5 * time.Second
+	ctxDone := false
+	select {
+	case <-ctx.Done():
+		ctxDone = true
+	case <-time.After(waitTimeout):
+	case err := <-err:
+		return err
+	}
+	cmd.Process.Kill()
+	if ctxDone {
+		// Wait till process exits, but return another error.
+		<-err
+		return ctx.Err()
+	}
+	return <-err
+}
+
 func RandomPort() int {
-	return rand.Intn(64<<10-1<<10) + 1<<10
+	n, err := rand.Int(rand.Reader, big.NewInt(64<<10-1<<10))
+	if err != nil {
+		panic(err)
+	}
+	return int(n.Int64()) + 1<<10
 }
 
 func UnusedTCPPort() int {
@@ -180,13 +276,26 @@ func UnusedTCPPort() int {
 			ln.Close()
 			return port
 		}
+
+		// Continue searching for a port only if we fail with EADDRINUSE or don't have permissions to use this port.
+		// Although we exclude ports <1024 in RandomPort(), it's still possible that we can face a restricted port.
+		var opErr *net.OpError
+		if errors.As(err, &opErr) && opErr.Op == "listen" {
+			if syscallErr, ok := errors.AsType[*os.SyscallError](opErr.Err); ok {
+				if errors.Is(syscallErr.Err, syscall.EADDRINUSE) || errors.Is(syscallErr.Err, syscall.EACCES) {
+					continue
+				}
+			}
+		}
+		log.Fatalf("error allocating port localhost:%d: %v", port, err)
 	}
 }
 
-// Escapes double quotes(and nested double quote escapes). Ignores any other escapes.
+// EscapeDoubleQuotes escapes double quotes (and nested double quote escapes). Ignores any other escapes.
 // Reference: https://www.gnu.org/software/bash/manual/html_node/Double-Quotes.html
 func EscapeDoubleQuotes(inp string) string {
 	var ret strings.Builder
+	//nolint:syz-linter // pos is modified inside the loop
 	for pos := 0; pos < len(inp); pos++ {
 		// If inp[pos] is not a double quote or a backslash, just use
 		// as is.

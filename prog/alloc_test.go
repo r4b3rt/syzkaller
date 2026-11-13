@@ -6,6 +6,8 @@ package prog
 import (
 	"fmt"
 	"testing"
+
+	"github.com/google/syzkaller/pkg/testutil"
 )
 
 func TestMemAlloc(t *testing.T) {
@@ -60,7 +62,6 @@ func TestMemAlloc(t *testing.T) {
 		},
 	}
 	for ti, test := range tests {
-		test := test
 		t.Run(fmt.Sprint(ti), func(t *testing.T) {
 			ma := newMemAlloc(16 << 20)
 			for i, op := range test {
@@ -70,7 +71,7 @@ func TestMemAlloc(t *testing.T) {
 					continue
 				}
 				t.Logf("#%v: alloc(%v) = %v", i, -op.size, op.addr)
-				addr := ma.alloc(nil, uint64(-op.size), op.alignment)
+				addr := ma.alloc(uint64(-op.size), op.alignment)
 				if addr != op.addr {
 					t.Fatalf("bad result %v, expecting %v", addr, op.addr)
 				}
@@ -85,11 +86,11 @@ func TestVmaAlloc(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := newRand(target, randSource(t))
+	r := newRand(target, testutil.RandSource(t))
 	va := newVmaAlloc(1000)
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		size := r.rand(4) + 1
 		page := va.alloc(r, size)
-		t.Logf("alloc(%v) = %3v-%3v\n", size, page, page+size)
+		t.Logf("alloc(%v) = %3v-%3v", size, page, page+size)
 	}
 }

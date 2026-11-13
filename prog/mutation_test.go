@@ -8,6 +8,10 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
+
+	"github.com/google/syzkaller/pkg/testutil"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMutationFlags(t *testing.T) {
@@ -81,9 +85,10 @@ mutate_integer(0x0, 0x1, 0x1, 0x1, 0x0, 0x1, 0x0, 0x0, 0x1)`,
 }
 
 func TestMutateArgument(t *testing.T) {
-	if raceEnabled {
+	if testutil.RaceEnabled {
 		t.Skip("skipping in race mode, too slow")
 	}
+	// nolint: lll
 	tests := [][2]string{
 		// Mutate an integer with a higher priority than the boolean arguments.
 		{
@@ -120,11 +125,19 @@ func TestMutateArgument(t *testing.T) {
 			`mutate_union(&(0x7f0000000000)=@f1=[0x0, 0x1, 0x2, 0x3, 0x0, 0x1, 0x2, 0x3, 0x0, 0x0])`,
 			`mutate_union(&(0x7f0000000000)=@f1=[0x0, 0x1, 0xff, 0x3, 0x0, 0x1, 0x2, 0x3, 0x0, 0x0])`,
 		},
+		// Mutate filename using target.SpecialFileLengths.
+		{
+			`mutate9(&(0x7f0000000000)='./file0\x00')`,
+			`mutate9(&(0x7f0000000040)='./file0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x00')`,
+		},
+		{
+			`mutate10(&(0x7f0000000000)=""/10)`,
+			`mutate10(&(0x7f0000000040)=""/256)`,
+		},
 	}
 
 	target := initTargetTest(t, "test", "64")
 	for ti, test := range tests {
-		test := test
 		t.Run(fmt.Sprint(ti), func(t *testing.T) {
 			t.Parallel()
 			rs, ct, p, goal, err := buildTestContext(test, target)
@@ -132,7 +145,7 @@ func TestMutateArgument(t *testing.T) {
 				t.Fatalf("failed to deserialize the program: %v", err)
 			}
 			want := goal.Serialize()
-			for i := 0; i < 1e5; i++ {
+			for i := range 100000 {
 				p1 := p.Clone()
 				ctx := &mutator{
 					p:      p1,
@@ -140,6 +153,7 @@ func TestMutateArgument(t *testing.T) {
 					ncalls: 2 * len(p.Calls),
 					ct:     ct,
 					corpus: nil,
+					opts:   DefaultMutateOpts,
 				}
 				ctx.mutateArg()
 				data1 := p1.Serialize()
@@ -153,13 +167,103 @@ func TestMutateArgument(t *testing.T) {
 	}
 }
 
+func TestMutateNoSquash(t *testing.T) {
+	target := initTargetTest(t, "test", "64")
+	p, err := target.Deserialize([]byte(`mutate_no_squash(&(0x7f0000000000)={0x1, 0x2, 0x3, 0x4, "5e9ce23b"})`), Strict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := rand.NewSource(0)
+	r := newRand(target, rs)
+	ctx := &mutator{
+		p:      p,
+		r:      r,
+		ncalls: 1,
+		ct:     target.DefaultChoiceTable(),
+		opts:   DefaultMutateOpts,
+	}
+
+	// squashAny should not mutate the program.
+	for range 100 {
+		p1 := p.Clone()
+		ctx.p = p1
+		if ctx.squashAny() {
+			t.Fatalf("squashAny mutated a no_squash call: %s", p1.Serialize())
+		}
+	}
+}
+
+func TestMutateSplice(t *testing.T) {
+	target := initTargetTest(t, "test", "64")
+	p, err := target.Deserialize([]byte(`test$recur0(&(0x7f0000000000)={&(0x7f0000000040)})`), Strict)
+	require.NoError(t, err)
+
+	p0, err := target.Deserialize([]byte(`r0 = mutate5(&(0x7f0000000000)='./file0\x00', 0x0)
+mutate6(r0, &(0x7f0000000040)='\x00', 0x1)
+test$recur0(&(0x7f0000000080)={&(0x7f00000000c0)})
+test$opt1(0x0)
+test$opt2(&(0x7f0000001000/0x1000)=nil)
+`), Strict)
+	require.NoError(t, err)
+
+	ctx := &mutator{
+		p:      p,
+		r:      newRand(target, rand.NewSource(0)),
+		ncalls: 10,
+		ct:     target.DefaultChoiceTable(),
+		corpus: []*Prog{p0},
+		opts:   DefaultMutateOpts,
+	}
+	require.True(t, ctx.splice())
+
+	want := `r0 = mutate5(&(0x7f0000000080)='./file0\x00', 0x0)
+mutate6(r0, &(0x7f00000000c0)='\x00', 0x1)
+test$recur0(&(0x7f0000000100)={&(0x7f0000000140)})
+test$opt1(0x0)
+test$opt2(&(0x7f0000001000/0x1000)=nil)
+test$recur0(&(0x7f0000000000)={&(0x7f0000000040)})
+`
+	assert.Equal(t, want, string(p.Serialize()))
+}
+
+func TestResourceCentricRelocate(t *testing.T) {
+	target := initTargetTest(t, "test", "64")
+	p, err := target.Deserialize([]byte(`mutate9(&(0x7f0000000000)='./file0\x00')`), Strict)
+	require.NoError(t, err)
+
+	p0, err := target.Deserialize([]byte(`r0 = mutate5(&(0x7f0000000000)='./file0\x00', 0x0)
+mutate6(r0, &(0x7f0000000040)='\x00', 0x1)
+`), Strict)
+	require.NoError(t, err)
+
+	ct := target.DefaultChoiceTable()
+	corpus := []*Prog{p0}
+	s := analyze(ct, corpus, p, nil)
+	r := newRand(target, rand.NewSource(0))
+
+	consumerMeta := target.SyscallMap["fallback$1"]
+	resType := consumerMeta.Args[0].Type.(*ResourceType)
+	arg, calls := r.resourceCentric(s, resType, DirIn)
+	require.NotNil(t, arg)
+	require.NotEmpty(t, calls)
+
+	p.Calls = append(p.Calls, calls...)
+	p.Calls = append(p.Calls, MakeCall(consumerMeta, []Arg{arg}))
+	want := `mutate9(&(0x7f0000000000)='./file0\x00')
+r0 = mutate5(&(0x7f0000000040)='./file0\x00', 0x0)
+mutate6(r0, &(0x7f0000000080)='\x00', 0x1)
+fallback$1(r0)
+`
+	assert.Equal(t, want, string(p.Serialize()))
+}
+
 func TestSizeMutateArg(t *testing.T) {
 	target, rs, iters := initRandomTargetTest(t, "test", "64")
 	r := newRand(target, rs)
 	ct := target.DefaultChoiceTable()
-	for i := 0; i < iters; i++ {
+	for range iters {
 		p := target.Generate(rs, 10, ct)
-		for it := 0; it < 10; it++ {
+		for range 10 {
 			p1 := p.Clone()
 			ctx := &mutator{
 				p:      p1,
@@ -167,6 +271,7 @@ func TestSizeMutateArg(t *testing.T) {
 				ncalls: 2 * len(p.Calls),
 				ct:     ct,
 				corpus: nil,
+				opts:   DefaultMutateOpts,
 			}
 			ctx.mutateArg()
 			ForeachArg(p.Calls[0], func(arg Arg, ctx *ArgCtx) {
@@ -177,7 +282,7 @@ func TestSizeMutateArg(t *testing.T) {
 				limit := uint64(1<<bits - 1)
 				val := arg.(*ConstArg).Val
 				if val > limit {
-					t.Fatalf("Invalid argument value: %d. (arg size: %d; max value: %d)", val, arg.Size(), limit)
+					t.Fatalf("invalid argument value: %d. (arg size: %d; max value: %d)", val, arg.Size(), limit)
 				}
 			})
 		}
@@ -187,13 +292,13 @@ func TestSizeMutateArg(t *testing.T) {
 func TestClone(t *testing.T) {
 	target, rs, iters := initTest(t)
 	ct := target.DefaultChoiceTable()
-	for i := 0; i < iters; i++ {
+	for range iters {
 		p := target.Generate(rs, 10, ct)
 		p1 := p.Clone()
 		data := p.Serialize()
 		data1 := p1.Serialize()
 		if !bytes.Equal(data, data1) {
-			t.Fatalf("program changed after clone\noriginal:\n%s\n\nnew:\n%s\n", data, data1)
+			t.Fatalf("program changed after clone\noriginal:\n%s\n\nnew:\n%s", data, data1)
 		}
 	}
 }
@@ -202,17 +307,20 @@ func TestMutateRandom(t *testing.T) {
 	testEachTargetRandom(t, func(t *testing.T, target *Target, rs rand.Source, iters int) {
 		ct := target.DefaultChoiceTable()
 	next:
-		for i := 0; i < iters; i++ {
+		for range iters {
 			p := target.Generate(rs, 10, ct)
+			if p.countArgs() > maxArgCutoff {
+				continue
+			}
 			data0 := p.Serialize()
 			p1 := p.Clone()
 			// There is a chance that mutation will produce the same program.
 			// So we check that at least 1 out of 20 mutations actually change the program.
-			for try := 0; try < 20; try++ {
-				p1.Mutate(rs, 10, ct, nil)
+			for range 20 {
+				p1.Mutate(rs, 10, ct, nil, nil)
 				data := p.Serialize()
 				if !bytes.Equal(data0, data) {
-					t.Fatalf("program changed after mutate\noriginal:\n%s\n\nnew:\n%s\n",
+					t.Fatalf("program changed after mutate\noriginal:\n%s\n\nnew:\n%s",
 						data0, data)
 				}
 				data1 := p1.Serialize()
@@ -220,7 +328,7 @@ func TestMutateRandom(t *testing.T) {
 					continue
 				}
 				if _, err := target.Deserialize(data1, NonStrict); err != nil {
-					t.Fatalf("Deserialize failed after Mutate: %v\n%s", err, data1)
+					t.Fatalf("deserialize failed after mutate: %v\n%s", err, data1)
 				}
 				continue next
 			}
@@ -233,13 +341,13 @@ func TestMutateCorpus(t *testing.T) {
 	target, rs, iters := initTest(t)
 	ct := target.DefaultChoiceTable()
 	var corpus []*Prog
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		p := target.Generate(rs, 10, ct)
 		corpus = append(corpus, p)
 	}
-	for i := 0; i < iters; i++ {
+	for range iters {
 		p1 := target.Generate(rs, 10, ct)
-		p1.Mutate(rs, 10, ct, corpus)
+		p1.Mutate(rs, 10, ct, nil, corpus)
 	}
 }
 
@@ -371,7 +479,7 @@ func BenchmarkMutate(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		rs := rand.NewSource(0)
 		for pb.Next() {
-			p.Clone().Mutate(rs, progLen, ct, nil)
+			p.Clone().Mutate(rs, progLen, ct, nil, nil)
 		}
 	})
 }
@@ -391,12 +499,11 @@ func BenchmarkGenerate(b *testing.B) {
 }
 
 func runMutationTests(t *testing.T, tests [][2]string, valid bool) {
-	if raceEnabled {
+	if testutil.RaceEnabled {
 		t.Skip("skipping in race mode, too slow")
 	}
 	target := initTargetTest(t, "test", "64")
 	for ti, test := range tests {
-		test := test
 		t.Run(fmt.Sprint(ti), func(t *testing.T) {
 			t.Parallel()
 			rs, ct, p, goal, err := buildTestContext(test, target)
@@ -404,13 +511,13 @@ func runMutationTests(t *testing.T, tests [][2]string, valid bool) {
 				t.Fatalf("failed to deserialize the program: %v", err)
 			}
 			want := goal.Serialize()
-			iters := iterCount()
+			iters := testutil.IterCount()
 			if valid {
 				iters = 1e6 // it will stop after reaching the goal
 			}
-			for i := 0; i < iters; i++ {
+			for i := range iters {
 				p1 := p.Clone()
-				p1.Mutate(rs, len(goal.Calls), ct, nil)
+				p1.Mutate(rs, len(goal.Calls), ct, nil, nil)
 				data1 := p1.Serialize()
 				if bytes.Equal(want, data1) {
 					if !valid {
@@ -453,7 +560,7 @@ func BenchmarkStoreLoadInt(b *testing.B) {
 	data := make([]byte, 9)
 	sink = data
 	data = sink.([]byte)[1:]
-	for i := 0; i < b.N; i++ {
+	for i := range b.N {
 		for size := 1; size <= 8; size *= 2 {
 			storeInt(data, uint64(i), size)
 			v := loadInt(data, size)
@@ -464,4 +571,4 @@ func BenchmarkStoreLoadInt(b *testing.B) {
 	}
 }
 
-var sink interface{}
+var sink any

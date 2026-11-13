@@ -7,9 +7,10 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -29,7 +30,7 @@ type errorDesc struct {
 }
 
 func NewErrorMatcher(t *testing.T, file string) *ErrorMatcher {
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
 		t.Fatalf("failed to open input file: %v", err)
 	}
@@ -122,7 +123,7 @@ nextErr:
 			fmt.Fprintf(buf, "%v: %v\n", err.pos, err.msgs[0])
 			continue
 		}
-		sort.Strings(err.msgs)
+		slices.Sort(err.msgs)
 		fmt.Fprintf(buf, "%v:\n\t%v\n", err.pos, strings.Join(err.msgs, "\n\t"))
 	}
 	em.t.Errorf("\n%s", buf.Bytes())

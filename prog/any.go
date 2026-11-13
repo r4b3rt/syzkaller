@@ -13,6 +13,7 @@ type anyTypes struct {
 	blob   *BufferType
 	ptrPtr *PtrType
 	ptr64  *PtrType
+	res8   *ResourceType
 	res16  *ResourceType
 	res32  *ResourceType
 	res64  *ResourceType
@@ -23,7 +24,7 @@ type anyTypes struct {
 
 func (target *Target) initAnyTypes() {
 	var anyPtrs *UnionType
-	for _, typ := range target.types {
+	for _, typ := range target.Types {
 		if typ.Name() == "ANYPTRS" {
 			anyPtrs = typ.(*UnionType)
 			break
@@ -38,18 +39,20 @@ func (target *Target) initAnyTypes() {
 	target.any.array = target.any.ptrPtr.Elem.(*ArrayType)
 	target.any.union = target.any.array.Elem.(*UnionType)
 	target.any.blob = target.any.union.Fields[0].Type.(*BufferType)
-	target.any.res16 = target.any.union.Fields[1].Type.(*ResourceType)
-	target.any.res32 = target.any.union.Fields[2].Type.(*ResourceType)
-	target.any.res64 = target.any.union.Fields[3].Type.(*ResourceType)
-	target.any.resdec = target.any.union.Fields[4].Type.(*ResourceType)
-	target.any.reshex = target.any.union.Fields[5].Type.(*ResourceType)
-	target.any.resoct = target.any.union.Fields[6].Type.(*ResourceType)
+	target.any.res8 = target.any.union.Fields[1].Type.(*ResourceType)
+	target.any.res16 = target.any.union.Fields[2].Type.(*ResourceType)
+	target.any.res32 = target.any.union.Fields[3].Type.(*ResourceType)
+	target.any.res64 = target.any.union.Fields[4].Type.(*ResourceType)
+	target.any.resdec = target.any.union.Fields[5].Type.(*ResourceType)
+	target.any.reshex = target.any.union.Fields[6].Type.(*ResourceType)
+	target.any.resoct = target.any.union.Fields[7].Type.(*ResourceType)
 }
 
 func (target *Target) getAnyPtrType(size uint64) *PtrType {
-	if size == target.PtrSize {
+	switch size {
+	case target.PtrSize:
 		return target.any.ptrPtr
-	} else if size == 8 {
+	case 8:
 		return target.any.ptr64
 	}
 	panic(fmt.Sprintf("bad pointer size %v", size))
@@ -60,11 +63,16 @@ func (target *Target) isAnyPtr(typ Type) bool {
 	return ok && ptr.Elem == target.any.array
 }
 
-func (p *Prog) complexPtrs() (res []*PointerArg) {
+type complexPtr struct {
+	arg  *PointerArg
+	call *Call
+}
+
+func (p *Prog) complexPtrs() (res []complexPtr) {
 	for _, c := range p.Calls {
 		ForeachArg(c, func(arg Arg, ctx *ArgCtx) {
 			if ptrArg, ok := arg.(*PointerArg); ok && p.Target.isComplexPtr(ptrArg) {
-				res = append(res, ptrArg)
+				res = append(res, complexPtr{ptrArg, c})
 				ctx.Stop = true
 			}
 		})
@@ -73,33 +81,33 @@ func (p *Prog) complexPtrs() (res []*PointerArg) {
 }
 
 func (target *Target) isComplexPtr(arg *PointerArg) bool {
-	if arg.Res == nil || arg.Dir() != DirIn {
+	if arg.Res == nil || !arg.Type().(*PtrType).SquashableElem {
 		return false
 	}
 	if target.isAnyPtr(arg.Type()) {
 		return true
 	}
-	complex, hasPtr := false, false
+	complex := false
 	ForeachSubArg(arg.Res, func(a1 Arg, ctx *ArgCtx) {
 		switch typ := a1.Type().(type) {
 		case *StructType:
 			if typ.Varlen() {
 				complex = true
+				ctx.Stop = true
 			}
 		case *UnionType:
 			if typ.Varlen() && len(typ.Fields) > 5 {
 				complex = true
+				ctx.Stop = true
 			}
-		case *PtrType:
-			hasPtr = true
-			ctx.Stop = true
 		}
 	})
-	return complex && !hasPtr
+	return complex
 }
 
 func (target *Target) isAnyRes(name string) bool {
-	return name == target.any.res16.TypeName ||
+	return name == target.any.res8.TypeName ||
+		name == target.any.res16.TypeName ||
 		name == target.any.res32.TypeName ||
 		name == target.any.res64.TypeName ||
 		name == target.any.resdec.TypeName ||
@@ -109,7 +117,7 @@ func (target *Target) isAnyRes(name string) bool {
 
 func (target *Target) CallContainsAny(c *Call) (res bool) {
 	ForeachArg(c, func(arg Arg, ctx *ArgCtx) {
-		if target.isAnyPtr(arg.Type()) {
+		if target.isAnyPtr(arg.Type()) || res {
 			res = true
 			ctx.Stop = true
 		}
@@ -119,7 +127,7 @@ func (target *Target) CallContainsAny(c *Call) (res bool) {
 
 func (target *Target) ArgContainsAny(arg0 Arg) (res bool) {
 	ForeachSubArg(arg0, func(arg Arg, ctx *ArgCtx) {
-		if target.isAnyPtr(arg.Type()) {
+		if target.isAnyPtr(arg.Type()) || res {
 			res = true
 			ctx.Stop = true
 		}
@@ -168,7 +176,7 @@ func (target *Target) squashPtrImpl(a Arg, elems *[]Arg) {
 	case *GroupArg:
 		target.squashGroup(arg, elems)
 	default:
-		panic("bad arg kind")
+		panic(fmt.Sprintf("bad arg kind %v (%#v) %v", a, a, a.Type()))
 	}
 	if pad != 0 {
 		elem := target.ensureDataElem(elems)
@@ -212,42 +220,37 @@ func (target *Target) squashResult(arg *ResultArg, elems *[]Arg) {
 	switch arg.Type().Format() {
 	case FormatNative, FormatBigEndian:
 		switch arg.Size() {
+		case 1:
+			typ, index = target.any.res8, 1
 		case 2:
-			typ, index = target.any.res16, 1
+			typ, index = target.any.res16, 2
 		case 4:
-			typ, index = target.any.res32, 2
+			typ, index = target.any.res32, 3
 		case 8:
-			typ, index = target.any.res64, 3
+			typ, index = target.any.res64, 4
 		default:
-			panic("bad size")
+			panic(fmt.Sprintf("bad size %v", arg.Size()))
 		}
 	case FormatStrDec:
-		typ, index = target.any.resdec, 4
+		typ, index = target.any.resdec, 5
 	case FormatStrHex:
-		typ, index = target.any.reshex, 5
+		typ, index = target.any.reshex, 6
 	case FormatStrOct:
-		typ, index = target.any.resoct, 6
+		typ, index = target.any.resoct, 7
 	default:
 		panic("bad")
 	}
 	arg.ref = typ.ref()
-	arg.dir = DirIn
 	*elems = append(*elems, MakeUnionArg(target.any.union, DirIn, arg, index))
 }
 
 func (target *Target) squashGroup(arg *GroupArg, elems *[]Arg) {
-	var pad uint64
-	if typ, ok := arg.Type().(*StructType); ok && typ.Varlen() && typ.AlignAttr != 0 {
-		var fieldsSize uint64
-		for _, fld := range arg.Inner {
-			fieldsSize += fld.Size()
-		}
-		if fieldsSize%typ.AlignAttr != 0 {
-			pad = typ.AlignAttr - fieldsSize%typ.AlignAttr
-		}
+	if typ, ok := arg.Type().(*StructType); ok && typ.OverlayField != 0 {
+		panic("squashing out_overlay")
 	}
-	var bitfield uint64
+	var bitfield, fieldsSize uint64
 	for _, fld := range arg.Inner {
+		fieldsSize += fld.Size()
 		// Squash bitfields separately.
 		if fld.Type().IsBitfield() {
 			bfLen := fld.Type().BitfieldLength()
@@ -271,7 +274,8 @@ func (target *Target) squashGroup(arg *GroupArg, elems *[]Arg) {
 		}
 		target.squashPtrImpl(fld, elems)
 	}
-	if pad != 0 {
+	// Add padding either due to dynamic alignment or overlay fields.
+	if pad := arg.Size() - fieldsSize; pad != 0 {
 		elem := target.ensureDataElem(elems)
 		elem.data = append(elem.Data(), make([]byte, pad)...)
 	}

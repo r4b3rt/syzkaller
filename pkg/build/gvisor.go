@@ -6,18 +6,14 @@ package build
 import (
 	"fmt"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
-	"github.com/google/syzkaller/sys/targets"
 )
 
 type gvisor struct{}
-
-var bazelTargetPath = regexp.MustCompile(`(?sm:.*^)\s*Outputs: \[(.*)\](?sm:$.*)`)
 
 func (gvisor gvisor) build(params Params) (ImageDetails, error) {
 	if params.Compiler == "" {
@@ -27,90 +23,70 @@ func (gvisor gvisor) build(params Params) (ImageDetails, error) {
 	// Bring down bazel daemon right away. We don't need it running and consuming memory.
 	defer osutil.RunCmd(10*time.Minute, params.KernelDir, params.Compiler, "shutdown")
 
-	config := strings.Fields(string(params.Config))
-	args := []string{}
-
-	target := "//runsc:runsc"
-	race := raceEnabled(config)
-	if race {
-		args = append(args, "--@io_bazel_rules_go//go/config:race")
-		target = "//runsc:runsc-race"
-	}
-	if coverageEnabled(config) {
-		coverageFiles := "//pkg/..."
-		exclusions := []string{
-			"//pkg/sentry/platform", "//pkg/ring0", // Breaks kvm.
-			"//pkg/coverage:coverage", // Too slow.
-		}
-		if race {
-			// These targets use go:norace, which is not
-			// respected by coverage instrumentation. Race builds
-			// will be instrumented with atomic coverage (using
-			// sync/atomic.AddInt32), which will not work.
-			exclusions = append(exclusions, []string{
-				"//pkg/sleep:sleep",
-				"//pkg/syncevent:syncevent",
-			}...)
-		}
-		for _, f := range exclusions {
-			coverageFiles += ",-" + f
-		}
-		args = append(args, []string{
-			"--collect_code_coverage",
-			"--instrumentation_filter=" + coverageFiles}...)
-	}
-	buildArgs := []string{"build", "--verbose_failures"}
-	buildArgs = append(buildArgs, args...)
-	buildArgs = append(buildArgs, target)
-	log.Logf(0, "bazel: %v", buildArgs)
-	// The 1 hour timeout is quite high. But we've seen false positives with 20 mins
-	// on the first build after bazel/deps update. Also other gvisor instances running
-	// on the same machine contribute to longer build times.
-	if _, err := osutil.RunCmd(60*time.Minute, params.KernelDir, params.Compiler, buildArgs...); err != nil {
-		return ImageDetails{}, err
-	}
-
-	// Find out a path to the runsc binary.
-	aqueryArgs := append([]string{"aquery"}, args...)
-	aqueryArgs = append(aqueryArgs, fmt.Sprintf("mnemonic(\"GoLink\", %s)", target))
-	log.Logf(0, "bazel: %v", aqueryArgs)
-	out, err := osutil.RunCmd(time.Minute, params.KernelDir, params.Compiler, aqueryArgs...)
+	config, err := parseGVisorConfig(params.Config)
 	if err != nil {
-		return ImageDetails{}, err
+		return ImageDetails{}, fmt.Errorf("cannot parse gVisor configuration: %w", err)
 	}
 
-	match := bazelTargetPath.FindSubmatch(out)
-	if match == nil {
-		return ImageDetails{}, fmt.Errorf("failed to find the runsc binary")
-	}
-	outBinary := filepath.Join(params.KernelDir, filepath.FromSlash(string(match[1])))
-
-	if err := osutil.CopyFile(outBinary, filepath.Join(params.OutputDir, "image")); err != nil {
-		return ImageDetails{}, err
-	}
-	sysTarget := targets.Get(params.TargetOS, params.TargetArch)
-	return ImageDetails{}, osutil.CopyFile(outBinary, filepath.Join(params.OutputDir, "obj", sysTarget.KernelObject))
+	image := filepath.Join(params.OutputDir, "image")
+	cmd := osutil.Command("make", "copy",
+		"DOCKER_BUILD=0",
+		"BAZEL_OPTIONS=--verbose_failures",
+		fmt.Sprintf("TARGETS=%s", config.releaseTarget()),
+		fmt.Sprintf("DESTINATION=%s", image),
+	)
+	cmd.Dir = params.KernelDir
+	log.Logf(0, "bazel copy: %v", cmd.Args)
+	_, err = osutil.Run(60*time.Minute, cmd)
+	return ImageDetails{}, err
 }
 
-func (gvisor) clean(kernelDir, targetArch string) error {
+func (gvisor) clean(params Params) error {
 	// Let's assume that bazel always properly handles build without cleaning (until proven otherwise).
 	return nil
 }
 
-func coverageEnabled(config []string) bool {
-	for _, flag := range config {
-		if flag == "-cover" {
-			return true
-		}
-	}
-	return false
+// Known gVisor configuration flags.
+const (
+	gvisorFlagCover = "-cover"
+	gvisorFlagRace  = "-race"
+)
+
+// gvisorConfig is a gVisor configuration.
+type gvisorConfig struct {
+	// Coverage represents whether code coverage is enabled.
+	Coverage bool
+
+	// Race represents whether race condition detection is enabled.
+	Race bool
 }
 
-func raceEnabled(config []string) bool {
-	for _, flag := range config {
-		if flag == "-race" {
-			return true
+// releaseTarget returns the bazel target of the gVisor release tarball for the configuration.
+func (cfg gvisorConfig) releaseTarget() string {
+	switch {
+	case cfg.Coverage && cfg.Race:
+		return "//debian:gvisor-release-race-coverage-tar-bz2"
+	case cfg.Coverage:
+		return "//debian:gvisor-release-coverage-tar-bz2"
+	case cfg.Race:
+		return "//debian:gvisor-release-race-tar-bz2"
+	default:
+		return "//debian:gvisor-release-tar-bz2"
+	}
+}
+
+// parseGVisorConfig parses a set of flags into a `gvisorConfig`.
+func parseGVisorConfig(config []byte) (gvisorConfig, error) {
+	var cfg gvisorConfig
+	for flag := range strings.FieldsSeq(string(config)) {
+		switch flag {
+		case gvisorFlagCover:
+			cfg.Coverage = true
+		case gvisorFlagRace:
+			cfg.Race = true
+		default:
+			return cfg, fmt.Errorf("unknown gVisor configuration flag: %q", flag)
 		}
 	}
-	return false
+	return cfg, nil
 }

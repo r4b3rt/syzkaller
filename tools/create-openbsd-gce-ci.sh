@@ -7,7 +7,7 @@
 
 # Mostly derived from Go buildlet generator with blessing from bradfitz@.
 
-set -eu -o pipefail
+set -eux -o pipefail
 
 readonly MIRROR="${MIRROR:-cdn.openbsd.org}"
 # The only supported setting.
@@ -29,9 +29,10 @@ fi
 rm -fr etc && mkdir -p etc
 cat >install.site <<EOF
 #!/bin/sh
-PKGS="bash gcc%8 git gmake go llvm nano wget"
+PKGS="bash gcc%16 git gmake go llvm%22 nano wget"
 PKG_PATH=${SNAPSHOTS}packages/${ARCH}/ pkg_add -I \$PKGS
 PKG_PATH= pkg_info -I \$PKGS && echo pkg_add OK
+ln -s /usr/local/bin/clang-format{-22,}
 
 echo 'set tty com0' > boot.conf
 echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config
@@ -40,6 +41,11 @@ echo 'permit keepenv nopass syzkaller as root' > /etc/doas.conf
 
 mkdir /syzkaller
 echo '/dev/sd1a /syzkaller ffs rw,noauto 1 0' >> /etc/fstab
+
+CLANG_LIB=\$(echo /usr/lib/clang/*/lib)
+mkdir -p \$CLANG_LIB/openbsd
+ln -s \$CLANG_LIB/libclang_rt.ubsan_minimal.a \$CLANG_LIB/openbsd/libclang_rt.ubsan_standalone-x86_64.a
+touch \$CLANG_LIB/openbsd/libclang_rt.ubsan_standalone_cxx-x86_64.a
 EOF
 
 cat >etc/installurl <<EOF
@@ -62,14 +68,21 @@ EOF2
   echo "starting syz-ci"
   fsck -y /dev/sd1a
   mount /syzkaller
-  su -l syzkaller <<EOF2
+  su -c vmd -l syzkaller <<EOF2
     cd /syzkaller
+    export HOME=/syzkaller
     set -eux
-    ulimit -d 8000000
-    test -x syz-ci || (
-         go get github.com/google/syzkaller/syz-ci &&
-         go build github.com/google/syzkaller/syz-ci)
-    ./syz-ci -config ./config-openbsd.ci 2>&1 | tee syz-ci.log &
+    ulimit -n 1024 -d 16000000
+    mkdir -p /syzkaller/go-cache
+    export GOCACHE=/syzkaller/go-cache
+    test -d /syzkaller/gopath/src/github.com/google/syzkaller || (
+	mkdir -p /syzkaller/gopath/src/github.com/google && \
+	git clone https://github.com/google/syzkaller.git && \
+	mv syzkaller /syzkaller/gopath/src/github.com/google)
+    (cd /syzkaller/gopath/src/github.com/google/syzkaller && \
+        gmake ci && \
+	install bin/syz-ci /syzkaller)
+    ./syz-ci -config /syzkaller/gopath/src/github.com/google/syzkaller/dashboard/config/openbsd/config.ci 2>&1 | tee /syzkaller/syz-ci.log &
 EOF2
 )
 EOF
@@ -201,7 +214,7 @@ Done.
 
 To create GCE image run the following commands:
 
-gsutil cp -a public-read "$i" gs://syzkaller/
+gcloud storage cp --billing-project=syzkaller --predefined-acl=publicRead "$i" gs://syzkaller/
 gcloud compute images create ci-openbsd-root --source-uri gs://syzkaller/"$i"
 
 EOF

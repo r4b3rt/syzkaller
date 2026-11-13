@@ -1,48 +1,45 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package config handles reading, parsing, and merging JSON configuration files.
 package config
 
 import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"regexp"
 
 	"github.com/google/syzkaller/pkg/osutil"
 )
 
-func LoadFile(filename string, cfg interface{}) error {
+func LoadFile(filename string, cfg any) error {
 	if filename == "" {
 		return fmt.Errorf("no config file specified")
 	}
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
-		return fmt.Errorf("failed to read config file: %v", err)
+		return fmt.Errorf("failed to read config file: %w", err)
 	}
 	return LoadData(data, cfg)
 }
 
-func LoadData(data []byte, cfg interface{}) error {
+func LoadData(data []byte, cfg any) error {
 	// Remove comment lines starting with #.
-	data = regexp.MustCompile(`(^|\n)\s*#.*?\n`).ReplaceAll(data, nil)
+	data = regexp.MustCompile(`(^|\n)\s*#[^\n]*`).ReplaceAll(data, nil)
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(cfg); err != nil {
-		return fmt.Errorf("failed to parse config file: %v", err)
+		return fmt.Errorf("failed to parse config file: %w", err)
 	}
 	return nil
 }
 
-func SaveFile(filename string, cfg interface{}) error {
-	data, err := SaveData(cfg)
+func SaveFile(filename string, cfg any) error {
+	data, err := json.MarshalIndent(cfg, "", "\t")
 	if err != nil {
 		return err
 	}
 	return osutil.WriteFile(filename, data)
-}
-
-func SaveData(cfg interface{}) ([]byte, error) {
-	return json.MarshalIndent(cfg, "", "\t")
 }

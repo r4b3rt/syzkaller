@@ -4,6 +4,7 @@
 package vmimpl
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,7 +13,7 @@ import (
 	"github.com/google/syzkaller/sys/targets"
 )
 
-// Sleep for d.
+// SleepInterruptible sleeps for d.
 // If shutdown is in progress, return false prematurely.
 func SleepInterruptible(d time.Duration) bool {
 	select {
@@ -23,7 +24,14 @@ func SleepInterruptible(d time.Duration) bool {
 	}
 }
 
-func WaitForSSH(debug bool, timeout time.Duration, addr, sshKey, sshUser, OS string, port int, stop chan error) error {
+type SSHOptions struct {
+	Addr string
+	Port int
+	User string
+	Key  string
+}
+
+func WaitForSSH(timeout time.Duration, opts SSHOptions, OS string, stop <-chan error, systemSSHCfg, debug bool) error {
 	pwd := "pwd"
 	if OS == targets.Windows {
 		pwd = "dir"
@@ -38,7 +46,7 @@ func WaitForSSH(debug bool, timeout time.Duration, addr, sshKey, sshUser, OS str
 		case <-Shutdown:
 			return fmt.Errorf("shutdown in progress")
 		}
-		args := append(SSHArgs(debug, sshKey, port), sshUser+"@"+addr, pwd)
+		args := append(SSHArgs(debug, opts.Key, opts.Port, systemSSHCfg), opts.User+"@"+opts.Addr, pwd)
 		if debug {
 			log.Logf(0, "running ssh: %#v", args)
 		}
@@ -50,33 +58,41 @@ func WaitForSSH(debug bool, timeout time.Duration, addr, sshKey, sshUser, OS str
 			log.Logf(0, "ssh failed: %v", err)
 		}
 		if time.Since(startTime) > timeout {
-			return &osutil.VerboseError{Title: "can't ssh into the instance", Output: []byte(err.Error())}
+			return &osutil.VerboseError{
+				Err:    ErrCantSSH,
+				Output: []byte(osutil.VerboseMessage(err)),
+			}
 		}
 	}
 }
 
-func SSHArgs(debug bool, sshKey string, port int) []string {
-	return sshArgs(debug, sshKey, "-p", port, 0)
+var ErrCantSSH = fmt.Errorf("can't ssh into the instance")
+
+func SSHArgs(debug bool, sshKey string, port int, systemSSHCfg bool) []string {
+	return sshArgs(debug, sshKey, "-p", port, 0, systemSSHCfg)
 }
 
-func SSHArgsForward(debug bool, sshKey string, port, forwardPort int) []string {
-	return sshArgs(debug, sshKey, "-p", port, forwardPort)
+func SSHArgsForward(debug bool, sshKey string, port, forwardPort int, systemSSHCfg bool) []string {
+	return sshArgs(debug, sshKey, "-p", port, forwardPort, systemSSHCfg)
 }
 
-func SCPArgs(debug bool, sshKey string, port int) []string {
-	return sshArgs(debug, sshKey, "-P", port, 0)
+func scpArgs(debug bool, sshKey string, port int, systemSSHCfg bool) []string {
+	return append(sshArgs(debug, sshKey, "-P", port, 0, systemSSHCfg), "-O") // Default to legacy scp protocol.
 }
 
-func sshArgs(debug bool, sshKey, portArg string, port, forwardPort int) []string {
-	args := []string{
-		portArg, fmt.Sprint(port),
-		"-F", "/dev/null",
-		"-o", "UserKnownHostsFile=/dev/null",
+func sshArgs(debug bool, sshKey, portArg string, port, forwardPort int, systemSSHCfg bool) []string {
+	args := []string{portArg, fmt.Sprint(port)}
+	if !systemSSHCfg {
+		args = append(args,
+			"-F", "/dev/null",
+			"-o", "UserKnownHostsFile=/dev/null",
+			"-o", "IdentitiesOnly=yes")
+	}
+	args = append(args,
 		"-o", "BatchMode=yes",
-		"-o", "IdentitiesOnly=yes",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "ConnectTimeout=10",
-	}
+	)
 	if sshKey != "" {
 		args = append(args, "-i", sshKey)
 	}
@@ -88,4 +104,39 @@ func sshArgs(debug bool, sshKey, portArg string, port, forwardPort int) []string
 		args = append(args, "-v")
 	}
 	return args
+}
+
+type SCPOptions struct {
+	Debug         bool
+	Key           string
+	Port          int
+	SystemSSHCfg  bool
+	User          string
+	Addr          string
+	Timeout       time.Duration
+	Dir           string
+	VerboseOutput bool
+}
+
+func SCP(hostSrc, vmDst string, opts SCPOptions) error {
+	args := append(scpArgs(opts.VerboseOutput, opts.Key, opts.Port, opts.SystemSSHCfg),
+		hostSrc, opts.User+"@"+opts.Addr+":"+vmDst)
+	if opts.Debug {
+		log.Logf(0, "running command: scp %#v", args)
+	}
+	timeout := opts.Timeout
+	if timeout == 0 {
+		timeout = 10 * time.Minute
+	}
+	output, err := osutil.RunCmd(timeout, opts.Dir, "scp", args...)
+	if err != nil {
+		if verr, ok := errors.AsType[*osutil.VerboseError](err); ok {
+			log.Logf(0, "scp failed: %v\n%s", err, string(verr.Output))
+		}
+		return fmt.Errorf("scp failed: %w", err)
+	}
+	if opts.Debug {
+		log.Logf(0, "result: %s", output)
+	}
+	return nil
 }

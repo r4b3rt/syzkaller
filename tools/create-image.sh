@@ -7,7 +7,6 @@
 set -eux
 
 # Create a minimal Debian distribution in a directory.
-DIR=chroot
 PREINSTALL_PKGS=openssh-server,curl,tar,gcc,libc6-dev,time,strace,sudo,less,psmisc,selinux-utils,policycoreutils,checkpolicy,selinux-policy-default,firmware-atheros,debian-ports-archive-keyring
 
 # If ADD_PACKAGE is not defined as an external environment variable, use our default packages
@@ -17,28 +16,31 @@ fi
 
 # Variables affected by options
 ARCH=$(uname -m)
-RELEASE=stretch
+RELEASE=trixie
 FEATURE=minimal
 SEEK=2047
 PERF=false
 
 # Display help function
 display_help() {
-    echo "Usage: $0 [option...] " >&2
+    echo "Usage: $0 [option...] "
     echo
-    echo "   -a, --arch                 Set architecture"
-    echo "   -d, --distribution         Set on which debian distribution to create"
-    echo "   -f, --feature              Check what packages to install in the image, options are minimal, full"
-    echo "   -s, --seek                 Image size (MB), default 2048 (2G)"
+    echo "   -a, --arch                 Set architecture (default: $ARCH)"
+    echo "   -d, --distribution         Set on which Debian distribution to create (default: $RELEASE)"
+    echo "   -f, --feature              Check what packages to install in the image, options are minimal, full (default: $FEATURE)"
     echo "   -h, --help                 Display help message"
-    echo "   -p, --add-perf             Add perf support with this option enabled. Please set envrionment variable \$KERNEL at first"
+    echo "   -o, --output               Set output prefix (default: value of --distribution)"
+    echo "   -p, --add-perf             Add perf support. Requires environment variable \$KERNEL pointing to kernel source tree"
+    echo "   -s, --seek                 Image size in MB (default: $(($SEEK + 1)))"
     echo
+    echo "The chroot will be created in ./<output>, the final image will be created in ./<output>.img, and SSH keys will be named"
+    echo "./<output>.id_rsa[.pub]."
 }
 
 while true; do
     if [ $# -eq 0 ];then
-	echo $#
-	break
+        echo $#
+        break
     fi
     case "$1" in
         -h | --help)
@@ -46,24 +48,33 @@ while true; do
             exit 0
             ;;
         -a | --arch)
-	    ARCH=$2
+            ARCH=$2
             shift 2
             ;;
         -d | --distribution)
-	    RELEASE=$2
+            RELEASE=$2
             shift 2
             ;;
         -f | --feature)
-	    FEATURE=$2
+            FEATURE=$2
             shift 2
             ;;
-        -s | --seek)
-	    SEEK=$(($2 - 1))
+        -o | --output)
+            if [[ "$2" == *"/"* || "$2" == *" "* || "$2" == "." || "$2" == ".." ]]
+            then
+                echo "Error: output prefix cannot contain /, spaces, or be . or .."
+                exit 1
+            fi
+            OUTPUT="$2"
             shift 2
             ;;
         -p | --add-perf)
-	    PERF=true
+            PERF=true
             shift 1
+            ;;
+        -s | --seek)
+            SEEK=$(($2 - 1))
+            shift 2
             ;;
         -*)
             echo "Error: Unknown option: $1" >&2
@@ -128,13 +139,14 @@ if [ $FEATURE = "full" ]; then
     PREINSTALL_PKGS=$PREINSTALL_PKGS","$ADD_PACKAGE
 fi
 
+DIR="${OUTPUT:-$RELEASE}"
 sudo rm -rf $DIR
 sudo mkdir -p $DIR
 sudo chmod 0755 $DIR
 
 # 1. debootstrap stage
 
-DEBOOTSTRAP_PARAMS="--arch=$DEBARCH --include=$PREINSTALL_PKGS --components=main,contrib,non-free $RELEASE $DIR"
+DEBOOTSTRAP_PARAMS="--arch=$DEBARCH --include=$PREINSTALL_PKGS --components=main,contrib,non-free,non-free-firmware $RELEASE $DIR"
 if [ $FOREIGN = "true" ]; then
     DEBOOTSTRAP_PARAMS="--foreign $DEBOOTSTRAP_PARAMS"
 fi
@@ -144,7 +156,16 @@ fi
 if [ $DEBARCH == "riscv64" ]; then
     DEBOOTSTRAP_PARAMS="--keyring /usr/share/keyrings/debian-ports-archive-keyring.gpg --exclude firmware-atheros $DEBOOTSTRAP_PARAMS http://deb.debian.org/debian-ports"
 fi
-sudo debootstrap $DEBOOTSTRAP_PARAMS
+
+# debootstrap may fail for EoL Debian releases
+RET=0
+sudo --preserve-env=http_proxy,https_proxy,ftp_proxy,no_proxy debootstrap $DEBOOTSTRAP_PARAMS || RET=$?
+
+if [ $RET != 0 ] && [ $DEBARCH != "riscv64" ]; then
+    # Try running debootstrap again using the Debian archive
+    DEBOOTSTRAP_PARAMS="--keyring /usr/share/keyrings/debian-archive-removed-keys.gpg $DEBOOTSTRAP_PARAMS https://archive.debian.org/debian-archive/debian/"
+    sudo --preserve-env=http_proxy,https_proxy,ftp_proxy,no_proxy debootstrap $DEBOOTSTRAP_PARAMS
+fi
 
 # 2. debootstrap stage: only necessary if target != host architecture
 
@@ -163,17 +184,19 @@ echo 'securityfs /sys/kernel/security securityfs defaults 0 0' | sudo tee -a $DI
 echo 'configfs /sys/kernel/config/ configfs defaults 0 0' | sudo tee -a $DIR/etc/fstab
 echo 'binfmt_misc /proc/sys/fs/binfmt_misc binfmt_misc defaults 0 0' | sudo tee -a $DIR/etc/fstab
 echo -en "127.0.0.1\tlocalhost\n" | sudo tee $DIR/etc/hosts
-echo "nameserver 8.8.8.8" | sudo tee -a $DIR/etc/resolve.conf
+echo "nameserver 8.8.8.8" | sudo tee -a $DIR/etc/resolv.conf
 echo "syzkaller" | sudo tee $DIR/etc/hostname
-ssh-keygen -f $RELEASE.id_rsa -t rsa -N ''
+ssh-keygen -f $DIR.id_rsa -t rsa -N ''
 sudo mkdir -p $DIR/root/.ssh/
-cat $RELEASE.id_rsa.pub | sudo tee $DIR/root/.ssh/authorized_keys
+cat $DIR.id_rsa.pub | sudo tee $DIR/root/.ssh/authorized_keys
 
 # Add perf support
 if [ $PERF = "true" ]; then
     cp -r $KERNEL $DIR/tmp/
     BASENAME=$(basename $KERNEL)
     sudo chroot $DIR /bin/bash -c "apt-get update; apt-get install -y flex bison python-dev libelf-dev libunwind8-dev libaudit-dev libslang2-dev libperl-dev binutils-dev liblzma-dev libnuma-dev"
+    sudo chroot $DIR /bin/bash -c "apt-get install -y make pkg-config systemtap-sdt-dev libssl-dev libdw-dev libpfm4-dev libtraceevent-dev"
+    sudo chroot $DIR /bin/bash -c "apt-get install -y python3-setuptools python3-nitime"
     sudo chroot $DIR /bin/bash -c "cd /tmp/$BASENAME/tools/perf/; make"
     sudo chroot $DIR /bin/bash -c "cp /tmp/$BASENAME/tools/perf/perf /usr/bin/"
     rm -r $DIR/tmp/$BASENAME
@@ -184,9 +207,9 @@ fi
 echo 'ATTR{name}=="vim2m", SYMLINK+="vim2m"' | sudo tee -a $DIR/etc/udev/rules.d/50-udev-default.rules
 
 # Build a disk image
-dd if=/dev/zero of=$RELEASE.img bs=1M seek=$SEEK count=1
-sudo mkfs.ext4 -F $RELEASE.img
+dd if=/dev/zero of=$DIR.img bs=1M seek=$SEEK count=1
+sudo mkfs.ext4 -F $DIR.img
 sudo mkdir -p /mnt/$DIR
-sudo mount -o loop $RELEASE.img /mnt/$DIR
+sudo mount -o loop $DIR.img /mnt/$DIR
 sudo cp -a $DIR/. /mnt/$DIR/.
 sudo umount /mnt/$DIR

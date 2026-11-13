@@ -6,7 +6,7 @@ include <net/bluetooth/hci_sock.h>
 include <net/bluetooth/sco.h>
 include <net/bluetooth/hci.h>
 
-syz_emit_vhci(data ptr[in, vhci_pkt], size bytesize[data])
+syz_emit_vhci(data ptr[in, vhci_pkt], size bytesize[data]) (remote_cover)
 
 # Matches HCI_HANDLE_1/HCI_HANDLE_2 in executor/common_linux.h.
 hci_handles = 200, 201
@@ -47,6 +47,9 @@ vhci_vendor_pkt {
 	opcode	flags[vhci_vendor_pkt_opcode, int8]
 }
 
+define HCI_PRIMARY	0x00
+define HCI_AMP	0x01
+
 vhci_vendor_pkt_opcode = HCI_PRIMARY, HCI_AMP, HCI_EXTERNAL_CONFIG, HCI_RAW_DEVICE
 
 type hci_acl_hdr[DATA] {
@@ -84,6 +87,18 @@ hci_cis_params {
 	m_rtn	int8
 	s_rtn	int8
 } [packed]
+
+# TODO: remove these definitions when they are no more present in LTS kernels.
+define HCI_OP_CREATE_PHY_LINK	0x0435
+define HCI_OP_ACCEPT_PHY_LINK	0x0436
+define HCI_OP_DISCONN_PHY_LINK	0x0437
+define HCI_OP_CREATE_LOGICAL_LINK	0x0438
+define HCI_OP_ACCEPT_LOGICAL_LINK	0x0439
+define HCI_OP_DISCONN_LOGICAL_LINK	0x043a
+define HCI_OP_LOGICAL_LINK_CANCEL	0x043b
+define HCI_OP_READ_LOCAL_AMP_INFO	0x1409
+define HCI_OP_READ_LOCAL_AMP_ASSOC	0x140a
+define HCI_OP_WRITE_REMOTE_AMP_ASSOC	0x140b
 
 hci_command_hdr_un [
 	accept_conn_req			hci_command_packet_t[HCI_OP_ACCEPT_CONN_REQ, hci_cp_accept_conn_req]
@@ -899,7 +914,7 @@ hci_ev_le_meta_un [
 	hci_ev_le_data_len_change	hci_ev_le_meta_t[HCI_EV_LE_DATA_LEN_CHANGE, hci_ev_le_data_len_change]
 	hci_ev_le_direct_adv_info	hci_ev_le_meta_t[HCI_EV_LE_DIRECT_ADV_REPORT, hci_ev_le_direct_adv_info]
 	hci_ev_le_enh_conn_complete	hci_ev_le_meta_t[HCI_EV_LE_ENHANCED_CONN_COMPLETE, hci_ev_le_enh_conn_complete]
-	hci_ev_le_ext_adv_report	hci_ev_le_meta_t[HCI_EV_LE_EXT_ADV_REPORT, hci_ev_le_ext_adv_report_t]
+	hci_ev_le_ext_adv_report	hci_ev_le_meta_t[HCI_EV_LE_EXT_ADV_REPORT, hci_ev_le_ext_adv_report]
 	hci_ev_le_ltk_req		hci_ev_le_meta_t[HCI_EV_LE_LTK_REQ, hci_ev_le_ltk_req]
 	hci_ev_le_phy_update_complete	hci_ev_le_meta_t[HCI_EV_LE_PHY_UPDATE_COMPLETE, hci_ev_le_phy_update_complete]
 	hci_ev_le_remote_conn_param_req	hci_ev_le_meta_t[HCI_EV_LE_REMOTE_CONN_PARAM_REQ, hci_ev_le_remote_conn_param_req]
@@ -1220,13 +1235,13 @@ hci_ev_le_enh_conn_complete {
 	clk_accurancy		int8
 } [packed]
 
-hci_ev_le_ext_adv_report_t {
-	num_reports	len[reports, int8]
-	reports		array[hci_ev_le_ext_adv_report]
+hci_ev_le_ext_adv_report {
+	num	len[info, int8]
+	info	array[hci_ev_le_ext_adv_info]
 } [packed]
 
-hci_ev_le_ext_adv_report {
-	evt_type		flags[hci_legacy_adv_evt_type, int16]
+hci_ev_le_ext_adv_info {
+	type			flags[hci_legacy_adv_evt_type, int16]
 	bdaddr_type		flags[bdaddr_types, int8]
 	bdaddr			bdaddr_t
 	primary_phy		int8
@@ -1478,7 +1493,7 @@ hci_rp_delete_reserved_lt_addr {
 
 hci_rp_delete_stored_link_key {
 	status		int8
-	num_keys	int8
+	num_keys	int16
 } [packed]
 
 hci_rp_le_ltk_neg_reply {
@@ -1766,8 +1781,8 @@ hci_rp_read_ssp_mode {
 
 hci_rp_read_stored_link_key {
 	status		int8
-	max_keys	int8
-	num_keys	int8
+	max_keys	int16
+	num_keys	int16
 } [packed]
 
 hci_rp_read_tx_power {

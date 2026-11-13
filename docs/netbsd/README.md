@@ -30,8 +30,8 @@ At this point you should have a NetBSD distribution in `$HOME/netbsd/dest`.
 
 2. Clone the syzkaller repository.
 	```sh
-	host$ go get -u -d github.com/google/syzkaller/prog
-	host$ cd ~/go/src/github.com/google/syzkaller
+	host$ git clone https://github.com/google/syzkaller
+	host$ cd syzkaller
 	```
 
 3. Compile syzkaller for NetBSD.
@@ -201,8 +201,8 @@ ssh -i netbsd-image.key -p 10022 -o IdentitiesOnly=yes root@localhost /sbin/rebo
 
 ## Missing things
 
-- Automating the configuation changes (like appending to config files), generating the json config file on the fly (with customizable values to the keys using command line parameters) and calling syz-manager with `anita` using just a single command.
+- Automating the configuration changes (like appending to config files), generating the json config file on the fly (with customizable values to the keys using command line parameters) and calling syz-manager with `anita` using just a single command.
 - System call descriptions. `sys/netbsd/*.txt` is a dirty copy from `sys/linux/*.txt` with everything that does not compile dropped. We need to go through syscalls and verify/fix/extend them, including devices/ioctls/etc.
 - Currently only `amd64` arch is supported. Supporting `386` would be useful, because it should cover compat paths. Also, we could do testing of the linux-compatibility subsystem.
 - `pkg/host` needs to be taught how to detect supported syscalls/devices.
-- On Linux we have emission of exernal networking/USB traffic into kernel using tun/gadgetfs. Implementing these for NetBSD could uncover a number of high-profile bugs.
+- On Linux we have emission of external networking/USB traffic into kernel using tun/gadgetfs. Implementing these for NetBSD could uncover a number of high-profile bugs.

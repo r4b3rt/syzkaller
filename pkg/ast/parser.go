@@ -6,8 +6,9 @@ package ast
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -62,7 +63,7 @@ func ParseGlob(glob string, errorHandler ErrorHandler) *Description {
 	}
 	desc := &Description{}
 	for _, f := range files {
-		data, err := ioutil.ReadFile(f)
+		data, err := os.ReadFile(f)
 		if err != nil {
 			errorHandler(Pos{}, fmt.Sprintf("failed to read input file: %v", err))
 			return nil
@@ -128,7 +129,10 @@ func (p *parser) parseTop() Node {
 		return p.parseResource()
 	case tokIdent:
 		name := p.parseIdent()
-		if name.Name == "type" {
+		switch name.Name {
+		case "meta":
+			return p.parseMeta()
+		case "type":
 			return p.parseTypeDef()
 		}
 		switch p.tok {
@@ -168,16 +172,14 @@ func (p *parser) tryConsume(tok token) bool {
 }
 
 func (p *parser) expect(tokens ...token) {
-	for _, tok := range tokens {
-		if p.tok == tok {
-			return
-		}
+	if slices.Contains(tokens, p.tok) {
+		return
 	}
 	var str []string
 	for _, tok := range tokens {
 		str = append(str, tok.String())
 	}
-	p.s.Error(p.pos, fmt.Sprintf("unexpected %v, expecting %v", p.tok, strings.Join(str, ", ")))
+	p.s.Errorf(p.pos, "unexpected %v, expecting %v", p.tok, strings.Join(str, ", "))
 	panic(errSkipLine)
 }
 
@@ -188,6 +190,13 @@ func (p *parser) parseComment() *Comment {
 	}
 	p.consume(tokComment)
 	return c
+}
+
+func (p *parser) parseMeta() *Meta {
+	return &Meta{
+		Pos:   p.pos,
+		Value: p.parseType(),
+	}
 }
 
 func (p *parser) parseDefine() *Define {
@@ -309,11 +318,11 @@ func (p *parser) parseCall(name *Ident) *Call {
 }
 
 func callName(s string) string {
-	pos := strings.IndexByte(s, '$')
-	if pos == -1 {
+	before, _, ok := strings.Cut(s, "$")
+	if !ok {
 		return s
 	}
-	return s[:pos]
+	return before
 }
 
 func (p *parser) parseFlags(name *Ident) Node {
@@ -423,7 +432,59 @@ func (p *parser) parseField(parseAttrs bool) *Field {
 	return field
 }
 
+type operatorInfo struct {
+	op   Operator
+	prio int
+}
+
+const maxOperatorPrio = 2
+
+// The highest priority is 0.
+var binaryOperators = map[token]operatorInfo{
+	tokOr:     {op: OperatorOr, prio: 0},
+	tokCmpEq:  {op: OperatorCompareEq, prio: 1},
+	tokCmpNeq: {op: OperatorCompareNeq, prio: 1},
+	tokBinAnd: {op: OperatorBinaryAnd, prio: 2},
+}
+
+// Parse out a single Type object, which can either be a plain object or an expression.
+// For now, only expressions constructed via '(', ')', "==", "!=", '&', '||' are supported.
 func (p *parser) parseType() *Type {
+	return p.parseBinaryExpr(0)
+}
+
+func (p *parser) parseBinaryExpr(expectPrio int) *Type {
+	if expectPrio > maxOperatorPrio {
+		return p.parseExprFactor()
+	}
+	lastPos := p.pos
+	curr := p.parseBinaryExpr(expectPrio + 1)
+	for {
+		info, ok := binaryOperators[p.tok]
+		if !ok || info.prio != expectPrio {
+			return curr
+		}
+		p.consume(p.tok)
+		curr = &Type{
+			Pos: lastPos,
+			Expression: &BinaryExpression{
+				Pos:      p.pos,
+				Operator: info.op,
+				Left:     curr,
+				Right:    p.parseBinaryExpr(expectPrio + 1),
+			},
+		}
+		lastPos = p.pos
+	}
+}
+
+func (p *parser) parseExprFactor() *Type {
+	if p.tok == tokLParen {
+		p.consume(tokLParen)
+		ret := p.parseBinaryExpr(0)
+		p.consume(tokRParen)
+		return ret
+	}
 	arg := &Type{
 		Pos: p.pos,
 	}
@@ -487,7 +548,7 @@ func (p *parser) parseIdent() *Ident {
 }
 
 func (p *parser) parseString() *String {
-	p.expect(tokString, tokStringHex)
+	p.expect(tokString, tokStringHex, tokIdent)
 	str := &String{
 		Pos:   p.pos,
 		Value: p.lit,
@@ -503,6 +564,8 @@ func strTokToFmt(tok token) StrFmt {
 		return StrFmtRaw
 	case tokStringHex:
 		return StrFmtHex
+	case tokIdent:
+		return StrFmtIdent
 	default:
 		panic("bad string token")
 	}

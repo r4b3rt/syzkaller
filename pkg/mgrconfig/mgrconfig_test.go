@@ -10,6 +10,7 @@ import (
 	"github.com/google/syzkaller/pkg/config"
 	. "github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/vm/gce"
+	"github.com/google/syzkaller/vm/proxyapp"
 	"github.com/google/syzkaller/vm/qemu"
 )
 
@@ -24,12 +25,14 @@ func TestCanned(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var vmCfg interface{}
+			var vmCfg any
 			switch cfg.Type {
 			case "qemu":
 				vmCfg = new(qemu.Config)
 			case "gce":
 				vmCfg = new(gce.Config)
+			case "proxyapp":
+				vmCfg = new(proxyapp.Config)
 			default:
 				t.Fatalf("unknown VM type: %v", cfg.Type)
 			}

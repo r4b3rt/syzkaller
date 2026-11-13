@@ -2,7 +2,7 @@
 # Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 config:
- - SYSV_FS
+ - SYSV_FS: [-v6.15]
  - ZONEFS_FS: [v5.6]
  - ISO9660_FS
  - JOLIET
@@ -11,18 +11,23 @@ config:
  - MSDOS_FS
  - VFAT_FS
  - EXFAT_FS
- - NTFS_FS
- - NTFS_RW
+ - NTFS_FS: [-v6.9]
+ - NTFS_RW: [-v6.9]
+ - NTFS3_FS: [v5.15]
+ - NTFS3_64BIT_CLUSTER: n
+ - NTFS3_LZX_XPRESS: [v5.15]
+ - NTFS3_FS_POSIX_ACL: [v5.15]
  - HFS_FS
  - HFSPLUS_FS
- - BFS_FS
+ # Removed in e36781a626b27 "bfs: remove the filesystem".
+ - BFS_FS: [-linux-next]
  - MINIX_FS
- - VXFS_FS
+ - VXFS_FS: [-v7.2]
  - OMFS_FS
  - HPFS_FS
  - NILFS2_FS
  - ORANGEFS_FS
- - EFS_FS
+ - EFS_FS: [-v7.2]
 
  - JFFS2_FS
  - JFFS2_FS_DEBUG: 0
@@ -40,7 +45,10 @@ config:
  - JFFS2_CMODE_PRIORITY
 
  - UFS_FS
- - UFS_FS_WRITE: n
+ # Write support for UFS. The description says experimental/dangerous,
+ # but seems to mean only that images can be corrupted
+ # ("you should back up your UFS partitions beforehand").
+ - UFS_FS_WRITE
  - UFS_DEBUG: n
 
  - JFS_FS
@@ -52,23 +60,27 @@ config:
  - XFS_QUOTA
  - XFS_POSIX_ACL
  - XFS_RT
- - XFS_SUPPORT_V4: [v5.10]
- - XFS_DEBUG
- - XFS_ASSERT_FATAL
+ - XFS_ONLINE_SCRUB
+ - XFS_ONLINE_REPAIR
+ # Not just sanity checks for code, but also image validation checks that BUG.
+ # XFS devs prefer this to be disabled by fuzzers.
+ - XFS_DEBUG: n
 
  - GFS2_FS
  - GFS2_FS_LOCKING_DLM
 
- - OCFS2_FS
- - OCFS2_FS_O2CB
- - OCFS2_FS_USERSPACE_CLUSTER
- - OCFS2_FS_STATS
+ - OCFS2_FS: [-arm64_gce]
+ - OCFS2_FS_O2CB: [-arm64_gce]
+ - OCFS2_FS_USERSPACE_CLUSTER: [-arm64_gce]
+ - OCFS2_FS_STATS: [-arm64_gce]
  - OCFS2_DEBUG_MASKLOG: n
- - OCFS2_DEBUG_FS
+ - OCFS2_DEBUG_FS: [-arm64_gce]
 
- - BTRFS_FS
+ - BTRFS_FS: [-arm64_gce]
  - BTRFS_FS_POSIX_ACL
  - BTRFS_ASSERT
+ # Moved by "btrfs: move ref-verify under CONFIG_BTRFS_DEBUG"
+ - BTRFS_FS_REF_VERIFY: [-v6.17]
 
  - F2FS_FS
  - F2FS_FS_SECURITY
@@ -87,6 +99,7 @@ config:
  - OVERLAY_FS_REDIRECT_DIR
  - OVERLAY_FS_INDEX
  - OVERLAY_FS_REDIRECT_ALWAYS_FOLLOW
+ - OVERLAY_FS_DEBUG: [v6.6]
 
  - UBIFS_FS
  - UBIFS_FS_ADVANCED_COMPR
@@ -117,12 +130,14 @@ config:
  - NFS_FS
  - NFS_V3_ACL
  - NFS_V4
- - NFS_V4_1
+ # Removed in 7537db24806fd "NFS: Merge CONFIG_NFS_V4_1 with CONFIG_NFS_V4".
+ - NFS_V4_1: [-v7.1]
  - NFS_V4_2
  - ROOT_NFS
  - NFS_FSCACHE
  - NFS_DISABLE_UDP_SUPPORT: n
  - NFS_V4_2_READ_PLUS: [v5.11]
+ - PNFS_BLOCK_LAYOUT: [linux-next]
  - NFSD
  - NFSD_V3_ACL
  - NFSD_V4
@@ -136,17 +151,17 @@ config:
  - CEPH_FSCACHE
  - CEPH_FS_POSIX_ACL
 
- - CIFS
- - CIFS_ALLOW_INSECURE_LEGACY
- - CIFS_WEAK_PW_HASH: [-v5.14] # TODO: -v5.15 when released
- - CIFS_UPCALL
- - CIFS_XATTR
- - CIFS_POSIX
- - CIFS_DFS_UPCALL
- - CIFS_SMB_DIRECT
- - CIFS_FSCACHE
- - CIFS_DEBUG
- - CIFS_SWN_UPCALL: [v5.11]
+ - CIFS: [-arm64_gce]
+ - CIFS_ALLOW_INSECURE_LEGACY: [-arm64_gce]
+ - CIFS_WEAK_PW_HASH: [-v5.15]
+ - CIFS_UPCALL: [-arm64_gce]
+ - CIFS_XATTR: [-arm64_gce]
+ - CIFS_POSIX: [-arm64_gce]
+ - CIFS_DFS_UPCALL: [-arm64_gce]
+ - CIFS_SMB_DIRECT: [-arm64_gce]
+ - CIFS_FSCACHE: [-arm64_gce]
+ - CIFS_DEBUG: [-arm64_gce]
+ - CIFS_SWN_UPCALL: [v5.11, -arm64_gce]
 
  - AFS_FS
  - AFS_FSCACHE
@@ -156,15 +171,16 @@ config:
  - 9P_FS_POSIX_ACL
  - 9P_FS_SECURITY
 
- - EXT3_FS
- - EXT3_FS_POSIX_ACL
- - EXT3_FS_SECURITY
+ # Removed by "ext4: remove obsolete EXT3 config options".
+ - EXT3_FS: [-v6.18]
+ - EXT3_FS_POSIX_ACL: [-v6.18]
+ - EXT3_FS_SECURITY: [-v6.18]
 
- - REISERFS_FS
- - REISERFS_FS_XATTR
- - REISERFS_FS_POSIX_ACL
- - REISERFS_FS_SECURITY
- - REISERFS_PROC_INFO
+ - REISERFS_FS: [-v6.12]
+ - REISERFS_FS_XATTR: [-v6.12]
+ - REISERFS_FS_POSIX_ACL: [-v6.12]
+ - REISERFS_FS_SECURITY: [-v6.12]
+ - REISERFS_PROC_INFO: [-v6.12]
 
  - ADFS_FS
  - ADFS_FS_RW: n
@@ -185,3 +201,13 @@ config:
  - ROMFS_BACKED_BY_BOTH
  - ROMFS_ON_BLOCK
  - ROMFS_ON_MTD
+
+ - BCACHEFS_FS: [v6.7, -v6.18]
+ - BCACHEFS_ERASURE_CODING: [v6.7, -v6.18]
+ - BCACHEFS_POSIX_ACL: [v6.7, -v6.18]
+ - BCACHEFS_QUOTA: [v6.7, -v6.18]
+ - BCACHEFS_DEBUG: [v6.7, -v6.18]
+ - BCACHEFS_SIX_OPTIMISTIC_SPIN: [v6.8, -v6.18]
+
+ - FSCACHE
+ - CACHEFILES

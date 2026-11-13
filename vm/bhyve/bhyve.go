@@ -1,15 +1,18 @@
 // Copyright 2019 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package bhyve implements Bhyve virtual machine management for FreeBSD targets.
 package bhyve
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -21,16 +24,20 @@ import (
 )
 
 func init() {
-	vmimpl.Register("bhyve", ctor, true)
+	vmimpl.Register("bhyve", vmimpl.Type{
+		Ctor:       ctor,
+		Overcommit: true,
+	})
 }
 
 type Config struct {
-	Bridge  string `json:"bridge"`  // name of network bridge device
+	Bridge  string `json:"bridge"`  // name of network bridge device, optional
 	Count   int    `json:"count"`   // number of VMs to use
 	CPU     int    `json:"cpu"`     // number of VM vCPU
-	HostIP  string `json:"hostip"`  // VM host IP address
+	HostIP  string `json:"hostip"`  // VM host IP address, optional
 	Mem     string `json:"mem"`     // amount of VM memory
-	Dataset string `json:"dataset"` // ZFS dataset containing VM image
+	Dataset string `json:"dataset"` // ZFS dataset containing VM image, optional
+	BootRom string `json:"bootrom"` // path to UEFI bootrom, optional
 }
 
 type Pool struct {
@@ -39,19 +46,18 @@ type Pool struct {
 }
 
 type instance struct {
-	cfg      *Config
-	snapshot string
-	tapdev   string
-	image    string
-	debug    bool
-	os       string
-	sshkey   string
-	sshuser  string
-	sshhost  string
-	merger   *vmimpl.OutputMerger
-	vmName   string
-	bhyve    *exec.Cmd
-	consolew io.WriteCloser
+	vmimpl.SSHOptions
+	cfg         *Config
+	snapshot    string
+	tapdev      string
+	forwardPort int
+	image       string
+	debug       bool
+	os          string
+	merger      *vmimpl.OutputMerger
+	vmName      string
+	bhyve       *exec.Cmd
+	consolew    io.WriteCloser
 }
 
 var ipRegex = regexp.MustCompile(`bound to (([0-9]+\.){3}[0-9]+) `)
@@ -64,14 +70,10 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 		Mem:   "512M",
 	}
 	if err := config.LoadData(env.Config, cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse bhyve vm config: %v", err)
+		return nil, fmt.Errorf("failed to parse bhyve vm config: %w", err)
 	}
 	if cfg.Count < 1 || cfg.Count > 128 {
 		return nil, fmt.Errorf("invalid config param count: %v, want [1-128]", cfg.Count)
-	}
-	if env.Debug && cfg.Count > 1 {
-		log.Logf(0, "limiting number of VMs from %v to 1 in debug mode", cfg.Count)
-		cfg.Count = 1
 	}
 	pool := &Pool{
 		cfg: cfg,
@@ -84,60 +86,76 @@ func (pool *Pool) Count() int {
 	return pool.cfg.Count
 }
 
-func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
+func (pool *Pool) Create(_ context.Context, workdir string, index int) (vmimpl.Instance, error) {
 	inst := &instance{
-		cfg:     pool.cfg,
-		debug:   pool.env.Debug,
-		os:      pool.env.OS,
-		sshkey:  pool.env.SSHKey,
-		sshuser: pool.env.SSHUser,
-		vmName:  fmt.Sprintf("syzkaller-%v-%v", pool.env.Name, index),
+		cfg:   pool.cfg,
+		debug: pool.env.Debug,
+		os:    pool.env.OS,
+		SSHOptions: vmimpl.SSHOptions{
+			Key:  pool.env.SSHKey,
+			User: pool.env.SSHUser,
+		},
+		vmName: fmt.Sprintf("syzkaller-%v-%v", pool.env.Name, index),
 	}
 
-	dataset := inst.cfg.Dataset
-	mountpoint, err := osutil.RunCmd(time.Minute, "", "zfs", "get", "-H", "-o", "value", "mountpoint", dataset)
-	if err != nil {
-		return nil, err
+	if inst.cfg.Dataset != "" {
+		dataset := inst.cfg.Dataset
+		mountpoint, err := osutil.RunCmd(time.Minute, "", "zfs", "get", "-H", "-o", "value", "mountpoint", dataset)
+		if err != nil {
+			return nil, err
+		}
+
+		snapshot := fmt.Sprintf("%v@bhyve-%v", dataset, inst.vmName)
+		clone := fmt.Sprintf("%v/bhyve-%v", dataset, inst.vmName)
+
+		prefix := strings.TrimSuffix(string(mountpoint), "\n") + "/"
+		image := strings.TrimPrefix(pool.env.Image, prefix)
+		if image == pool.env.Image {
+			return nil, fmt.Errorf("image file %v not contained in dataset %v", image, prefix)
+		}
+		inst.image = prefix + fmt.Sprintf("bhyve-%v", inst.vmName) + "/" + image
+
+		// Stop the instance from a previous run in case it's still running.
+		osutil.RunCmd(time.Minute, "", "bhyvectl", "--destroy", fmt.Sprintf("--vm=%v", inst.vmName))
+		// Destroy a lingering snapshot and clone.
+		osutil.RunCmd(time.Minute, "", "zfs", "destroy", "-R", snapshot)
+
+		// Create a snapshot of the data set containing the VM image.
+		// bhyve will use a clone of the snapshot, which gets recreated every time the VM
+		// is restarted. This is all to work around bhyve's current lack of an
+		// image snapshot facility.
+		if _, err := osutil.RunCmd(time.Minute, "", "zfs", "snapshot", snapshot); err != nil {
+			inst.Close()
+			return nil, err
+		}
+		inst.snapshot = snapshot
+		if _, err := osutil.RunCmd(time.Minute, "", "zfs", "clone", snapshot, clone); err != nil {
+			inst.Close()
+			return nil, err
+		}
+	} else {
+		inst.image = filepath.Join(workdir, filepath.Base(pool.env.Image)+fmt.Sprintf("-%v", inst.vmName))
+		// Use cp(1) here to help ensure that the image file gets
+		// copied using copy_file_range(2), which will leverage block
+		// cloning on ZFS.
+		_, err := osutil.RunCmd(time.Minute, "", "cp", "-f", pool.env.Image, inst.image)
+		if err != nil {
+			inst.Close()
+			return nil, err
+		}
 	}
 
-	snapshot := fmt.Sprintf("%v@bhyve-%v", dataset, inst.vmName)
-	clone := fmt.Sprintf("%v/bhyve-%v", dataset, inst.vmName)
-
-	prefix := strings.TrimSuffix(string(mountpoint), "\n") + "/"
-	image := strings.TrimPrefix(pool.env.Image, prefix)
-	if image == pool.env.Image {
-		return nil, fmt.Errorf("image file %v not contained in dataset %v", image, prefix)
-	}
-	inst.image = prefix + fmt.Sprintf("bhyve-%v", inst.vmName) + "/" + image
-
-	// Stop the instance from a previous run in case it's still running.
-	osutil.RunCmd(time.Minute, "", "bhyvectl", "--destroy", fmt.Sprintf("--vm=%v", inst.vmName))
-	// Destroy a lingering snapshot and clone.
-	osutil.RunCmd(time.Minute, "", "zfs", "destroy", "-R", snapshot)
-
-	// Create a snapshot of the data set containing the VM image.
-	// bhyve will use a clone of the snapshot, which gets recreated every time the VM
-	// is restarted. This is all to work around bhyve's current lack of an
-	// image snapshot facility.
-	if _, err := osutil.RunCmd(time.Minute, "", "zfs", "snapshot", snapshot); err != nil {
-		inst.Close()
-		return nil, err
-	}
-	inst.snapshot = snapshot
-	if _, err := osutil.RunCmd(time.Minute, "", "zfs", "clone", snapshot, clone); err != nil {
-		inst.Close()
-		return nil, err
-	}
-
-	tapdev, err := osutil.RunCmd(time.Minute, "", "ifconfig", "tap", "create")
-	if err != nil {
-		inst.Close()
-		return nil, err
-	}
-	inst.tapdev = tapRegex.FindString(string(tapdev))
-	if _, err := osutil.RunCmd(time.Minute, "", "ifconfig", inst.cfg.Bridge, "addm", inst.tapdev); err != nil {
-		inst.Close()
-		return nil, err
+	if inst.cfg.Bridge != "" {
+		tapdev, err := osutil.RunCmd(time.Minute, "", "ifconfig", "tap", "create")
+		if err != nil {
+			inst.Close()
+			return nil, err
+		}
+		inst.tapdev = tapRegex.FindString(string(tapdev))
+		if _, err := osutil.RunCmd(time.Minute, "", "ifconfig", inst.cfg.Bridge, "addm", inst.tapdev); err != nil {
+			inst.Close()
+			return nil, err
+		}
 	}
 
 	if err := inst.Boot(); err != nil {
@@ -149,20 +167,16 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 }
 
 func (inst *instance) Boot() error {
-	loaderArgs := []string{
-		"-c", "stdio",
-		"-m", inst.cfg.Mem,
-		"-d", inst.image,
-		"-e", "autoboot_delay=0",
-		inst.vmName,
-	}
-
 	// Stop the instance from the previous run in case it's still running.
 	osutil.RunCmd(time.Minute, "", "bhyvectl", "--destroy", fmt.Sprintf("--vm=%v", inst.vmName))
 
-	_, err := osutil.RunCmd(time.Minute, "", "bhyveload", loaderArgs...)
-	if err != nil {
-		return err
+	netdev := ""
+	if inst.tapdev != "" {
+		inst.Port = 22
+		netdev = inst.tapdev
+	} else {
+		inst.Port = vmimpl.UnusedTCPPort()
+		netdev = fmt.Sprintf("slirp,hostfwd=tcp:127.0.0.1:%v-:22", inst.Port)
 	}
 
 	bhyveArgs := []string{
@@ -171,10 +185,26 @@ func (inst *instance) Boot() error {
 		"-m", inst.cfg.Mem,
 		"-s", "0:0,hostbridge",
 		"-s", "1:0,lpc",
-		"-s", fmt.Sprintf("2:0,virtio-net,%v", inst.tapdev),
+		"-s", fmt.Sprintf("2:0,virtio-net,%v", netdev),
 		"-s", fmt.Sprintf("3:0,virtio-blk,%v", inst.image),
 		"-l", "com1,stdio",
 		inst.vmName,
+	}
+
+	if inst.cfg.BootRom == "" {
+		loaderArgs := []string{
+			"-c", "stdio",
+			"-m", inst.cfg.Mem,
+			"-d", inst.image,
+			"-e", "autoboot_delay=0",
+			inst.vmName,
+		}
+		_, err := osutil.RunCmd(time.Minute, "", "bhyveload", loaderArgs...)
+		if err != nil {
+			return err
+		}
+	} else {
+		bhyveArgs = append([]string{"-M", "-l", fmt.Sprintf("bootrom,%v", inst.cfg.BootRom)}, bhyveArgs...)
 	}
 
 	outr, outw, err := osutil.LongPipe()
@@ -210,7 +240,7 @@ func (inst *instance) Boot() error {
 		tee = os.Stdout
 	}
 	inst.merger = vmimpl.NewOutputMerger(tee)
-	inst.merger.Add("console", outr)
+	inst.merger.Add("console", vmimpl.OutputConsole, outr)
 	outr = nil
 
 	var bootOutput []byte
@@ -221,7 +251,7 @@ func (inst *instance) Boot() error {
 		for {
 			select {
 			case out := <-inst.merger.Output:
-				bootOutput = append(bootOutput, out...)
+				bootOutput = append(bootOutput, out.Data...)
 			case <-bootOutputStop:
 				close(bootOutputStop)
 				return
@@ -236,10 +266,16 @@ func (inst *instance) Boot() error {
 		}
 	}()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	select {
 	case ip := <-ipch:
-		inst.sshhost = ip
-	case <-inst.merger.Err:
+		if inst.tapdev != "" {
+			inst.Addr = ip
+		} else {
+			inst.Addr = "localhost"
+		}
+	case <-inst.merger.Errors(ctx):
 		bootOutputStop <- true
 		<-bootOutputStop
 		return vmimpl.BootError{Title: "bhyve exited", Output: bootOutput}
@@ -249,8 +285,8 @@ func (inst *instance) Boot() error {
 		return vmimpl.BootError{Title: "no IP found", Output: bootOutput}
 	}
 
-	if err := vmimpl.WaitForSSH(inst.debug, 10*time.Minute, inst.sshhost,
-		inst.sshkey, inst.sshuser, inst.os, 22, nil); err != nil {
+	err = vmimpl.WaitForSSH(10*time.Minute, inst.SSHOptions, inst.os, nil, false, inst.debug)
+	if err != nil {
 		bootOutputStop <- true
 		<-bootOutputStop
 		return vmimpl.MakeBootError(err, bootOutput)
@@ -259,7 +295,7 @@ func (inst *instance) Boot() error {
 	return nil
 }
 
-func (inst *instance) Close() {
+func (inst *instance) Close() error {
 	if inst.consolew != nil {
 		inst.consolew.Close()
 	}
@@ -277,47 +313,76 @@ func (inst *instance) Close() {
 		osutil.RunCmd(time.Minute, "", "ifconfig", inst.tapdev, "destroy")
 		inst.tapdev = ""
 	}
+	return nil
 }
 
 func (inst *instance) Forward(port int) (string, error) {
-	return fmt.Sprintf("%v:%v", inst.cfg.HostIP, port), nil
+	if inst.tapdev != "" {
+		return fmt.Sprintf("%v:%v", inst.cfg.HostIP, port), nil
+	} else {
+		if port == 0 {
+			return "", fmt.Errorf("vm/bhyve: forward port is zero")
+		}
+		if inst.forwardPort != 0 {
+			return "", fmt.Errorf("vm/bhyve: forward port is already set")
+		}
+		inst.forwardPort = port
+		return fmt.Sprintf("localhost:%v", port), nil
+	}
 }
 
 func (inst *instance) Copy(hostSrc string) (string, error) {
 	vmDst := filepath.Join("/root", filepath.Base(hostSrc))
-	args := append(vmimpl.SCPArgs(inst.debug, inst.sshkey, 22),
-		hostSrc, inst.sshuser+"@"+inst.sshhost+":"+vmDst)
-	if inst.debug {
-		log.Logf(0, "running command: scp %#v", args)
-	}
-	_, err := osutil.RunCmd(10*time.Minute, "", "scp", args...)
+	err := vmimpl.SCP(hostSrc, vmDst, vmimpl.SCPOptions{
+		Debug:        inst.debug,
+		Key:          inst.Key,
+		Port:         inst.Port,
+		SystemSSHCfg: false,
+		User:         inst.User,
+		Addr:         inst.Addr,
+		Timeout:      10 * time.Minute,
+	})
 	if err != nil {
 		return "", err
 	}
 	return vmDst, nil
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
-	<-chan []byte, <-chan error, error) {
+func (inst *instance) Run(ctx context.Context, command string) (
+	<-chan vmimpl.Chunk, <-chan error, error) {
 	rpipe, wpipe, err := osutil.LongPipe()
 	if err != nil {
 		return nil, nil, err
 	}
-	inst.merger.Add("ssh", rpipe)
+	rpipeErr, wpipeErr, err := osutil.LongPipe()
+	if err != nil {
+		rpipe.Close()
+		wpipe.Close()
+		return nil, nil, err
+	}
+	inst.merger.Add("ssh", vmimpl.OutputStdout, rpipe)
+	inst.merger.Add("ssh-err", vmimpl.OutputStderr, rpipeErr)
 
-	args := append(vmimpl.SSHArgs(inst.debug, inst.sshkey, 22),
-		inst.sshuser+"@"+inst.sshhost, command)
+	var sshargs []string
+	if inst.forwardPort != 0 {
+		sshargs = vmimpl.SSHArgsForward(inst.debug, inst.Key, inst.Port, inst.forwardPort, false)
+	} else {
+		sshargs = vmimpl.SSHArgs(inst.debug, inst.Key, inst.Port, false)
+	}
+	args := append(slices.Clone(sshargs), inst.User+"@"+inst.Addr, command)
 	if inst.debug {
 		log.Logf(0, "running command: ssh %#v", args)
 	}
 	cmd := osutil.Command("ssh", args...)
 	cmd.Stdout = wpipe
-	cmd.Stderr = wpipe
+	cmd.Stderr = wpipeErr
 	if err := cmd.Start(); err != nil {
 		wpipe.Close()
+		wpipeErr.Close()
 		return nil, nil, err
 	}
 	wpipe.Close()
+	wpipeErr.Close()
 	errc := make(chan error, 1)
 	signal := func(err error) {
 		select {
@@ -327,12 +392,12 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	}
 
 	go func() {
+		errCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 		select {
-		case <-time.After(timeout):
+		case <-ctx.Done():
 			signal(vmimpl.ErrTimeout)
-		case <-stop:
-			signal(vmimpl.ErrTimeout)
-		case err := <-inst.merger.Err:
+		case err := <-inst.merger.Errors(errCtx):
 			cmd.Process.Kill()
 			if cmdErr := cmd.Wait(); cmdErr == nil {
 				// If the command exited successfully, we got EOF error from merger.

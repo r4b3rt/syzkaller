@@ -1,38 +1,35 @@
 // Copyright 2020 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package backend provides coverage symbolization backends for DWARF, ELF, Mach-O, and gVisor executables.
 package backend
 
 import (
 	"fmt"
 
-	"github.com/google/syzkaller/pkg/host"
+	"github.com/google/syzkaller/pkg/mgrconfig"
+	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/sys/targets"
 )
 
 type Impl struct {
-	Units     []*CompileUnit
-	Symbols   []*Symbol
-	Frames    []Frame
-	Symbolize func(pcs map[*Module][]uint64) ([]Frame, error)
-	RestorePC func(pc uint32) uint64
-}
-
-type Module struct {
-	Name string
-	Path string
-	Addr uint64
+	Units           []*CompileUnit
+	Symbols         []*Symbol
+	Frames          []*Frame
+	Symbolize       func(pcs map[*vminfo.KernelModule][]uint64) ([]*Frame, error)
+	CallbackPoints  []uint64
+	PreciseCoverage bool
 }
 
 type CompileUnit struct {
 	ObjectUnit
 	Path   string
-	Module *Module
+	Module *vminfo.KernelModule
 }
 
 type Symbol struct {
 	ObjectUnit
-	Module     *Module
+	Module     *vminfo.KernelModule
 	Unit       *CompileUnit
 	Start      uint64
 	End        uint64
@@ -47,10 +44,12 @@ type ObjectUnit struct {
 }
 
 type Frame struct {
-	Module *Module
-	PC     uint64
-	Name   string
-	Path   string
+	Module   *vminfo.KernelModule
+	PC       uint64
+	Name     string
+	FuncName string
+	Path     string
+	Inline   bool
 	Range
 }
 
@@ -61,18 +60,41 @@ type Range struct {
 	EndCol    int
 }
 
+type SecRange struct {
+	Start uint64
+	End   uint64
+}
+
 const LineEnd = 1 << 30
 
-func Make(target *targets.Target, vm, objDir, srcDir, buildDir string,
-	moduleObj []string, modules []host.KernelModule) (*Impl, error) {
-	if objDir == "" {
+func Make(cfg *mgrconfig.Config, modules []*vminfo.KernelModule) (*Impl, error) {
+	kernelDirs := cfg.KernelDirs()
+	target := cfg.SysTarget
+	moduleObj := cfg.ModuleObj
+	vm := cfg.Type
+	if vm == targets.GVisor {
+		// gVisor has no kernel object, coverage is symbolized from the image.
+		return makeGvisor(target, cfg.Image, kernelDirs.Src, modules)
+	}
+	if kernelDirs.Obj == "" {
 		return nil, fmt.Errorf("kernel obj directory is not specified")
 	}
-	if target.OS == "darwin" {
-		return makeMachO(target, objDir, srcDir, buildDir, moduleObj, modules)
+	if target.OS == targets.Darwin {
+		return makeMachO(target, kernelDirs, moduleObj, modules)
 	}
-	if vm == "gvisor" {
-		return makeGvisor(target, objDir, srcDir, buildDir, modules)
+	var delimiters []string
+	if cfg.AndroidSplitBuild {
+		// Path prefixes used by Android Pixel kernels. See
+		// https://source.android.com/docs/setup/build/building-pixel-kernels for more
+		// details.
+		delimiters = []string{"/aosp/", "/private/"}
 	}
-	return makeELF(target, objDir, srcDir, buildDir, moduleObj, modules)
+	return makeELF(target, kernelDirs, delimiters, moduleObj, modules)
+}
+
+func GetPCBase(cfg *mgrconfig.Config) (uint64, error) {
+	if cfg.Target.OS == targets.Linux && cfg.Type != targets.GVisor && cfg.Type != targets.Starnix {
+		return getLinuxPCBase(cfg)
+	}
+	return 0, nil
 }

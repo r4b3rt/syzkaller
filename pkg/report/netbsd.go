@@ -75,4 +75,5 @@ var netbsdOopses = append([]*oops{
 		},
 		[]*regexp.Regexp{},
 	},
+	&groupGoRuntimeErrors,
 }, commonOopses...)

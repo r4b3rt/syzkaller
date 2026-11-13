@@ -6,23 +6,29 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/google/syzkaller/pkg/ast"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/tool"
 	"github.com/google/syzkaller/sys/targets"
 )
 
+var (
+	flagDryRun = flag.Bool("dry-run", false, "do not patch the files, just check if they are well formatted")
+)
+
 func main() {
-	if len(os.Args) < 2 {
+	defer tool.Init()()
+	args := flag.Args()
+	if len(args) < 1 {
 		fmt.Fprintf(os.Stderr, "usage: syz-fmt files... or dirs... or all\n")
 		os.Exit(1)
 	}
-	args := os.Args[1:]
 	if len(args) == 1 && args[0] == "all" {
 		args = nil
 		for os := range targets.List {
@@ -36,7 +42,7 @@ func main() {
 			os.Exit(1)
 		}
 		if st.IsDir() {
-			files, err := ioutil.ReadDir(arg)
+			files, err := os.ReadDir(arg)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to read dir %v: %v\n", arg, err)
 				os.Exit(1)
@@ -45,7 +51,8 @@ func main() {
 				if !strings.HasSuffix(file.Name(), ".txt") {
 					continue
 				}
-				processFile(filepath.Join(arg, file.Name()), file.Mode())
+				info, _ := file.Info()
+				processFile(filepath.Join(arg, file.Name()), info.Mode())
 			}
 		} else {
 			processFile(arg, st.Mode())
@@ -54,7 +61,7 @@ func main() {
 }
 
 func processFile(file string, mode os.FileMode) {
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to read file %v: %v\n", file, err)
 		os.Exit(1)
@@ -67,12 +74,17 @@ func processFile(file string, mode os.FileMode) {
 	if bytes.Equal(data, formatted) {
 		return
 	}
+	if *flagDryRun {
+		fmt.Fprintf(os.Stderr, "%v is not well-formatted, please run syz-fmt against it\n", file)
+		os.Exit(2)
+		return
+	}
 	fmt.Printf("reformatting %v\n", file)
 	if err := osutil.Rename(file, file+"~"); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
-	if err := ioutil.WriteFile(file, formatted, mode); err != nil {
+	if err := os.WriteFile(file, formatted, mode); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}

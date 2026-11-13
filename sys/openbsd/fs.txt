@@ -20,16 +20,20 @@ openat(fd fd_dir, file ptr[in, filename], flags flags[open_flags], mode flags[op
 close(fd fd)
 read(fd fd, buf buffer[out], count len[buf])
 readv(fd fd, vec ptr[in, array[iovec_out]], vlen len[vec])
-pread(fd fd, buf buffer[in], nbyte len[buf], pad const[0], off fileoff)
-preadv(fd fd, vec ptr[in, array[iovec_out]], vlen len[vec], pad const[0], off fileoff)
+pread(fd fd, buf buffer[in], nbyte len[buf], off fileoff)
+preadv(fd fd, vec ptr[in, array[iovec_out]], vlen len[vec], off fileoff)
 write(fd fd, buf buffer[in], count len[buf])
 writev(fd fd, vec ptr[in, array[iovec_in]], vlen len[vec])
-pwrite(fd fd, buf buffer[in], nbyte len[buf], pad const[0], off fileoff)
-pwritev(fd fd, vec ptr[in, array[iovec_in]], vlen len[vec], pad const[0], off fileoff)
-lseek(fd fd, pad const[0], offset fileoff, whence flags[seek_whence])
+pwrite(fd fd, buf buffer[in], nbyte len[buf], off fileoff)
+pwritev(fd fd, vec ptr[in, array[iovec_in]], vlen len[vec], off fileoff)
+lseek(fd fd, offset fileoff, whence flags[seek_whence])
 dup(oldfd fd) fd
 dup2(oldfd fd, newfd fd) fd
+dup3(oldfd fd, newfd fd, flags flags[pipe_flags]) fd
 pipe2(pipefd ptr[out, pipefd], flags flags[pipe_flags])
+# closefrom closes all fds starting from lowfd, which includes the executor's own fds
+# (kcov, tun, control pipes), so programs that use it break the executor rather than test the kernel.
+closefrom(lowfd fd) (disabled)
 
 pipefd {
 	rfd	fd
@@ -47,25 +51,25 @@ iovec_out {
 }
 
 stat {
-	dev	int64
-	ino	int64
-	mode	int32
-	nlink	int32
-	rdev	int64
-	size	int64
-	blksize	int32
-	blocks	int64
-	atime	int64
-	ansec	int64
-	mtime	int64
-	mnsec	int64
-	ctime	int64
-	cnsec	int64
-	pad1	const[0, int32]
-	pad2	const[0, int32]
+	mode		int32
+	dev		int32
+	ino		int64
+	nlink		int32
+	uid		uid
+	gid		gid
+	rdev		int32
+	atim		timespec
+	mtim		timespec
+	ctim		timespec
+	size		int64
+	blocks		int64
+	blksize		int32
+	flags		int32
+	gen		int32
+	birthtim	timespec
 }
 
-open_flags = O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, O_CREAT, O_TRUNC, O_EXCL, O_SHLOCK, O_EXLOCK, O_NOFOLLOW, O_CLOEXEC, O_DSYNC, O_SYNC, O_RSYNC, O_NOCTTY, O_DIRECTORY, O_ASYNC
+open_flags = O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, O_CREAT, O_TRUNC, O_EXCL, O_SHLOCK, O_EXLOCK, O_NOFOLLOW, O_CLOEXEC, O_DSYNC, O_SYNC, O_RSYNC, O_NOCTTY, O_DIRECTORY, O_ASYNC, O_CLOFORK
 open_mode = S_IRUSR, S_IWUSR, S_IXUSR, S_IRGRP, S_IWGRP, S_IXGRP, S_IROTH, S_IWOTH, S_IXOTH
 seek_whence = SEEK_SET, SEEK_CUR, SEEK_END
 pipe_flags = O_NONBLOCK, O_CLOEXEC

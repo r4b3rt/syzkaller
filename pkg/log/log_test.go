@@ -5,6 +5,8 @@ package log
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func init() {
@@ -26,10 +28,35 @@ func TestCaching(t *testing.T) {
 	}
 	prependTime = false
 	for _, test := range tests {
-		Logf(1, test.str)
+		Log(1, test.str)
 		out := CachedLogOutput()
 		if out != test.want {
 			t.Fatalf("wrote: %v\nwant: %v\ngot: %v", test.str, test.want, out)
 		}
 	}
+}
+
+func TestLazy(t *testing.T) {
+	// Ensure that the format message is formatted lazily only when logging enabled.
+	Logf(1e6, "%v", noFormat{t})
+}
+
+type noFormat struct{ *testing.T }
+
+func (nf noFormat) String() string {
+	nf.T.Fatalf("must not be formatted")
+	return ""
+}
+
+func TestVerboseWriter(t *testing.T) {
+	prependTime = false
+	defer func() { prependTime = true }()
+	w := VerboseWriter(1)
+	n, err := w.Write([]byte("foo\n"))
+	require.NoError(t, err)
+	require.Equal(t, 4, n)
+	n, err = w.Write([]byte("bar\r\n"))
+	require.NoError(t, err)
+	require.Equal(t, 5, n)
+	require.Contains(t, CachedLogOutput(), "foo\nbar\n")
 }

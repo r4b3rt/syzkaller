@@ -5,28 +5,18 @@ package qemu
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"strings"
+	"syscall"
+
+	"github.com/google/syzkaller/pkg/log"
 )
 
-type qmpVersion struct {
-	Package string
-	QEMU    struct {
-		Major int
-		Micro int
-		Minor int
-	}
-}
-
-type qmpBanner struct {
-	QMP struct {
-		Version qmpVersion
-	}
-}
-
 type qmpCommand struct {
-	Execute   string      `json:"execute"`
-	Arguments interface{} `json:"arguments,omitempty"`
+	Execute   string `json:"execute"`
+	Arguments any    `json:"arguments,omitempty"`
 }
 
 type hmpCommand struct {
@@ -39,7 +29,14 @@ type qmpResponse struct {
 		Class string
 		Desc  string
 	}
-	Return interface{}
+	Return any
+
+	Event     string
+	Data      map[string]any
+	Timestamp struct {
+		Seconds      int64
+		Microseconds int64
+	}
 }
 
 func (inst *instance) qmpConnCheck() error {
@@ -56,7 +53,11 @@ func (inst *instance) qmpConnCheck() error {
 	monDec := json.NewDecoder(conn)
 	monEnc := json.NewEncoder(conn)
 
-	var banner qmpBanner
+	// QEMU sends a greeting banner (containing version and capability details)
+	// immediately upon connection. We must decode and discard it from the TCP
+	// stream first, otherwise subsequent command responses (e.g. to qmp_capabilities)
+	// will be misread as the banner. We decode into an empty struct to avoid allocation.
+	var banner struct{}
 	if err := monDec.Decode(&banner); err != nil {
 		return err
 	}
@@ -74,10 +75,14 @@ func (inst *instance) qmpConnCheck() error {
 }
 
 func (inst *instance) qmpRecv() (*qmpResponse, error) {
-	qmp := new(qmpResponse)
-	err := inst.monDec.Decode(qmp)
-
-	return qmp, err
+	for {
+		qmp := new(qmpResponse)
+		err := inst.monDec.Decode(qmp)
+		if err != nil || qmp.Event == "" {
+			return qmp, err
+		}
+		log.Logf(3, "event: %v", qmp)
+	}
 }
 
 func (inst *instance) doQmp(cmd *qmpCommand) (*qmpResponse, error) {
@@ -87,7 +92,7 @@ func (inst *instance) doQmp(cmd *qmpCommand) (*qmpResponse, error) {
 	return inst.qmpRecv()
 }
 
-func (inst *instance) qmp(cmd *qmpCommand) (interface{}, error) {
+func (inst *instance) qmp(cmd *qmpCommand) (any, error) {
 	if err := inst.qmpConnCheck(); err != nil {
 		return nil, err
 	}
@@ -96,15 +101,22 @@ func (inst *instance) qmp(cmd *qmpCommand) (interface{}, error) {
 		return nil, err
 	}
 	if resp.Error.Desc != "" {
-		return nil, fmt.Errorf("error %v", resp.Error)
+		return nil, fmt.Errorf("%v", resp.Error)
 	}
 	if resp.Return == nil {
 		return nil, fmt.Errorf(`no "return" nor "error" in [%v]`, resp)
+	}
+	if output, _ := resp.Return.(string); strings.HasPrefix(output, "Error:") ||
+		strings.HasPrefix(output, "unknown command:") {
+		return nil, errors.New(output)
 	}
 	return resp.Return, nil
 }
 
 func (inst *instance) hmp(cmd string, cpu int) (string, error) {
+	if inst.debug {
+		log.Logf(0, "qemu: running hmp command: %v", cmd)
+	}
 	req := &qmpCommand{
 		Execute: "human-monitor-command",
 		Arguments: &hmpCommand{
@@ -113,8 +125,12 @@ func (inst *instance) hmp(cmd string, cpu int) (string, error) {
 		},
 	}
 	resp, err := inst.qmp(req)
+	if inst.debug {
+		log.Logf(0, "qemu: reply: %v\n%v", err, resp)
+	}
 	if err != nil {
-		return "", err
+		killErr := syscall.Kill(inst.qemu.Process.Pid, 0)
+		return "", fmt.Errorf("qemu hmp command '%s' (qemu kill: %s): %w", cmd, fmt.Sprint(killErr), err)
 	}
 	return resp.(string), nil
 }

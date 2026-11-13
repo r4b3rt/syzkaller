@@ -1,18 +1,28 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package osutil provides operating system utility functions for process execution,
+// file system operations, and time tracking.
 package osutil
 
 import (
 	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
+	"testing"
 	"time"
+	_ "unsafe" // required to use go:linkname
 )
 
 const (
@@ -28,6 +38,18 @@ func RunCmd(timeout time.Duration, dir, bin string, args ...string) ([]byte, err
 	return Run(timeout, cmd)
 }
 
+// RunSandboxed runs "bin args..." in dir under Sandbox(cmd, true, true) with timeout.
+func RunSandboxed(timeout time.Duration, dir, bin string, args ...string) ([]byte, error) {
+	cmd := Command(bin, args...)
+	cmd.Dir = dir
+	if err := Sandbox(cmd, true, true); err != nil {
+		return nil, err
+	}
+	return Run(timeout, cmd)
+}
+
+var ErrTimeout = errors.New("timedout")
+
 // Run runs cmd with the specified timeout.
 // Returns combined output. If the command fails, err includes output.
 func Run(timeout time.Duration, cmd *exec.Cmd) ([]byte, error) {
@@ -38,9 +60,9 @@ func Run(timeout time.Duration, cmd *exec.Cmd) ([]byte, error) {
 	if cmd.Stderr == nil {
 		cmd.Stderr = output
 	}
-	setPdeathsig(cmd)
+	setPdeathsig(cmd, true)
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start %v %+v: %v", cmd.Path, cmd.Args, err)
+		return nil, fmt.Errorf("failed to start %v %+v: %w", cmd.Path, cmd.Args, err)
 	}
 	done := make(chan bool)
 	timedout := make(chan bool, 1)
@@ -59,18 +81,18 @@ func Run(timeout time.Duration, cmd *exec.Cmd) ([]byte, error) {
 	err := cmd.Wait()
 	close(done)
 	if err != nil {
-		text := fmt.Sprintf("failed to run %q: %v", cmd.Args, err)
+		retErr := fmt.Errorf("failed to run %q: %w", cmd.Args, err)
 		if <-timedout {
-			text = fmt.Sprintf("timedout %q", cmd.Args)
+			retErr = fmt.Errorf("%w after %v %q", ErrTimeout, timeout, cmd.Args)
 		}
-		exitCode := 0
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		exitCode := cmd.ProcessState.ExitCode()
+		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
 				exitCode = status.ExitStatus()
 			}
 		}
 		return output.Bytes(), &VerboseError{
-			Title:    text,
+			Err:      retErr,
 			Output:   output.Bytes(),
 			ExitCode: exitCode,
 		}
@@ -78,63 +100,61 @@ func Run(timeout time.Duration, cmd *exec.Cmd) ([]byte, error) {
 	return output.Bytes(), nil
 }
 
-// Command is similar to os/exec.Command, but also sets PDEATHSIG on linux.
+// CommandContext is similar to os/exec.CommandContext, but also sets PDEATHSIG to SIGKILL on linux,
+// i.e. the child will be killed immediately.
+func CommandContext(ctx context.Context, bin string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, bin, args...)
+	setPdeathsig(cmd, true)
+	cmd.Cancel = func() error {
+		killPgroup(cmd)
+		return nil
+	}
+	return cmd
+}
+
+// Command is similar to os/exec.Command, but also sets PDEATHSIG to SIGKILL on linux,
+// i.e. the child will be killed immediately.
 func Command(bin string, args ...string) *exec.Cmd {
 	cmd := exec.Command(bin, args...)
-	setPdeathsig(cmd)
+	setPdeathsig(cmd, true)
+	return cmd
+}
+
+// GraciousCommand is similar to os/exec.Command, but also sets PDEATHSIG to SIGTERM on linux,
+// i.e. the child has a chance to exit gracefully. This may be important when running
+// e.g. syz-manager. If it is killed immediately, it can leak GCE instances.
+func GraciousCommand(bin string, args ...string) *exec.Cmd {
+	cmd := exec.Command(bin, args...)
+	setPdeathsig(cmd, false)
 	return cmd
 }
 
 type VerboseError struct {
-	Title    string
+	Err      error
 	Output   []byte
 	ExitCode int
 }
 
 func (err *VerboseError) Error() string {
-	if len(err.Output) == 0 {
-		return err.Title
-	}
-	return fmt.Sprintf("%v\n%s", err.Title, err.Output)
+	return err.Err.Error()
 }
 
-func PrependContext(ctx string, err error) error {
-	switch err1 := err.(type) {
-	case *VerboseError:
-		err1.Title = fmt.Sprintf("%v: %v", ctx, err1.Title)
-		return err1
-	default:
-		return fmt.Errorf("%v: %v", ctx, err)
+func (err *VerboseError) Unwrap() error {
+	return err.Err
+}
+
+func VerboseMessage(err error) string {
+	msg := err.Error()
+	if verr := new(VerboseError); errors.As(err, &verr) {
+		msg += "\n" + string(verr.Output)
 	}
+	return msg
 }
 
 // IsExist returns true if the file name exists.
 func IsExist(name string) bool {
 	_, err := os.Stat(name)
 	return err == nil
-}
-
-// IsAccessible checks if the file can be opened.
-func IsAccessible(name string) error {
-	if !IsExist(name) {
-		return fmt.Errorf("%v does not exist", name)
-	}
-	f, err := os.Open(name)
-	if err != nil {
-		return fmt.Errorf("%v can't be opened (%v)", name, err)
-	}
-	f.Close()
-	return nil
-}
-
-// IsWritable checks if the file can be written.
-func IsWritable(name string) error {
-	f, err := os.OpenFile(name, os.O_WRONLY, DefaultFilePerm)
-	if err != nil {
-		return fmt.Errorf("%v can't be written (%v)", name, err)
-	}
-	f.Close()
-	return nil
 }
 
 // FilesExist returns true if all files exist in dir.
@@ -208,7 +228,7 @@ func CopyDirRecursively(srcDir, dstDir string) error {
 	if err := MkdirAll(dstDir); err != nil {
 		return err
 	}
-	files, err := ioutil.ReadDir(srcDir)
+	files, err := os.ReadDir(srcDir)
 	if err != nil {
 		return err
 	}
@@ -245,27 +265,127 @@ func MkdirAll(dir string) error {
 	return os.MkdirAll(dir, DefaultDirPerm)
 }
 
+// SandboxTempDir creates a temporary directory for tests that use Sandbox.
+// Unlike t.TempDir, which creates 0700 directories, the returned directory and
+// its per-test parent remain owned by the current user, but have 0755
+// permissions so the sandbox user can traverse and view them.
+func SandboxTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, p := range []string{filepath.Dir(dir), dir} {
+		if err := os.Chmod(p, DefaultDirPerm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
 func WriteFile(filename string, data []byte) error {
-	return ioutil.WriteFile(filename, data, DefaultFilePerm)
+	return os.WriteFile(filename, data, DefaultFilePerm)
+}
+
+// ReadFileInRoot reads relFile confined to rootDir,
+// rejecting any path traversal or symlink that escapes rootDir (see SandboxRoot.ReadFile).
+func ReadFileInRoot(rootDir, relFile string) ([]byte, error) {
+	root, err := OpenSandboxRoot(rootDir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return root.ReadFile(relFile)
+}
+
+// ReadDirInRoot lists directory entries of relDir confined to rootDir using os.OpenRoot,
+// rejecting any path traversal or symlink that escapes rootDir.
+func ReadDirInRoot(rootDir, relDir string) ([]os.DirEntry, error) {
+	root, err := os.OpenRoot(rootDir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	f, err := root.Open(relDir)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return f.ReadDir(-1)
+}
+
+// WriteFileAtomically writes data to file filename without exposing and empty/partially-written file.
+// This is useful for writing generated source files. Exposing an empty file may break tools
+// that run on  source files in parallel.
+func WriteFileAtomically(filename string, data []byte) error {
+	// We can't use os.CreateTemp b/c it may be on a different mount,
+	// and Rename can't move across mounts.
+	tmpFile := filename + ".tmp"
+	if err := WriteFile(tmpFile, data); err != nil {
+		return err
+	}
+	return os.Rename(tmpFile, filename)
+}
+
+func WriteJSON[T any](filename string, obj T) error {
+	jsonData, err := json.MarshalIndent(obj, "", "\t")
+	if err != nil {
+		return fmt.Errorf("failed to marshal: %w", err)
+	}
+	return WriteFile(filename, jsonData)
+}
+
+func ReadJSON[T any](filename string) (T, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		var v T
+		return v, err
+	}
+	return ParseJSON[T](data)
+}
+
+func ParseJSON[T any](data []byte) (T, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var v T
+	if err := dec.Decode(&v); err != nil {
+		return v, fmt.Errorf("failed to unmarshal %T: %w", v, err)
+	}
+	return v, nil
+}
+
+func WriteGzipStream(filename string, reader io.Reader) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gz := gzip.NewWriter(f)
+	defer gz.Close()
+	_, err = io.Copy(gz, reader)
+	return err
 }
 
 func WriteExecFile(filename string, data []byte) error {
 	os.Remove(filename)
-	return ioutil.WriteFile(filename, data, DefaultExecPerm)
+	return os.WriteFile(filename, data, DefaultExecPerm)
 }
 
 // TempFile creates a unique temp filename.
 // Note: the file already exists when the function returns.
 func TempFile(prefix string) (string, error) {
-	f, err := ioutil.TempFile("", prefix)
+	return TempFileIn("", prefix)
+}
+
+// TempFileIn is an extended version of TempFile that allows configuring
+// the folder in which the file will be created.
+func TempFileIn(dir, prefix string) (string, error) {
+	f, err := os.CreateTemp(dir, prefix)
 	if err != nil {
-		return "", fmt.Errorf("failed to create temp file: %v", err)
+		return "", fmt.Errorf("failed to create temp file: %w", err)
 	}
 	f.Close()
 	return f.Name(), nil
 }
 
-// Return all files in a directory.
+// ListDir returns all files in a directory.
 func ListDir(dir string) ([]string, error) {
 	f, err := os.Open(dir)
 	if err != nil {
@@ -275,22 +395,60 @@ func ListDir(dir string) ([]string, error) {
 	return f.Readdirnames(-1)
 }
 
-var wd string
-
-func init() {
-	var err error
-	wd, err = os.Getwd()
-	if err != nil {
-		panic(fmt.Sprintf("failed to get wd: %v", err))
-	}
-}
+var (
+	wd     string
+	wdOnce sync.Once
+)
 
 func Abs(path string) string {
+	wdOnce.Do(func() {
+		var err error
+		wd, err = os.Getwd()
+		if err != nil {
+			panic(fmt.Sprintf("failed to get wd: %v", err))
+		}
+	})
 	if wd1, err := os.Getwd(); err == nil && wd1 != wd {
 		panic(fmt.Sprintf("wd changed: %q -> %q", wd, wd1))
 	}
-	if path == "" || filepath.IsAbs(path) {
+	if path == "" {
 		return path
 	}
-	return filepath.Join(wd, path)
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(wd, path)
+	}
+	return filepath.Clean(path)
+}
+
+// FileTimes returns file creation and modification times.
+func FileTimes(file string) (time.Time, time.Time, error) {
+	return fileTimes(file)
+}
+
+// MonotonicNano returns monotonic time in nanoseconds from some unspecified point in time.
+// Useful mostly to measure time intervals.
+// This function should be used inside of tested VMs b/c time.Now may reject to use monotonic time
+// if the fuzzer messes with system time (sets time past Y2157, see comments in time/time.go).
+// This is a hacky way to use the private runtime function.
+// If this ever breaks, we can either provide specializations for different Go versions
+// using build tags, or fall back to time.Now.
+//
+//go:linkname MonotonicNano runtime.nanotime
+func MonotonicNano() time.Duration
+
+// DiskUsage returns total recursive disk usage of the dir (similar to du -s).
+func DiskUsage(dir string) (uint64, error) {
+	var total uint64
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		total += sysDiskUsage(info)
+		return nil
+	})
+	return total, err
 }

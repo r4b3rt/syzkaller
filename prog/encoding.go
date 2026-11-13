@@ -8,8 +8,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/google/syzkaller/pkg/image"
 )
 
 // String generates a very compact program description (mostly for debug output).
@@ -24,21 +27,30 @@ func (p *Prog) String() string {
 	return buf.String()
 }
 
-func (p *Prog) Serialize() []byte {
-	return p.serialize(false)
-}
+type SerializeFlag int
 
-func (p *Prog) SerializeVerbose() []byte {
-	return p.serialize(true)
-}
+const (
+	// Include all field values, even if they have default values.
+	Verbose SerializeFlag = 0
+	// Don't serialize compressed fs images.
+	// This is used in coverage report generation to prevent the bloating of the resulting HTML file.
+	SkipImages SerializeFlag = 1
+)
 
-func (p *Prog) serialize(verbose bool) []byte {
+func (p *Prog) Serialize(flags ...SerializeFlag) []byte {
 	p.debugValidate()
 	ctx := &serializer{
-		target:  p.Target,
-		buf:     new(bytes.Buffer),
-		vars:    make(map[*ResultArg]int),
-		verbose: verbose,
+		target: p.Target,
+		buf:    new(bytes.Buffer),
+		vars:   make(map[*ResultArg]int),
+	}
+	for _, flag := range flags {
+		switch flag {
+		case Verbose:
+			ctx.verbose = true
+		case SkipImages:
+			ctx.skipImages = true
+		}
 	}
 	for _, c := range p.Calls {
 		ctx.call(c)
@@ -46,15 +58,24 @@ func (p *Prog) serialize(verbose bool) []byte {
 	return ctx.buf.Bytes()
 }
 
-type serializer struct {
-	target  *Target
-	buf     *bytes.Buffer
-	vars    map[*ResultArg]int
-	varSeq  int
-	verbose bool
+func (p *Prog) SerializeVerbose() []byte {
+	return p.Serialize(Verbose)
 }
 
-func (ctx *serializer) printf(text string, args ...interface{}) {
+type serializer struct {
+	target     *Target
+	buf        *bytes.Buffer
+	vars       map[*ResultArg]int
+	varSeq     int
+	verbose    bool
+	skipImages bool
+}
+
+func (ctx *serializer) print(text string) {
+	ctx.printf("%v", text)
+}
+
+func (ctx *serializer) printf(text string, args ...any) {
 	fmt.Fprintf(ctx.buf, text, args...)
 }
 
@@ -79,7 +100,7 @@ func (ctx *serializer) call(c *Call) {
 		}
 		ctx.arg(a)
 	}
-	ctx.printf(")")
+	ctx.print(")")
 
 	anyChangedProps := false
 	c.Props.ForeachProp(func(name, key string, value reflect.Value) {
@@ -89,16 +110,17 @@ func (ctx *serializer) call(c *Call) {
 		}
 
 		if !anyChangedProps {
-			ctx.printf(" (")
+			ctx.print(" (")
 			anyChangedProps = true
 		} else {
-			ctx.printf(", ")
+			ctx.print(", ")
 		}
 
-		ctx.printf(key)
+		ctx.print(key)
 		switch kind := value.Kind(); kind {
 		case reflect.Int:
 			ctx.printf(": %d", value.Int())
+		case reflect.Bool:
 		default:
 			panic("unable to serialize call prop of type " + kind.String())
 		}
@@ -146,19 +168,27 @@ func (a *DataArg) serialize(ctx *serializer) {
 		return
 	}
 	data := a.Data()
-	// Statically typed data will be padded with 0s during deserialization,
-	// so we can strip them here for readability always. For variable-size
-	// data we strip trailing 0s only if we strip enough of them.
-	sz := len(data)
-	for len(data) >= 2 && data[len(data)-1] == 0 && data[len(data)-2] == 0 {
-		data = data[:len(data)-1]
-	}
-	if typ.Varlen() && len(data)+8 >= sz {
-		data = data[:sz]
-	}
-	serializeData(ctx.buf, data, isReadableDataType(typ))
-	if typ.Varlen() && sz != len(data) {
-		ctx.printf("/%v", sz)
+	if typ.IsCompressed() {
+		if ctx.skipImages {
+			ctx.printf(`"<<IMAGE>>"`)
+		} else {
+			serializeCompressedData(ctx.buf, data)
+		}
+	} else {
+		// Statically typed data will be padded with 0s during deserialization,
+		// so we can strip them here for readability always. For variable-size
+		// data we strip trailing 0s only if we strip enough of them.
+		sz := len(data)
+		for len(data) >= 2 && data[len(data)-1] == 0 && data[len(data)-2] == 0 {
+			data = data[:len(data)-1]
+		}
+		if typ.Varlen() && len(data)+8 >= sz {
+			data = data[:sz]
+		}
+		serializeData(ctx.buf, data, isReadableDataType(typ))
+		if typ.Varlen() && sz != len(data) {
+			ctx.printf("/%v", sz)
+		}
 	}
 }
 
@@ -228,8 +258,17 @@ func (a *ResultArg) serialize(ctx *serializer) {
 type DeserializeMode int
 
 const (
-	Strict    DeserializeMode = iota
-	NonStrict DeserializeMode = iota
+	// In strict mode deserialization fails if the program is malformed in any way.
+	// This mode is used for manually written programs to ensure that they are correct.
+	Strict DeserializeMode = iota
+	// In non-strict mode malformed programs silently fixed in a best-effort way,
+	// e.g. missing/wrong arguments are replaced with default values.
+	// This mode is used for the corpus programs to "repair" them after descriptions changes.
+	NonStrict
+	// Unsafe mode is used for VM checking programs. In this mode programs are not fixed
+	// for safety, e.g. can access global files, issue prohibited ioctl's, disabled syscalls, etc.
+	StrictUnsafe
+	NonStrictUnsafe
 )
 
 func (target *Target) Deserialize(data []byte, mode DeserializeMode) (*Prog, error) {
@@ -239,7 +278,9 @@ func (target *Target) Deserialize(data []byte, mode DeserializeMode) (*Prog, err
 				err, target.OS, target.Arch, GitRevision, mode, data))
 		}
 	}()
-	p := newParser(target, data, mode == Strict)
+	strict := mode == Strict || mode == StrictUnsafe
+	unsafe := mode == StrictUnsafe || mode == NonStrictUnsafe
+	p := newParser(target, data, strict, unsafe)
 	prog, err := p.parseProg()
 	if err := p.Err(); err != nil {
 		return nil, err
@@ -250,21 +291,28 @@ func (target *Target) Deserialize(data []byte, mode DeserializeMode) (*Prog, err
 	// This validation is done even in non-debug mode because deserialization
 	// procedure does not catch all bugs (e.g. mismatched types).
 	// And we can receive bad programs from corpus and hub.
-	if err := prog.validate(); err != nil {
+	if err := prog.validateWithOpts(validationOptions{
+		// Don't validate auto-set conditional fields. We'll patch them later.
+		ignoreTransient: true,
+	}); err != nil {
 		return nil, err
 	}
+	p.fixupConditionals(prog)
 	if p.autos != nil {
 		p.fixupAutos(prog)
 	}
-	if err := prog.sanitize(mode == NonStrict); err != nil {
-		return nil, err
+	if !unsafe {
+		if err := prog.sanitize(!strict); err != nil {
+			return nil, err
+		}
 	}
 	return prog, nil
 }
 
 func (p *parser) parseProg() (*Prog, error) {
 	prog := &Prog{
-		Target: p.target,
+		Target:   p.target,
+		isUnsafe: p.unsafe,
 	}
 	for p.Scan() {
 		if p.EOF() {
@@ -376,6 +424,8 @@ func (p *parser) parseCallProps() CallProps {
 			} else {
 				value.SetInt(intV)
 			}
+		case reflect.Bool:
+			value.SetBool(true)
 		default:
 			panic("unable to handle call props of type " + kind.String())
 		}
@@ -408,6 +458,8 @@ func (p *parser) parseArg(typ Type, dir Dir) (Arg, error) {
 	if r != "" {
 		if res, ok := arg.(*ResultArg); ok {
 			p.vars[r] = res
+		} else {
+			p.strictFailf("variable %v doesn't refers to a resource", r)
 		}
 	}
 	return arg, nil
@@ -418,9 +470,10 @@ func (p *parser) parseArgImpl(typ Type, dir Dir) (Arg, error) {
 		p.eatExcessive(true, "non-nil argument for nil type")
 		return nil, nil
 	}
-	switch p.Char() {
-	case '0':
+	if ch := p.Char(); ch >= '0' && ch <= '9' {
 		return p.parseArgInt(typ, dir)
+	}
+	switch p.Char() {
 	case 'r':
 		return p.parseArgRes(typ, dir)
 	case '&':
@@ -446,7 +499,7 @@ func (p *parser) parseArgImpl(typ Type, dir Dir) (Arg, error) {
 		return p.parseAuto(typ, dir)
 	default:
 		return nil, fmt.Errorf("failed to parse argument at '%c' (line #%v/%v: %v)",
-			p.Char(), p.l, p.i, p.s)
+			p.Char(), p.l, p.i, highlightError(p.s, p.i))
 	}
 }
 
@@ -454,7 +507,7 @@ func (p *parser) parseArgInt(typ Type, dir Dir) (Arg, error) {
 	val := p.Ident()
 	v, err := strconv.ParseUint(val, 0, 64)
 	if err != nil {
-		return nil, fmt.Errorf("wrong arg value '%v': %v", val, err)
+		return nil, fmt.Errorf("wrong arg value '%v': %w", val, err)
 	}
 	switch typ.(type) {
 	case *ConstType, *IntType, *FlagsType, *ProcType, *CsumType:
@@ -478,9 +531,20 @@ func (p *parser) parseArgInt(typ Type, dir Dir) (Arg, error) {
 }
 
 func (p *parser) parseAuto(typ Type, dir Dir) (Arg, error) {
-	switch typ.(type) {
+	switch t1 := typ.(type) {
 	case *ConstType, *LenType, *CsumType:
 		return p.auto(MakeConstArg(typ, dir, 0)), nil
+	case *StructType:
+		var inner []Arg
+		for len(inner) < len(t1.Fields) {
+			field := t1.Fields[len(inner)]
+			innerArg, err := p.parseAuto(field.Type, dir)
+			if err != nil {
+				return nil, err
+			}
+			inner = append(inner, innerArg)
+		}
+		return MakeGroupArg(typ, dir, inner), nil
 	default:
 		return nil, fmt.Errorf("wrong type %T for AUTO", typ)
 	}
@@ -521,9 +585,10 @@ func (p *parser) parseArgRes(typ Type, dir Dir) (Arg, error) {
 func (p *parser) parseArgAddr(typ Type, dir Dir) (Arg, error) {
 	var elem Type
 	elemDir := DirInOut
+	squashableElem := false
 	switch t1 := typ.(type) {
 	case *PtrType:
-		elem, elemDir = t1.Elem, t1.ElemDir
+		elem, elemDir, squashableElem = t1.Elem, t1.ElemDir, t1.SquashableElem
 	case *VmaType:
 	default:
 		p.eatExcessive(true, "wrong addr arg %T", typ)
@@ -551,13 +616,15 @@ func (p *parser) parseArgAddr(typ Type, dir Dir) (Arg, error) {
 	var inner Arg
 	if p.Char() == '=' {
 		p.Parse('=')
-		if p.Char() == 'A' {
+		if p.HasNext("ANY") {
 			p.Parse('A')
 			p.Parse('N')
 			p.Parse('Y')
 			p.Parse('=')
-			anyPtr := p.target.getAnyPtrType(typ.Size())
-			typ, elem, elemDir = anyPtr, anyPtr.Elem, anyPtr.ElemDir
+			if squashableElem {
+				anyPtr := p.target.getAnyPtrType(typ.Size())
+				typ, elem, elemDir = anyPtr, anyPtr.Elem, anyPtr.ElemDir
+			}
 		}
 		var err error
 		inner, err = p.parseArg(elem, elemDir)
@@ -588,12 +655,20 @@ func (p *parser) parseArgString(t Type, dir Dir) (Arg, error) {
 		p.eatExcessive(true, "wrong string arg")
 		return t.DefaultArg(dir), nil
 	}
-	data, err := p.deserializeData()
+	data, b64, err := p.deserializeData()
 	if err != nil {
 		return nil, err
 	}
+	// Check compressed data for validity.
+	if typ.IsCompressed() {
+		if err := image.DecompressCheck(data); err != nil {
+			p.strictFailf("invalid compressed data in arg: %v", err)
+			// In non-strict mode, empty the data slice.
+			data = image.Compress(nil)
+		}
+	}
 	size := ^uint64(0)
-	if p.Char() == '/' {
+	if p.Char() == '/' && !b64 {
 		p.Parse('/')
 		sizeStr := p.Ident()
 		size, err = strconv.ParseUint(sizeStr, 0, 64)
@@ -622,13 +697,7 @@ func (p *parser) parseArgString(t Type, dir Dir) (Arg, error) {
 		len(typ.Values) != 0 &&
 		// AUTOGENERATED will be padded by 0's.
 		!strings.HasPrefix(typ.Values[0], "AUTOGENERATED") {
-		matched := false
-		for _, val := range typ.Values {
-			if string(data) == val {
-				matched = true
-				break
-			}
-		}
+		matched := slices.Contains(typ.Values, string(data))
 		if !matched {
 			p.strictFailf("bad string value %q, expect %q", data, typ.Values)
 			data = []byte(typ.Values[0])
@@ -641,7 +710,7 @@ func (p *parser) parseArgStruct(typ Type, dir Dir) (Arg, error) {
 	p.Parse('{')
 	t1, ok := typ.(*StructType)
 	if !ok {
-		p.eatExcessive(false, "wrong struct arg")
+		p.eatExcessive(false, "wrong struct arg for %q", typ.Name())
 		p.Parse('}')
 		return typ.DefaultArg(dir), nil
 	}
@@ -709,7 +778,7 @@ func (p *parser) parseArgArray(typ Type, dir Dir) (Arg, error) {
 func (p *parser) parseArgUnion(typ Type, dir Dir) (Arg, error) {
 	t1, ok := typ.(*UnionType)
 	if !ok {
-		p.eatExcessive(true, "wrong union arg")
+		p.eatExcessive(true, "wrong union arg for %q", typ.Name())
 		return typ.DefaultArg(dir), nil
 	}
 	p.Parse('@')
@@ -717,6 +786,7 @@ func (p *parser) parseArgUnion(typ Type, dir Dir) (Arg, error) {
 	var (
 		optType Type
 		optDir  Dir
+		options []string
 	)
 	index := -1
 	for i, field := range t1.Fields {
@@ -724,9 +794,11 @@ func (p *parser) parseArgUnion(typ Type, dir Dir) (Arg, error) {
 			optType, index, optDir = field.Type, i, field.Dir(dir)
 			break
 		}
+		options = append(options, fmt.Sprintf("%q", field.Name))
 	}
 	if optType == nil {
-		p.eatExcessive(true, "wrong union option")
+		p.eatExcessive(true, "wrong option %q of union %q, available options are: %s",
+			name, typ.Name(), strings.Join(options, ", "))
 		return typ.DefaultArg(dir), nil
 	}
 	var opt Arg
@@ -744,7 +816,7 @@ func (p *parser) parseArgUnion(typ Type, dir Dir) (Arg, error) {
 }
 
 // Eats excessive call arguments and struct fields to recover after description changes.
-func (p *parser) eatExcessive(stopAtComma bool, what string, args ...interface{}) {
+func (p *parser) eatExcessive(stopAtComma bool, what string, args ...any) {
 	p.strictFailf(what, args...)
 	paren, brack, brace := 0, 0, 0
 	for !p.EOF() && p.e == nil {
@@ -807,31 +879,8 @@ func (p *parser) parseAddr() (uint64, uint64, error) {
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to parse addr: %q", pstr)
 	}
-	if addr < encodingAddrBase {
-		return 0, 0, fmt.Errorf("address without base offset: %q", pstr)
-	}
 	addr -= encodingAddrBase
-	// This is not used anymore, but left here to parse old programs.
-	if p.Char() == '+' || p.Char() == '-' {
-		minus := false
-		if p.Char() == '-' {
-			minus = true
-			p.Parse('-')
-		} else {
-			p.Parse('+')
-		}
-		ostr := p.Ident()
-		off, err := strconv.ParseUint(ostr, 0, 64)
-		if err != nil {
-			return 0, 0, fmt.Errorf("failed to parse addr offset: %q", ostr)
-		}
-		if minus {
-			off = -off
-		}
-		addr += off
-	}
 	target := p.target
-	maxMem := target.NumPages * target.PageSize
 	var vmaSize uint64
 	if p.Char() == '/' {
 		p.Parse('/')
@@ -845,11 +894,10 @@ func (p *parser) parseAddr() (uint64, uint64, error) {
 		if vmaSize == 0 {
 			vmaSize = target.PageSize
 		}
-		if vmaSize > maxMem {
-			vmaSize = maxMem
-		}
-		if addr > maxMem-vmaSize {
-			addr = maxMem - vmaSize
+		if !p.unsafe {
+			maxMem := target.NumPages * target.PageSize
+			vmaSize = min(vmaSize, maxMem)
+			addr = min(addr, maxMem-vmaSize)
 		}
 	}
 	p.Parse(')')
@@ -864,6 +912,13 @@ func serializeData(buf *bytes.Buffer, data []byte, readable bool) {
 	buf.WriteByte('\'')
 	encodeData(buf, data, true, false)
 	buf.WriteByte('\'')
+}
+
+func serializeCompressedData(buf *bytes.Buffer, data []byte) {
+	buf.WriteByte('"')
+	buf.WriteByte('$')
+	buf.Write(image.EncodeB64(data))
+	buf.WriteByte('"')
 }
 
 func EncodeData(buf *bytes.Buffer, data []byte, readable bool) {
@@ -943,10 +998,26 @@ func isReadableData(data []byte) bool {
 	return true
 }
 
-func (p *parser) deserializeData() ([]byte, error) {
+// Deserialize data, returning the data and whether it was encoded in Base64.
+func (p *parser) deserializeData() ([]byte, bool, error) {
 	var data []byte
 	if p.Char() == '"' {
 		p.Parse('"')
+		if p.Char() == '$' {
+			// Read Base64 data.
+			p.consume()
+			var rawData []byte
+			for !p.EOF() && p.Char() != '"' {
+				v := p.consume()
+				rawData = append(rawData, v)
+			}
+			p.Parse('"')
+			decoded, err := image.DecodeB64(rawData)
+			if err != nil {
+				return nil, false, fmt.Errorf("data arg is corrupt: %w", err)
+			}
+			return decoded, true, nil
+		}
 		val := ""
 		if p.Char() != '"' {
 			val = p.Ident()
@@ -955,11 +1026,11 @@ func (p *parser) deserializeData() ([]byte, error) {
 		var err error
 		data, err = hex.DecodeString(val)
 		if err != nil {
-			return nil, fmt.Errorf("data arg has bad value %q", val)
+			return nil, false, fmt.Errorf("data arg has bad value %q", val)
 		}
 	} else {
 		if p.consume() != '\'' {
-			return nil, fmt.Errorf("data arg does not start with \" nor with '")
+			return nil, false, fmt.Errorf("data arg does not start with \" nor with '")
 		}
 		for p.Char() != '\'' && p.Char() != 0 {
 			v := p.consume()
@@ -974,7 +1045,7 @@ func (p *parser) deserializeData() ([]byte, error) {
 				lo := p.consume()
 				b, ok := hexToByte(lo, hi)
 				if !ok {
-					return nil, fmt.Errorf("invalid hex \\x%v%v in data arg", hi, lo)
+					return nil, false, fmt.Errorf("invalid hex \\x%v%v in data arg", hi, lo)
 				}
 				data = append(data, b)
 			case 'a':
@@ -998,12 +1069,12 @@ func (p *parser) deserializeData() ([]byte, error) {
 			case '\\':
 				data = append(data, '\\')
 			default:
-				return nil, fmt.Errorf("invalid \\%c escape sequence in data arg", v)
+				return nil, false, fmt.Errorf("invalid \\%c escape sequence in data arg", v)
 			}
 		}
 		p.Parse('\'')
 	}
-	return data, nil
+	return data, false, nil
 }
 
 func isPrintable(v byte) bool {
@@ -1043,6 +1114,7 @@ func fromHexChar(v byte) (byte, bool) {
 type parser struct {
 	target  *Target
 	strict  bool
+	unsafe  bool
 	vars    map[string]*ResultArg
 	autos   map[Arg]bool
 	comment string
@@ -1054,10 +1126,11 @@ type parser struct {
 	e    error
 }
 
-func newParser(target *Target, data []byte, strict bool) *parser {
+func newParser(target *Target, data []byte, strict, unsafe bool) *parser {
 	p := &parser{
 		target: target,
 		strict: strict,
+		unsafe: unsafe,
 		vars:   make(map[string]*ResultArg),
 		data:   data,
 	}
@@ -1087,7 +1160,9 @@ func (p *parser) fixupAutos(prog *Prog) {
 				_ = s
 			case *PtrType:
 				a := arg.(*PointerArg)
-				a.Address = s.ma.alloc(nil, a.Res.Size(), a.Res.Type().Alignment())
+				a.Address = s.ma.alloc(a.Res.Size(), a.Res.Type().Alignment())
+			case *CsumType:
+				// Checksums are computed at runtime, no need to fixup.
 			default:
 				panic(fmt.Sprintf("unsupported auto type %T", typ))
 			}
@@ -1098,18 +1173,29 @@ func (p *parser) fixupAutos(prog *Prog) {
 	}
 }
 
+func (p *parser) fixupConditionals(prog *Prog) {
+	for _, c := range prog.Calls {
+		// Only overwrite transient union fields.
+		c.setDefaultConditions(p.target, true)
+	}
+}
+
 func (p *parser) Scan() bool {
 	if p.e != nil || len(p.data) == 0 {
 		return false
 	}
 	nextLine := bytes.IndexByte(p.data, '\n')
+	var line []byte
 	if nextLine != -1 {
-		p.s = string(p.data[:nextLine])
+		line = p.data[:nextLine]
 		p.data = p.data[nextLine+1:]
 	} else {
-		p.s = string(p.data)
+		line = p.data
 		p.data = nil
 	}
+	line = bytes.TrimLeft(line, " \t")
+	line = bytes.TrimRight(line, " \t\r")
+	p.s = string(line)
 	p.i = 0
 	p.l++
 	return true
@@ -1117,10 +1203,6 @@ func (p *parser) Scan() bool {
 
 func (p *parser) Err() error {
 	return p.e
-}
-
-func (p *parser) Str() string {
-	return p.s
 }
 
 func (p *parser) EOF() bool {
@@ -1136,6 +1218,21 @@ func (p *parser) Char() byte {
 		return 0
 	}
 	return p.s[p.i]
+}
+
+func (p *parser) HasNext(str string) bool {
+	if p.e != nil {
+		return false
+	}
+	if len(p.s) < p.i+len(str) {
+		return false
+	}
+	for i := range len(str) {
+		if p.s[p.i+i] != str[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *parser) Parse(ch byte) {
@@ -1191,13 +1288,14 @@ func (p *parser) Ident() string {
 	return s
 }
 
-func (p *parser) failf(msg string, args ...interface{}) {
+func (p *parser) failf(msg string, args ...any) {
 	if p.e == nil {
-		p.e = fmt.Errorf("%v\nline #%v:%v: %v", fmt.Sprintf(msg, args...), p.l, p.i, p.s)
+		p.e = fmt.Errorf("%v\nline #%v:%v: %v", fmt.Sprintf(msg, args...), p.l, p.i,
+			highlightError(p.s, p.i))
 	}
 }
 
-func (p *parser) strictFailf(msg string, args ...interface{}) {
+func (p *parser) strictFailf(msg string, args ...any) {
 	if p.strict {
 		p.failf(msg, args...)
 	}
@@ -1220,11 +1318,10 @@ func CallSet(data []byte) (map[string]struct{}, int, error) {
 		if len(ln) == 0 || ln[0] == '#' {
 			continue
 		}
-		bracket := bytes.IndexByte(ln, '(')
-		if bracket == -1 {
+		call, _, ok := bytes.Cut(ln, []byte{'('})
+		if !ok {
 			return nil, 0, fmt.Errorf("line does not contain opening bracket")
 		}
-		call := ln[:bracket]
 		if eq := bytes.IndexByte(call, '='); eq != -1 {
 			eq++
 			for eq < len(call) && call[eq] == ' ' {
@@ -1242,4 +1339,8 @@ func CallSet(data []byte) (map[string]struct{}, int, error) {
 		return nil, 0, fmt.Errorf("program does not contain any calls")
 	}
 	return calls, ncalls, nil
+}
+
+func highlightError(s string, offset int) string {
+	return s[:offset] + "<<<!!ERROR!!>>>" + s[offset:]
 }

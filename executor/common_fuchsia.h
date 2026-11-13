@@ -160,7 +160,7 @@ static void event_reset(event_t* ev)
 static void event_set(event_t* ev)
 {
 	if (ev->state)
-		fail("event already set");
+		exitf("event already set");
 	__atomic_store_n(&ev->state, 1, __ATOMIC_RELEASE);
 }
 
@@ -259,7 +259,7 @@ static long syz_future_time(volatile long when)
 		break;
 	}
 	zx_time_t now = 0;
-	zx_clock_get(ZX_CLOCK_MONOTONIC, &now);
+	zx_clock_read(ZX_CLOCK_MONOTONIC, &now);
 	return now + delta_ms * 1000 * 1000;
 }
 #endif

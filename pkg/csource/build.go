@@ -6,9 +6,11 @@ package csource
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
+	"testing"
 
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
@@ -17,7 +19,7 @@ import (
 
 // Build builds a C program from source src and returns name of the resulting binary.
 func Build(target *prog.Target, src []byte) (string, error) {
-	return build(target, src, "", true)
+	return build(target, src, "", "")
 }
 
 // BuildNoWarn is the same as Build, but ignores all compilation warnings.
@@ -25,17 +27,28 @@ func Build(target *prog.Target, src []byte) (string, error) {
 // using an old repro with newer compiler, or a compiler that we never seen before.
 // In these cases it's more important to build successfully.
 func BuildNoWarn(target *prog.Target, src []byte) (string, error) {
-	return build(target, src, "", false)
+	return build(target, src, "", "", "-fpermissive", "-w")
 }
 
-// BuildFile builds a C/C++ program from file src and returns name of the resulting binary.
-func BuildFile(target *prog.Target, src string) (string, error) {
-	return build(target, nil, src, true)
+// BuildExecutor builds the executor binary for tests.
+// rootDir must point to syzkaller root directory in slash notation.
+func BuildExecutor(t *testing.T, target *prog.Target, rootDir string, cflags ...string) string {
+	// Build w/o optimizations for tests. Tests can build lots of versions of executor in parallel,
+	// and on overloaded machines it can be slow. On my machine this reduces executor build time
+	// from ~7.5 to ~3.5 secs.
+	cflags = append(cflags, "-O0")
+	bin, err := build(target, nil, filepath.FromSlash(rootDir),
+		filepath.FromSlash("executor/executor.cc"), cflags...)
+	if err != nil {
+		t.Fatalf("failed to build executor: %v", err)
+	}
+	t.Cleanup(func() {
+		os.Remove(bin)
+	})
+	return bin
 }
 
-func build(target *prog.Target, src []byte, file string, warn bool) (string, error) {
-	sysTarget := targets.Get(target.OS, target.Arch)
-	compiler := sysTarget.CCompiler
+func build(target *prog.Target, src []byte, dir, file string, cflags ...string) (string, error) {
 	// We call the binary syz-executor because it sometimes shows in bug titles,
 	// and we don't want 2 different bugs for when a crash is triggered during fuzzing and during repro.
 	bin, err := osutil.TempFile("syz-executor")
@@ -54,15 +67,19 @@ func build(target *prog.Target, src []byte, file string, warn bool) (string, err
 	} else {
 		flags = append(flags, file)
 	}
-	flags = append(flags, sysTarget.CFlags...)
+	sysTarget := targets.Get(target.OS, target.Arch)
+	compiler, targetCFlags := sysTarget.CCompiler, sysTarget.CFlags
+	if file != "" && !strings.HasSuffix(file, ".c") {
+		compiler, targetCFlags = sysTarget.CxxCompiler, sysTarget.CxxFlags
+	}
+	flags = append(flags, targetCFlags...)
+	flags = append(flags, cflags...)
 	if sysTarget.PtrSize == 4 {
 		// We do generate uint64's for syscall arguments that overflow longs on 32-bit archs.
 		flags = append(flags, "-Wno-overflow")
 	}
-	if !warn {
-		flags = append(flags, "-fpermissive", "-w")
-	}
 	cmd := osutil.Command(compiler, flags...)
+	cmd.Dir = dir
 	if file == "" {
 		cmd.Stdin = bytes.NewReader(src)
 	}
@@ -70,7 +87,7 @@ func build(target *prog.Target, src []byte, file string, warn bool) (string, err
 	if err != nil {
 		os.Remove(bin)
 		if file != "" {
-			src, _ = ioutil.ReadFile(file)
+			src, _ = os.ReadFile(file)
 		}
 		return "", fmt.Errorf("failed to build program:\n%s\n%s\ncompiler invocation: %v %v",
 			src, out, compiler, flags)
@@ -86,7 +103,7 @@ func Format(src []byte) ([]byte, error) {
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
-		return src, fmt.Errorf("failed to format source: %v\n%v", err, stderr.String())
+		return src, fmt.Errorf("failed to format source: %w\n%v", err, stderr.String())
 	}
 	return stdout.Bytes(), nil
 }

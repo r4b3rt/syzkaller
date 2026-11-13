@@ -26,19 +26,20 @@ line = assignment | call
 assignment = variable " = " call
 call = syscall-name "(" [arg ["," arg]*] ")"  ["(" [call-prop ["," call-prop*] ")"]
 arg = "nil" | "AUTO" | const-arg | resource-arg | result-arg | pointer-arg | string-arg | struct-arg | array-arg | union-arg
-const-arg = "0x" hex-integer
+const-arg = integer
 resource-arg = variable ["/" hex-integer] ["+" hex-integer]
 result-arg = "<" variable "=>" arg
 pointer-arg = "&" pointer-arg-addr ["=ANY"] "=" arg
 pointer-arg-addr = "AUTO" | "(" pointer-addr ["/" region-size] ")"
-string-arg = "'" escaped-string "'" | "\"" escaped-string "\""
+string-arg = "'" escaped-string "'" | "\"" escaped-string "\"" | "\"$" escaped-string "\""
 struct-arg =  "{" [arg ["," arg]*] "}"
 array-arg = "[" [arg ["," arg]*] "]"
 union-arg = "@" field-name ["=" arg]
 call-prop = prop-name ": " prop-value
 variable = "r" dec-integer
-pointer-addr = hex-integer
-region-size = hex-integer
+pointer-addr = integer
+region-size = integer
+integer = dec-integer | oct-integer | "0x" hex-integer
 ```
 
 Programs may also contain blank lines and comments.
@@ -91,3 +92,25 @@ non-negative, a fault will be injected into the `N`-th occasion.
 r0 = openat$6lowpan_control(0xffffffffffffff9c, &(0x7f00000000c0), 0x2, 0x0)
 ioctl$LOOP_SET_FD(r0, 0x4c00, r0) (fail_nth: 5)
 ```
+
+#### Async
+Syntax: `async`.
+
+Instructs `syz-executor` not to wait until the call completes and
+to proceed immediately to the next call.
+
+```
+r0 = openat(0xffffffffffffff9c, &AUTO='./file1\x00', 0x42, 0x1ff)
+write(r0, &AUTO="01010101", 0x4) (async)
+read(r0, &AUTO=""/4, 0x4)
+close(r0)
+```
+
+When setting `async` flags be aware of the following considerations:
+* Such programs should only be executed in threaded mode (i.e. `-threaded`
+flag must be passed to `syz-executor`.
+* Each `async` call is executed in a separate thread and there's a
+limited number of available threads (`kMaxThreads = 16`).
+* If an `async` call produces a resource, keep in mind that some other call
+might take it as input and `syz-executor` will just pass 0 if the resource-
+producing call has not finished by that time.

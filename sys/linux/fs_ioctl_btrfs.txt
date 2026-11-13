@@ -61,6 +61,9 @@ ioctl$BTRFS_IOC_SET_FEATURES(fd fd, cmd const[BTRFS_IOC_SET_FEATURES], arg ptr[i
 ioctl$BTRFS_IOC_GET_SUBVOL_INFO(fd fd, cmd const[BTRFS_IOC_GET_SUBVOL_INFO], arg ptr[out, btrfs_ioctl_get_subvol_info_args])
 ioctl$BTRFS_IOC_GET_SUBVOL_ROOTREF(fd fd, cmd const[BTRFS_IOC_GET_SUBVOL_ROOTREF], arg ptr[inout, btrfs_ioctl_get_subvol_rootref_args])
 ioctl$BTRFS_IOC_INO_LOOKUP_USER(fd fd, cmd const[BTRFS_IOC_INO_LOOKUP_USER], arg ptr[inout, btrfs_ioctl_ino_lookup_user_args])
+ioctl$BTRFS_IOC_ENCODED_READ(fd fd, cmd const[BTRFS_IOC_ENCODED_READ], arg ptr[inout, btrfs_ioctl_encoded_io_args])
+ioctl$BTRFS_IOC_ENCODED_WRITE(fd fd, cmd const[BTRFS_IOC_ENCODED_WRITE], arg ptr[in, btrfs_ioctl_encoded_io_args])
+ioctl$BTRFS_IOC_SUBVOL_SYNC_WAIT(fd fd, cmd const[BTRFS_IOC_SUBVOL_SYNC_WAIT], arg ptr[inout, btrfs_ioctl_subvol_wait])
 
 resource transid[int64]
 resource devid[int64]
@@ -275,12 +278,13 @@ btrfs_ioctl_timespec {
 }
 
 btrfs_ioctl_send_args {
-	send_fd			align64[fd]
+	send_fd			padto64[fd]
 	clone_sources_count	len[clone_sources, int64]
 	clone_sources		ptr[in, array[subvolid]]
 	parent_root		int64
 	flags			flags[btrfs_ioctl_send_flags, int64]
-	reserved		array[int64, 4]
+	version			int32[0:1]
+	reserved		array[const[0, int8], 28]
 }
 
 #This pads the struct to 1032 bytes. It was originally meant to pad to
@@ -424,6 +428,25 @@ btrfs_ioctl_resize_size_num {
 	kKmM		flags[all_these_kKmM, int8]
 } [packed]
 
+btrfs_ioctl_encoded_io_args {
+	iov			ptr[in, array[iovec_inout]]
+	iovcnt			len[iov, int64]
+	offset			int64
+	flags			const[0, int64]
+	len			int64
+	unencoded_len		int64
+	unencoded_offset	int64
+	compression		flags[btrfs_encoded_io_compression, int32]
+	encryption		int32
+	reserved		array[const[0, int32], 2]
+}
+
+btrfs_ioctl_subvol_wait {
+	subvolid	subvolid
+	mode		flags[btrfs_ioctl_subvol_wait_mode, int32]
+	count		int32
+}
+
 plus_minus = '+', '-'
 all_these_kKmM = 'k', 'K', 'm', 'M', 'g', 'G', 't', 'T', 'p', 'P', 'e', 'E'
 
@@ -439,11 +462,13 @@ btrfs_balance_ctl_values = BTRFS_BALANCE_CTL_PAUSE, BTRFS_BALANCE_CTL_CANCEL
 btrfs_balance_args_flags = BTRFS_BALANCE_ARGS_PROFILES, BTRFS_BALANCE_ARGS_USAGE, BTRFS_BALANCE_ARGS_DEVID, BTRFS_BALANCE_ARGS_DRANGE, BTRFS_BALANCE_ARGS_VRANGE, BTRFS_BALANCE_ARGS_LIMIT, BTRFS_BALANCE_ARGS_LIMIT_RANGE, BTRFS_BALANCE_ARGS_STRIPES_RANGE, BTRFS_BALANCE_ARGS_USAGE_RANGE
 btrfs_ioctl_balance_args_states = BTRFS_BALANCE_STATE_RUNNING, BTRFS_BALANCE_STATE_PAUSE_REQ, BTRFS_BALANCE_STATE_CANCEL_REQ
 btrfs_ioctl_balance_args_flags = BTRFS_BALANCE_DATA, BTRFS_BALANCE_SYSTEM, BTRFS_BALANCE_METADATA, BTRFS_BALANCE_FORCE, BTRFS_BALANCE_RESUME
-btrfs_ioctl_send_flags = BTRFS_SEND_FLAG_NO_FILE_DATA, BTRFS_SEND_FLAG_OMIT_STREAM_HEADER, BTRFS_SEND_FLAG_OMIT_END_CMD
+btrfs_ioctl_send_flags = BTRFS_SEND_FLAG_NO_FILE_DATA, BTRFS_SEND_FLAG_OMIT_STREAM_HEADER, BTRFS_SEND_FLAG_OMIT_END_CMD, BTRFS_SEND_FLAG_VERSION
 btrfs_ioctl_get_dev_stats_flags = BTRFS_DEV_STATS_RESET
 btrfs_ioctl_quota_ctl_cmd = BTRFS_QUOTA_CTL_ENABLE, BTRFS_QUOTA_CTL_DISABLE, BTRFS_QUOTA_CTL_RESCAN__NOTUSED
 btrfs_ioctl_dev_replace_args_cmd = BTRFS_IOCTL_DEV_REPLACE_CMD_START, BTRFS_IOCTL_DEV_REPLACE_CMD_STATUS, BTRFS_IOCTL_DEV_REPLACE_CMD_CANCEL, BTRFS_IOCTL_DEV_REPLACE_RESULT_NO_ERROR, BTRFS_IOCTL_DEV_REPLACE_RESULT_NOT_STARTED, BTRFS_IOCTL_DEV_REPLACE_RESULT_ALREADY_STARTED, BTRFS_IOCTL_DEV_REPLACE_RESULT_SCRUB_INPROGRESS
 cont_reading_from_srcdev_mode_flags = BTRFS_IOCTL_DEV_REPLACE_CONT_READING_FROM_SRCDEV_MODE_ALWAYS, BTRFS_IOCTL_DEV_REPLACE_CONT_READING_FROM_SRCDEV_MODE_AVOID
-btrfs_ioctl_feature_compat_flags = BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE, BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID
+btrfs_ioctl_feature_compat_flags = btrfs_ioctl_feature_compat_ro_flags
 btrfs_ioctl_feature_compat_ro_flags = BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE, BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID
 btrfs_ioctl_feature_incompat_flags = BTRFS_FEATURE_INCOMPAT_MIXED_BACKREF, BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL, BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS, BTRFS_FEATURE_INCOMPAT_COMPRESS_LZO, BTRFS_FEATURE_INCOMPAT_COMPRESS_ZSTD
+btrfs_encoded_io_compression = BTRFS_ENCODED_IO_COMPRESSION_NONE, BTRFS_ENCODED_IO_COMPRESSION_ZLIB, BTRFS_ENCODED_IO_COMPRESSION_ZSTD, BTRFS_ENCODED_IO_COMPRESSION_LZO_4K, BTRFS_ENCODED_IO_COMPRESSION_LZO_8K, BTRFS_ENCODED_IO_COMPRESSION_LZO_16K, BTRFS_ENCODED_IO_COMPRESSION_LZO_32K, BTRFS_ENCODED_IO_COMPRESSION_LZO_64K, BTRFS_ENCODED_IO_COMPRESSION_TYPES
+btrfs_ioctl_subvol_wait_mode = BTRFS_SUBVOL_SYNC_WAIT_FOR_ONE, BTRFS_SUBVOL_SYNC_WAIT_FOR_QUEUED, BTRFS_SUBVOL_SYNC_COUNT, BTRFS_SUBVOL_SYNC_PEEK_FIRST, BTRFS_SUBVOL_SYNC_PEEK_LAST

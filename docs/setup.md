@@ -3,8 +3,8 @@
 Generic setup instructions for fuzzing Linux kernel are outlined [here](linux/setup.md).
 
 For other kernels see:
-[Akaros](akaros/README.md),
 [FreeBSD](freebsd/README.md),
+[Darwin/XNU](darwin/README.md),
 [Fuchsia](fuchsia/README.md),
 [NetBSD](netbsd/README.md),
 [OpenBSD](openbsd/setup.md),

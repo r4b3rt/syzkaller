@@ -25,8 +25,14 @@ CONFIG_DEBUG_KMEMLEAK=y
 ```
 
 To show code coverage in web interface:
+
+For Linux < 5.12
 ```
 CONFIG_DEBUG_INFO=y
+```
+For Linux >= 5.12
+```
+CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
 ```
 
 For detection of enabled syscalls and kernel bitness:
@@ -51,7 +57,7 @@ For `namespace` sandbox:
 CONFIG_USER_NS=y
 ```
 
-For running in VMs `make kvmconfig` is generally required.
+For running in VMs `make kvm_guest.config` is generally required.
 
 Debian images produced by [tools/create-image.sh](/tools/create-image.sh) also require:
 ```

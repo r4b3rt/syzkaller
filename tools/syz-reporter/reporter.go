@@ -12,19 +12,19 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
-	"github.com/google/syzkaller/pkg/html"
+	"github.com/google/syzkaller/pkg/html/pages"
 	"github.com/google/syzkaller/pkg/kconfig"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
@@ -93,7 +93,7 @@ func httpSummary(w io.Writer, cfg *mgrconfig.Config) error {
 
 	var err error
 	if data.Crashes, err = collectCrashes(cfg.Workdir); err != nil {
-		return fmt.Errorf("failed to collect crashes: %v", err)
+		return fmt.Errorf("failed to collect crashes: %w", err)
 	}
 
 	data.CrashCount = len(data.Crashes)
@@ -105,7 +105,7 @@ func httpSummary(w io.Writer, cfg *mgrconfig.Config) error {
 	}
 
 	if err = summaryTemplate.Execute(w, data); err != nil {
-		return fmt.Errorf("failed to execute template: %v", err)
+		return fmt.Errorf("failed to execute template: %w", err)
 	}
 
 	return err
@@ -124,12 +124,13 @@ func collectCrashes(workdir string) ([]*UICrashType, error) {
 			crashTypes = append(crashTypes, crash)
 		}
 	}
-	sort.Slice(crashTypes, func(i, j int) bool {
-		return strings.ToLower(crashTypes[i].Description) < strings.ToLower(crashTypes[j].Description)
+	slices.SortFunc(crashTypes, func(a, b *UICrashType) int {
+		return cmp.Compare(strings.ToLower(a.Description), strings.ToLower(b.Description))
 	})
 	return crashTypes, nil
 }
 
+// TODO: reuse manager.CrashStore.
 func readCrash(workdir, dir string) *UICrashType {
 	if len(dir) != 40 {
 		return nil
@@ -140,7 +141,7 @@ func readCrash(workdir, dir string) *UICrashType {
 		return nil
 	}
 	defer descFile.Close()
-	descBytes, err := ioutil.ReadAll(descFile)
+	descBytes, err := io.ReadAll(descFile)
 	if err != nil || len(descBytes) == 0 {
 		return nil
 	}
@@ -168,7 +169,7 @@ func readCrash(workdir, dir string) *UICrashType {
 		}
 
 		if strings.HasPrefix(f, "tag") {
-			tag, err := ioutil.ReadFile(filepath.Join(crashdir, dir, f))
+			tag, err := os.ReadFile(filepath.Join(crashdir, dir, f))
 			if err == nil {
 				reproducers[string(tag)] = string(tag)
 			}
@@ -179,19 +180,19 @@ func readCrash(workdir, dir string) *UICrashType {
 		}
 
 		if f == "cause.commit" {
-			commits, err := ioutil.ReadFile(filepath.Join(crashdir, dir, f))
+			commits, err := os.ReadFile(filepath.Join(crashdir, dir, f))
 			if err == nil {
 				causingCommits = strings.Split(string(commits), "\n")
 			}
 		}
 		if f == "fix.commit" {
-			commits, err := ioutil.ReadFile(filepath.Join(crashdir, dir, f))
+			commits, err := os.ReadFile(filepath.Join(crashdir, dir, f))
 			if err == nil {
 				fixingCommits = strings.Split(string(commits), "\n")
 			}
 		}
 		if f == kconfig.CauseConfigFile {
-			configs, err := ioutil.ReadFile(filepath.Join(crashdir, dir, f))
+			configs, err := os.ReadFile(filepath.Join(crashdir, dir, f))
 			if err == nil {
 				configsList := strings.Split(string(configs), "\n")
 				// Ignore configuration list longer than 10
@@ -223,7 +224,7 @@ func trimNewLines(data []byte) []byte {
 	return data
 }
 
-var summaryTemplate = html.CreatePage(`
+var summaryTemplate = pages.Create(`
 <!doctype html>
 <html>
 <head>

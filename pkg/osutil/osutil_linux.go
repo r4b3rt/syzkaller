@@ -5,34 +5,34 @@ package osutil
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io/fs"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"os/user"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-// RemoveAll is similar to os.RemoveAll, but can handle more cases.
-func RemoveAll(dir string) error {
-	files, _ := ioutil.ReadDir(dir)
-	for _, f := range files {
-		name := filepath.Join(dir, f.Name())
-		if f.IsDir() {
-			RemoveAll(name)
-		}
-		unix.Unmount(name, unix.MNT_FORCE)
+func fileTimes(file string) (time.Time, time.Time, error) {
+	// Btime stands for "birth" time, which is creation time.
+	var statx unix.Statx_t
+	err := unix.Statx(unix.AT_FDCWD, file, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_BTIME|unix.STATX_MTIME, &statx)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
 	}
-	if err := os.RemoveAll(dir); err != nil {
-		removeImmutable(dir)
-		return os.RemoveAll(dir)
+	modTime := time.Unix(statx.Mtime.Sec, int64(statx.Mtime.Nsec))
+	// Some filesystems may not store the birth time.
+	creationTime := modTime
+	if statx.Mask&unix.STATX_BTIME != 0 {
+		creationTime = time.Unix(statx.Btime.Sec, int64(statx.Btime.Nsec))
 	}
-	return nil
+	return creationTime, modTime, nil
 }
 
 func SystemMemorySize() uint64 {
@@ -41,14 +41,31 @@ func SystemMemorySize() uint64 {
 	return uint64(info.Totalram) // nolint:unconvert
 }
 
-func removeImmutable(fname string) error {
-	// Reset FS_XFLAG_IMMUTABLE/FS_XFLAG_APPEND.
-	fd, err := syscall.Open(fname, syscall.O_RDONLY, 0)
+func AvailableMemorySize() (uint64, error) {
+	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
-		return err
+		return 0, err
 	}
-	defer syscall.Close(fd)
-	return unix.IoctlSetPointerInt(fd, unix.FS_IOC_SETFLAGS, 0)
+	return parseMemAvailable(string(data))
+}
+
+func parseMemAvailable(meminfo string) (uint64, error) {
+	for line := range strings.SplitSeq(meminfo, "\n") {
+		rest, ok := strings.CutPrefix(line, "MemAvailable:")
+		if !ok {
+			continue
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			break
+		}
+		kb, err := strconv.ParseUint(fields[0], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse MemAvailable %q: %w", fields[0], err)
+		}
+		return kb << 10, nil
+	}
+	return 0, fmt.Errorf("MemAvailable not found in /proc/meminfo")
 }
 
 func Sandbox(cmd *exec.Cmd, user, net bool) error {
@@ -72,63 +89,118 @@ func Sandbox(cmd *exec.Cmd, user, net bool) error {
 	return nil
 }
 
-func SandboxChown(file string) error {
+// SandboxChown changes ownership of the given files or directories to the
+// sandbox user without following symlinks.
+func SandboxChown(files ...string) error {
 	enabled, uid, gid, err := initSandbox()
 	if err != nil || !enabled {
 		return err
 	}
-	return os.Chown(file, int(uid), int(gid))
+	for _, file := range files {
+		if err := os.Lchown(file, int(uid), int(gid)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sandboxChownFile changes ownership of the opened file f to the sandbox user.
+func sandboxChownFile(f *os.File) error {
+	enabled, uid, gid, err := initSandbox()
+	if err != nil || !enabled {
+		return err
+	}
+	return f.Chown(int(uid), int(gid))
 }
 
 var (
 	sandboxOnce     sync.Once
-	sandboxEnabled  = true
 	sandboxUsername = "syzkaller"
 	sandboxUID      = ^uint32(0)
 	sandboxGID      = ^uint32(0)
 )
 
 func initSandbox() (bool, uint32, uint32, error) {
+	if syscall.Getuid() != 0 || os.Getenv("SYZ_DISABLE_SANDBOXING") == "yes" {
+		return false, 0, 0, nil
+	}
 	sandboxOnce.Do(func() {
-		if syscall.Getuid() != 0 || os.Getenv("CI") != "" || os.Getenv("SYZ_DISABLE_SANDBOXING") == "yes" {
-			sandboxEnabled = false
-			return
+		if u, err := user.Lookup(sandboxUsername); err == nil {
+			uid, err1 := strconv.ParseUint(u.Uid, 10, 32)
+			gid, err2 := strconv.ParseUint(u.Gid, 10, 32)
+			if err1 == nil && err2 == nil {
+				sandboxUID = uint32(uid)
+				sandboxGID = uint32(gid)
+			}
 		}
-		uid, err := usernameToID("-u")
-		if err != nil {
-			return
-		}
-		gid, err := usernameToID("-g")
-		if err != nil {
-			return
-		}
-		sandboxUID = uid
-		sandboxGID = gid
 	})
-	if sandboxEnabled && sandboxUID == ^uint32(0) {
+	if sandboxUID == ^uint32(0) {
 		return false, 0, 0, fmt.Errorf("user %q is not found, can't sandbox command", sandboxUsername)
 	}
-	return sandboxEnabled, sandboxUID, sandboxGID, nil
+	return true, sandboxUID, sandboxGID, nil
 }
 
-func usernameToID(what string) (uint32, error) {
-	out, err := RunCmd(time.Minute, "", "id", what, sandboxUsername)
-	if err != nil {
-		return 0, err
+// RequireSandbox verifies that osutil.Sandbox is available for the test.
+// The test is skipped if sandboxing is not available (not running as root,
+// SYZ_DISABLE_SANDBOXING=yes, or no syzkaller user), unless CI is set: on CI
+// sandboxing must be available, so the test fails instead.
+func RequireSandbox(t *testing.T) {
+	t.Helper()
+	skip := func(msg string) {
+		t.Helper()
+		if os.Getenv("CI") != "" {
+			t.Fatalf("sandbox tests must run on CI: %v", msg)
+		}
+		t.Skipf("skipping sandbox test: %v", msg)
 	}
-	str := strings.Trim(string(out), " \t\n")
-	id, err := strconv.ParseUint(str, 10, 32)
-	if err != nil {
-		return 0, err
+	if syscall.Getuid() != 0 {
+		skip("requires root")
 	}
-	return uint32(id), nil
+	if os.Getenv("SYZ_DISABLE_SANDBOXING") == "yes" {
+		skip("SYZ_DISABLE_SANDBOXING is set")
+	}
+	u, err := user.Lookup(sandboxUsername)
+	if err != nil {
+		skip(err.Error())
+	}
+	// Dropping privileges via SysProcAttr.Credential does not update HOME.
+	// TODO: set HOME in cmd.Env inside Sandbox when dropping privileges once
+	// existing callers and container setups are refactored.
+	t.Setenv("HOME", u.HomeDir)
 }
 
-func setPdeathsig(cmd *exec.Cmd) {
+// IsSandboxOwned reports whether path is owned by the sandbox user (as opposed to root).
+func IsSandboxOwned(t *testing.T, path string) bool {
+	t.Helper()
+	enabled, uid, gid, err := initSandbox()
+	if err != nil || !enabled {
+		t.Fatalf("sandbox is not enabled: %v", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	switch {
+	case stat.Uid == uid && stat.Gid == gid:
+		return true
+	case stat.Uid == 0 && stat.Gid == 0:
+		return false
+	default:
+		t.Fatalf("%v has unexpected owner %v:%v", path, stat.Uid, stat.Gid)
+		return false
+	}
+}
+
+func setPdeathsig(cmd *exec.Cmd, hardKill bool) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = new(syscall.SysProcAttr)
 	}
-	cmd.SysProcAttr.Pdeathsig = syscall.SIGKILL
+	if hardKill {
+		cmd.SysProcAttr.Pdeathsig = syscall.SIGKILL
+	} else {
+		cmd.SysProcAttr.Pdeathsig = syscall.SIGTERM
+	}
 	// We will kill the whole process group.
 	cmd.SysProcAttr.Setpgid = true
 }
@@ -141,4 +213,18 @@ func prolongPipe(r, w *os.File) {
 	for sz := 128 << 10; sz <= 2<<20; sz *= 2 {
 		syscall.Syscall(syscall.SYS_FCNTL, w.Fd(), syscall.F_SETPIPE_SZ, uintptr(sz))
 	}
+}
+
+func sysDiskUsage(info fs.FileInfo) uint64 {
+	stat := info.Sys().(*syscall.Stat_t)
+	blocks := uint64(max(0, stat.Blocks))
+	if blocks == 0 && stat.Size > 0 && (info.Mode().IsRegular() || info.IsDir()) {
+		// This is what du does in this case: small files stored inline, still take some blocks.
+		blksize := uint64(stat.Blksize)
+		if blksize == 0 {
+			blksize = 4096
+		}
+		return (uint64(stat.Size) + blksize - 1) / blksize * blksize
+	}
+	return blocks * 512
 }

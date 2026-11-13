@@ -1,13 +1,17 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package ifuzz generates and mutates random instruction streams for target CPU architectures.
 package ifuzz
 
 import (
 	"math/rand"
+	"slices"
 
+	_ "github.com/google/syzkaller/pkg/ifuzz/arm64/generated" // pull in generated instruction descriptions
 	"github.com/google/syzkaller/pkg/ifuzz/iset"
 	_ "github.com/google/syzkaller/pkg/ifuzz/powerpc/generated" // pull in generated instruction descriptions
+	_ "github.com/google/syzkaller/pkg/ifuzz/riscv64/generated" // pull in generated instruction descriptions
 	_ "github.com/google/syzkaller/pkg/ifuzz/x86/generated"     // pull in generated instruction descriptions
 )
 
@@ -20,6 +24,8 @@ type (
 const (
 	ArchX86     = iset.ArchX86
 	ArchPowerPC = iset.ArchPowerPC
+	ArchArm64   = iset.ArchArm64
+	ArchRiscv64 = iset.ArchRiscv64
 	ModeLong64  = iset.ModeLong64
 	ModeProt32  = iset.ModeProt32
 	ModeProt16  = iset.ModeProt16
@@ -28,7 +34,7 @@ const (
 
 func Generate(cfg *Config, r *rand.Rand) []byte {
 	var text []byte
-	for i := 0; i < cfg.Len; i++ {
+	for range cfg.Len {
 		insn := randInsn(cfg, r)
 		text = append(text, insn.Encode(cfg, r)...)
 	}
@@ -114,7 +120,7 @@ func randInsn(cfg *Config, r *rand.Rand) iset.Insn {
 
 func split(cfg *Config, text []byte) [][]byte {
 	insnset := iset.Arches[cfg.Arch]
-	text = append([]byte{}, text...)
+	text = slices.Clone(text)
 	var insns [][]byte
 	var bad []byte
 	for len(text) != 0 {

@@ -4,29 +4,15 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"html/template"
-	"net"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/google/syzkaller/pkg/log"
 )
-
-func (hub *Hub) initHTTP(addr string) {
-	http.HandleFunc("/", hub.httpSummary)
-
-	ln, err := net.Listen("tcp4", addr)
-	if err != nil {
-		log.Fatalf("failed to listen on %v: %v", addr, err)
-	}
-	log.Logf(0, "serving http on http://%v", ln.Addr())
-	go func() {
-		err := http.Serve(ln, nil)
-		log.Fatalf("failed to serve http: %v", err)
-	}()
-}
 
 func (hub *Hub) httpSummary(w http.ResponseWriter, r *http.Request) {
 	hub.mu.Lock()
@@ -48,6 +34,7 @@ func (hub *Hub) httpSummary(w http.ResponseWriter, r *http.Request) {
 		total.RecvRepros += mgr.RecvRepros
 		data.Managers = append(data.Managers, UIManager{
 			Name:       name,
+			HTTP:       mgr.HTTP,
 			Domain:     mgr.Domain,
 			Corpus:     len(mgr.Corpus.Records),
 			Added:      mgr.Added,
@@ -57,8 +44,8 @@ func (hub *Hub) httpSummary(w http.ResponseWriter, r *http.Request) {
 			RecvRepros: mgr.RecvRepros,
 		})
 	}
-	sort.Slice(data.Managers, func(i, j int) bool {
-		return data.Managers[i].Name < data.Managers[j].Name
+	slices.SortFunc(data.Managers, func(a, b UIManager) int {
+		return cmp.Compare(a.Name, b.Name)
 	})
 	data.Managers = append([]UIManager{total}, data.Managers...)
 	if err := summaryTemplate.Execute(w, data); err != nil {
@@ -69,7 +56,7 @@ func (hub *Hub) httpSummary(w http.ResponseWriter, r *http.Request) {
 }
 
 func compileTemplate(html string) *template.Template {
-	return template.Must(template.New("").Parse(strings.Replace(html, "{{STYLE}}", htmlStyle, -1)))
+	return template.Must(template.New("").Parse(strings.ReplaceAll(html, "{{STYLE}}", htmlStyle)))
 }
 
 type UISummaryData struct {
@@ -79,6 +66,7 @@ type UISummaryData struct {
 
 type UIManager struct {
 	Name       string
+	HTTP       string
 	Domain     string
 	Corpus     int
 	Added      int
@@ -104,6 +92,7 @@ var summaryTemplate = compileTemplate(`
 	<caption>Managers:</caption>
 	<tr>
 		<th>Name</th>
+		<th>URL</th>
 		<th>Domain</th>
 		<th>Corpus</th>
 		<th>Added</th>
@@ -116,6 +105,7 @@ var summaryTemplate = compileTemplate(`
 	{{range $m := $.Managers}}
 	<tr>
 		<td>{{$m.Name}}</td>
+		<td><a href="{{$m.HTTP}}">{{$m.HTTP}}</a></td>
 		<td>{{$m.Domain}}</td>
 		<td>{{$m.Corpus}}</td>
 		<td>{{$m.Added}}</td>

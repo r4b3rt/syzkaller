@@ -4,19 +4,15 @@
 # See https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/include/uapi/drm/msm_drm.h for upstream definitions
 
 include <drm/msm_drm.h>
+include <linux/fcntl.h>
 
 resource fd_msm[fd]
-
-# This either comes from a MSM_GEM_SUBMIT ioctl described below or from a kms
-# ioctl creating an OUT_FENCE_PTR (see drivers/gpu/drm/drm_atomic_uapi.c and
-# https://www.kernel.org/doc/html/latest/gpu/drm-kms.html for more details)
-# Once fences are described this should be updated to an fd_drm_fence.
-
-resource fd_msm_fence[fd]
+resource msm_submitqueue_id[int32]
+resource msm_fence_id[int32]
 
 openat$msm(fd const[AT_FDCWD], file ptr[in, string["/dev/msm"]], flags flags[open_flags], mode const[0]) fd_msm
 
-ioctl$DRM_IOCTL_MSM_GET_PARAM(fd fd_msm, cmd const[DRM_IOCTL_MSM_GET_PARAM], arg ptr[inout, drm_msm_param])
+ioctl$DRM_IOCTL_MSM_GET_PARAM(fd fd_msm, cmd const[DRM_IOCTL_MSM_GET_PARAM], arg ptr[inout, drm_msm_param$DRM_IOCTL_MSM_GET_PARAM])
 ioctl$DRM_IOCTL_MSM_GEM_NEW(fd fd_msm, cmd const[DRM_IOCTL_MSM_GEM_NEW], arg ptr[inout, drm_msm_gem_new])
 ioctl$DRM_IOCTL_MSM_GEM_INFO(fd fd_msm, cmd const[DRM_IOCTL_MSM_GEM_INFO], arg ptr[inout, drm_msm_gem_info])
 ioctl$DRM_IOCTL_MSM_GEM_CPU_PREP(fd fd_msm, cmd const[DRM_IOCTL_MSM_GEM_CPU_PREP], arg ptr[in, drm_msm_gem_cpu_prep])
@@ -25,8 +21,9 @@ ioctl$DRM_IOCTL_MSM_GEM_SUBMIT(fd fd_msm, cmd const[DRM_IOCTL_MSM_GEM_SUBMIT], a
 ioctl$DRM_IOCTL_MSM_WAIT_FENCE(fd fd_msm, cmd const[DRM_IOCTL_MSM_WAIT_FENCE], arg ptr[in, drm_msm_wait_fence])
 ioctl$DRM_IOCTL_MSM_GEM_MADVISE(fd fd_msm, cmd const[DRM_IOCTL_MSM_GEM_MADVISE], arg ptr[inout, drm_msm_gem_madvise])
 ioctl$DRM_IOCTL_MSM_SUBMITQUEUE_NEW(fd fd_msm, cmd const[DRM_IOCTL_MSM_SUBMITQUEUE_NEW], arg ptr[inout, drm_msm_submitqueue])
-ioctl$DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE(fd fd_msm, cmd const[DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE], arg ptr[in, int32])
+ioctl$DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE(fd fd_msm, cmd const[DRM_IOCTL_MSM_SUBMITQUEUE_CLOSE], arg ptr[in, msm_submitqueue_id])
 ioctl$DRM_IOCTL_MSM_SUBMITQUEUE_QUERY(fd fd_msm, cmd const[DRM_IOCTL_MSM_SUBMITQUEUE_QUERY], arg ptr[inout, drm_msm_submitqueue_query])
+ioctl$DRM_IOCTL_MSM_SET_PARAM(fd fd_msm, cmd const[DRM_IOCTL_MSM_SET_PARAM], arg ptr[in, drm_msm_param$DRM_IOCTL_MSM_SET_PARAM])
 
 mmap$DRM_MSM(addr vma, len len[addr], prot flags[mmap_prot], flags flags[mmap_flags], fd fd_msm, offset fileoff)
 _ = __NR_mmap2
@@ -34,7 +31,7 @@ _ = __NR_mmap2
 drm_msm_gem_new {
 	size	int64
 	flags	flags[msm_gem_new_flags, int32]
-	handle	drm_gem_handle
+	handle	drm_gem_handle	(out)
 }
 
 drm_msm_gem_info {
@@ -45,10 +42,32 @@ drm_msm_gem_info {
 	pad	const[0, int32]
 }
 
-drm_msm_param {
+drm_msm_param$DRM_IOCTL_MSM_GET_PARAM {
 	pipe	flags[msm_pipe_flags, int32]
 	param	flags[msm_param_flags, int32]
 	value	int64
+}
+
+drm_msm_param$DRM_IOCTL_MSM_SET_PARAM {
+	pipe	flags[msm_pipe_flags, int32]
+	param	flags[msm_param_set_flags, int32]
+	vallen	drm_msm_param_set_union
+	pad	const[0, int32]
+}
+
+drm_msm_param_set_union [
+	imm	drm_msm_param_set_imm
+	ptr	drm_msm_param_set_ptr
+]
+
+drm_msm_param_set_imm {
+	value	int64
+	len	const[0, int32]
+}
+
+drm_msm_param_set_ptr {
+	value	ptr64[in, array[int8]]
+	len	len[value, int32]
 }
 
 drm_msm_timespec {
@@ -78,7 +97,7 @@ drm_msm_gem_submit_cmd {
 	type		flags[msm_gem_submit_cmd_flags, int32]
 	submit_idx	int32
 	submit_offset	int32
-	size		int32
+	size		int32[0:0x7fffffff, 4]
 	pad		const[0, int32]
 	nr_relocs	len[relocs, int32]
 	relocs		ptr64[in, array[drm_msm_gem_submit_reloc]]
@@ -98,13 +117,13 @@ drm_msm_gem_submit_syncobj {
 
 drm_msm_gem_submit {
 	flags		flags[msm_gem_submit_flags, int32]
-	fence		int32
+	fence		msm_fence_id	(out)
 	nr_bos		len[bos, int32]
 	nr_cmds		len[cmds, int32]
 	bos		ptr64[in, array[drm_msm_gem_submit_bo]]
 	cmds		ptr64[in, array[drm_msm_gem_submit_cmd]]
-	fence_fd	fd_msm_fence[opt]
-	queueid		int32
+	fence_fd	fd_sync_file[opt]
+	queueid		msm_submitqueue_id
 	in_syncobjs	ptr64[in, array[drm_msm_gem_submit_syncobj]]
 	out_syncobjs	ptr64[in, array[drm_msm_gem_submit_syncobj]]
 	nr_in_syncobjs	len[in_syncobjs, int32]
@@ -114,10 +133,10 @@ drm_msm_gem_submit {
 }
 
 drm_msm_wait_fence {
-	fence	int32
-	pad	const[0, int32]
-	timeout	drm_msm_timespec	(in)
-	queueid	int32
+	fence	msm_fence_id
+	flags	flags[msm_wait_fence_flags, int32]
+	timeout	drm_msm_timespec
+	queueid	msm_submitqueue_id
 }
 
 drm_msm_gem_madvise {
@@ -128,27 +147,29 @@ drm_msm_gem_madvise {
 
 drm_msm_submitqueue {
 	flags	flags[msm_submitqueue_flags, int32]
-	prio	int32
-	id	int32
+	prio	int32[0:3]
+	id	msm_submitqueue_id	(out)
 }
 
 drm_msm_submitqueue_query {
-	data	int64
-	id	int32
-	param	flags[msm_submitqueue_query_flags, int32]
-	len	int32
+	data	ptr64[out, int8]
+	id	msm_submitqueue_id	(in)
+	param	flags[msm_submitqueue_query_flags, int32]	(in)
+	len	len[data, int32]
 	pad	const[0, int32]
 }
 
 msm_gem_new_flags = MSM_BO_SCANOUT, MSM_BO_GPU_READONLY, MSM_BO_CACHE_MASK, MSM_BO_CACHED, MSM_BO_WC, MSM_BO_UNCACHED
-msm_gem_info_flags = MSM_INFO_GET_OFFSET, MSM_INFO_GET_IOVA, MSM_INFO_SET_NAME, MSM_INFO_GET_NAME
-msm_param_flags = MSM_PARAM_GPU_ID, MSM_PARAM_GMEM_SIZE, MSM_PARAM_CHIP_ID, MSM_PARAM_MAX_FREQ, MSM_PARAM_TIMESTAMP, MSM_PARAM_GMEM_BASE, MSM_PARAM_NR_RINGS, MSM_PARAM_PP_PGTABLE, MSM_PARAM_FAULTS
-msm_gem_cpu_prep_flags = MSM_PREP_READ, MSM_PREP_WRITE, MSM_PREP_NOSYNC
+msm_gem_info_flags = MSM_INFO_GET_OFFSET, MSM_INFO_GET_IOVA, MSM_INFO_SET_NAME, MSM_INFO_GET_NAME, MSM_INFO_SET_IOVA
+msm_param_flags = MSM_PARAM_GPU_ID, MSM_PARAM_GMEM_SIZE, MSM_PARAM_CHIP_ID, MSM_PARAM_MAX_FREQ, MSM_PARAM_TIMESTAMP, MSM_PARAM_GMEM_BASE, MSM_PARAM_NR_RINGS, MSM_PARAM_PP_PGTABLE, MSM_PARAM_FAULTS, MSM_PARAM_PRIORITIES, MSM_PARAM_SUSPENDS, MSM_PARAM_VA_START, MSM_PARAM_VA_SIZE
+msm_param_set_flags = MSM_PARAM_SYSPROF, MSM_PARAM_COMM, MSM_PARAM_CMDLINE
+msm_gem_cpu_prep_flags = MSM_PREP_READ, MSM_PREP_WRITE, MSM_PREP_NOSYNC, MSM_PREP_BOOST
 msm_pipe_flags = MSM_PIPE_NONE, MSM_PIPE_2D0, MSM_PIPE_2D1, MSM_PIPE_3D0
-msm_gem_submit_flags = MSM_PIPE_NONE, MSM_PIPE_2D0, MSM_PIPE_2D1, MSM_PIPE_3D0, MSM_SUBMIT_NO_IMPLICIT, MSM_SUBMIT_FENCE_FD_IN, MSM_SUBMIT_FENCE_FD_OUT, MSM_SUBMIT_SUDO, MSM_SUBMIT_SYNCOBJ_IN, MSM_SUBMIT_SYNCOBJ_OUT
+msm_gem_submit_flags = MSM_PIPE_NONE, MSM_PIPE_2D0, MSM_PIPE_2D1, MSM_PIPE_3D0, MSM_SUBMIT_NO_IMPLICIT, MSM_SUBMIT_FENCE_FD_IN, MSM_SUBMIT_FENCE_FD_OUT, MSM_SUBMIT_SUDO, MSM_SUBMIT_SYNCOBJ_IN, MSM_SUBMIT_SYNCOBJ_OUT, MSM_SUBMIT_FENCE_SN_IN
 msm_gem_submit_bo_flags = MSM_SUBMIT_BO_READ, MSM_SUBMIT_BO_WRITE, MSM_SUBMIT_BO_DUMP
-msm_gem_submit_syncobj_flags = MSM_SUBMIT_SYNCOBJ_RESET
+msm_gem_submit_syncobj_flags = MSM_SYNCOBJ_RESET
 msm_gem_submit_cmd_flags = MSM_SUBMIT_CMD_BUF, MSM_SUBMIT_CMD_IB_TARGET_BUF, MSM_SUBMIT_CMD_CTX_RESTORE_BUF
 msm_gem_madvise_flags = MSM_MADV_WILLNEED, MSM_MADV_DONTNEED, __MSM_MADV_PURGED
 msm_submitqueue_flags = MSM_SUBMITQUEUE_FLAGS
 msm_submitqueue_query_flags = MSM_SUBMITQUEUE_PARAM_FAULTS
+msm_wait_fence_flags = MSM_WAIT_FENCE_BOOST

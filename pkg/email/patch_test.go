@@ -4,22 +4,18 @@
 package email
 
 import (
+	"fmt"
 	"testing"
+
+	"github.com/google/syzkaller/pkg/aflow/ai"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestParsePatch(t *testing.T) {
 	for _, test := range tests {
-		t.Run(test.title, func(t *testing.T) {
-			title, diff, err := ParsePatch(test.text)
-			if err != nil {
-				t.Fatalf("failed to parse patch: %v", err)
-			}
-			if test.title != title {
-				t.Fatalf("title mismatch, want:\n%v\ngot:\n%v", test.title, title)
-			}
-			if test.diff != diff {
-				t.Fatalf("diff mismatch, want:\n%v\ngot:\n%v", test.diff, diff)
-			}
+		t.Run(test.title, func(tt *testing.T) {
+			diff := ParsePatch([]byte(test.text))
+			assert.Equal(tt, test.diff, diff, "diff mismatch")
 		})
 	}
 }
@@ -29,6 +25,40 @@ var tests = []struct {
 	title string
 	diff  string
 }{
+	{
+		text: `
+So that's my patch
+diff --git a/foo/bar/foobar.c b/foo/bar/foobar.c
+--- a/foo/bar/foobar.c
++++ b/foo/bar/foobar.c
+@@ -2,7 +2,7 @@
+         u32 chars = len;
+         int not_chars;
+
+-        if (!len)
++        if (!len || !ln)
+                 return 1;
+
+         return 0;
+ 
+Watch out for the empty lines!
+`,
+		title: ``,
+		diff: `diff --git a/foo/bar/foobar.c b/foo/bar/foobar.c
+--- a/foo/bar/foobar.c
++++ b/foo/bar/foobar.c
+@@ -2,7 +2,7 @@
+         u32 chars = len;
+         int not_chars;
+
+-        if (!len)
++        if (!len || !ln)
+                 return 1;
+
+         return 0;
+ 
+`,
+	},
 	{
 		text: `
 commit 7bdb59aaaaaa4bd7161adc8f923cdef10f2638d1
@@ -478,4 +508,160 @@ Index: usb-devel/drivers/usb/core/hub.c
  		dev_err(hub->intfdev, "activate --> %d\n", status);
 `,
 	},
+	{
+		text: `Some
+Text
+Without
+Any
+Diff
+`,
+		diff:  "",
+		title: "test empty patch",
+	},
+}
+
+func TestFormatPatch(t *testing.T) {
+	type Test struct {
+		description string
+		diff        string
+		baseCommit  string
+		fixes       ai.FixesTag
+		tools       []string
+		authors     []string
+		recipients  []ai.Recipient
+		links       []string
+		reportedBy  []string
+		suggestedBy []string
+		reviewedBy  []string
+		ackedBy     []string
+		testedBy    []string
+		want        string
+	}
+	tests := []Test{
+		{
+			description: `mm: fix something
+
+Something was broken. This fixes it.
+
+`,
+			diff: `diff --git a/mm/slub.c b/mm/slub.c
+`,
+			baseCommit: "f5e343a447510a663fbf6215584a9bf8e03bfd5c",
+			fixes: ai.FixesTag{
+				Hash:  "9320daf2018f12345678",
+				Title: "some old bug",
+			},
+			authors: []string{"syzbot@kernel.org"},
+			recipients: []ai.Recipient{
+				{Name: "Foo Bar", Email: "foobar@test.com", To: true},
+				{Email: "linux-kernel@vger.kernel.org"},
+			},
+			links: []string{
+				"https://syzkaller.appspot.com/bug?id=123",
+				"https://syzkaller.appspot.com/syzbot/ai?job_id=456",
+			},
+			reportedBy:  []string{"syzbot+12345@testapp.appspotmail.com"},
+			suggestedBy: []string{"Suggester <suggester@syzbot.org>"},
+			reviewedBy:  []string{"Alice <alice@test.com>", "Bob <bob@test.com>"},
+			ackedBy:     []string{"Charlie <charley@test.com>"},
+			testedBy:    []string{"Dave <dave@test.com>"},
+			want: `mm: fix something
+
+Something was broken. This fixes it.
+
+Fixes: 9320daf2018f ("some old bug")
+Assisted-by: syzbot
+Reviewed-by: Alice <alice@test.com>
+Reviewed-by: Bob <bob@test.com>
+Acked-by: Charlie <charley@test.com>
+Tested-by: Dave <dave@test.com>
+Reported-by: syzbot+12345@testapp.appspotmail.com
+Suggested-by: Suggester <suggester@syzbot.org>
+Link: https://syzkaller.appspot.com/bug?id=123
+Link: https://syzkaller.appspot.com/syzbot/ai?job_id=456
+Signed-off-by: syzbot@kernel.org
+To: "Foo Bar" <foobar@test.com>
+Cc: <linux-kernel@vger.kernel.org>
+
+diff --git a/mm/slub.c b/mm/slub.c
+
+base-commit: f5e343a447510a663fbf6215584a9bf8e03bfd5c
+`,
+		},
+		{
+			description: `mm: fix something
+
+Something was broken. This fixes it.
+
+`,
+			diff: `diff --git a/mm/slub.c b/mm/slub.c
+`,
+			baseCommit: "f5e343a447510a663fbf6215584a9bf8e03bfd5c",
+			authors:    []string{"syzbot@kernel.org"},
+			recipients: []ai.Recipient{
+				{Name: "Foo Bar", Email: "foobar@test.com", To: true},
+				{Email: "linux-kernel@vger.kernel.org"},
+			},
+			want: `mm: fix something
+
+Something was broken. This fixes it.
+
+Assisted-by: syzbot
+Signed-off-by: syzbot@kernel.org
+To: "Foo Bar" <foobar@test.com>
+Cc: <linux-kernel@vger.kernel.org>
+
+diff --git a/mm/slub.c b/mm/slub.c
+
+base-commit: f5e343a447510a663fbf6215584a9bf8e03bfd5c
+`,
+		},
+
+		{
+			description: `mm: fix something
+
+Something was broken. This fixes it.
+
+`,
+			diff: `diff --git a/mm/slub.c b/mm/slub.c
+`,
+			baseCommit: "f5e343a447510a663fbf6215584a9bf8e03bfd5c",
+			tools:      []string{"gemini-3-flash-preview", "gemini-3.1-pro-preview"},
+			authors:    []string{"syzbot@kernel.org", `"Kernel Dev" <dev@kernel.org>`},
+			recipients: []ai.Recipient{
+				{Name: "Foo Bar", Email: "foobar@test.com", To: true},
+			},
+			want: `mm: fix something
+
+Something was broken. This fixes it.
+
+Assisted-by: Gemini:gemini-3.1-pro-preview Gemini:gemini-3-flash-preview syzbot
+Signed-off-by: syzbot@kernel.org
+Signed-off-by: "Kernel Dev" <dev@kernel.org>
+To: "Foo Bar" <foobar@test.com>
+
+diff --git a/mm/slub.c b/mm/slub.c
+
+base-commit: f5e343a447510a663fbf6215584a9bf8e03bfd5c
+`,
+		},
+	}
+	for i, test := range tests {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			got := FormatPatch(test.description, test.diff, PatchTemplateData{
+				BaseCommit:  test.baseCommit,
+				Fixes:       test.fixes,
+				Tools:       test.tools,
+				Authors:     test.authors,
+				Recipients:  test.recipients,
+				Links:       test.links,
+				ReportedBy:  test.reportedBy,
+				SuggestedBy: test.suggestedBy,
+				ReviewedBy:  test.reviewedBy,
+				AckedBy:     test.ackedBy,
+				TestedBy:    test.testedBy,
+			})
+			assert.Equal(t, test.want, got)
+		})
+	}
 }

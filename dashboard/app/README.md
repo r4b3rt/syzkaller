@@ -22,7 +22,12 @@ production use.
 The app also needs one or more [syz-ci](/syz-ci/syz-ci.go) instances running elsewhere. The `syz-ci` instances
 do the actual fuzzing, bisection, patch testing, etc.
 
-The app can be deployed with `gcloud app deploy/update`, refer to the docs for more details.
+The app can be deployed by `gcloud app deploy ./dashboard/app/app.yaml`.
+
+The following optional flags are available:
+
+1. "--no-promote" to test the app firs and migrate the traffic to it later.
+2. "--verbosity=info" to see what files are going to be deployed.
 
 The app tests can be run with:
 ```
@@ -34,4 +39,47 @@ If any of the tests fail, use `-v` flag to see log of what happens and `-run` fl
 to run a single test, e.g.:
 ```
 go test -short -v -run=TestEmailReport github.com/google/syzkaller/dashboard/app
+```
+
+## Local Test Deployment
+
+It's possible to run the dashboard locally for testing purposes.
+However, note that it won't have any data, so you would need to connect `syz-ci`
+instances so that they populate database with some bugs.
+
+First, you need to install Google Cloud SDK (`gcloud` command, and required components,
+this is one time step).
+
+Then, create emulator config (this is one time step):
+
+```
+gcloud config configurations create emulator
+gcloud config set auth/disable_credentials true
+gcloud config set project syzkaller
+gcloud config set api_endpoint_overrides/spanner http://localhost:9020/
+```
+
+Then, start local spanner emulator in one console:
+
+```
+gcloud emulators spanner start
+gcloud spanner instances create syzbot --config=emulator --nodes=1
+gcloud spanner databases create ai --instance=syzbot
+```
+
+Then, initialize the schema from another console:
+
+```
+for SQL in dashboard/app//aidb/migrations/*.up.sql; do \
+	gcloud spanner databases ddl update ai \
+	--instance=syzbot --ddl-file ${SQL}; done
+```
+
+Finally, start the web server:
+
+```
+SPANNER_EMULATOR_HOST="localhost:9010" \
+	GOOGLE_CLOUD_SPANNER_MULTIPLEXED_SESSIONS=false \
+	google-cloud-sdk/bin/dev_appserver.py --application=syzkaller \
+	--host=0.0.0.0 --enable_host_checking=false dashboard/app/
 ```

@@ -1,5 +1,5 @@
 TITLE: kernel BUG in corrupted
-ALT: kernel BUG at fs/buffer.c:LINE!
+TYPE: BUG
 CORRUPTED: Y
 
 [ 1722.511384] ------------[ cut here ]------------

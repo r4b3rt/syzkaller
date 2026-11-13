@@ -9,13 +9,17 @@ import (
 	"fmt"
 	"net/mail"
 	"regexp"
+	"runtime"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/debugtracer"
 	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/report/crash"
 	"github.com/google/syzkaller/sys/targets"
 )
 
@@ -31,23 +35,28 @@ type Repo interface {
 	// CheckoutCommit checkouts the specified repository on the specified commit.
 	CheckoutCommit(repo, commit string) (*Commit, error)
 
+	// FetchTags forces the fetching of tags from the specified remote repository.
+	FetchTags(repo string) error
+
 	// SwitchCommit checkouts the specified commit without fetching.
 	SwitchCommit(commit string) (*Commit, error)
 
-	// HeadCommit returns info about the HEAD commit of the current branch of git repository.
-	HeadCommit() (*Commit, error)
+	// Commit returns info about the specified commit hash.
+	// The commit may be the special value HEAD for the current commit.
+	Commit(com string) (*Commit, error)
 
-	// GetCommitByTitle finds commit info by the title.
-	// Remote is not fetched, the commit needs to be reachable from the current repo state
-	// (e.g. do CheckoutBranch before). If the commit is not found, nil is returned.
-	GetCommitByTitle(title string) (*Commit, error)
+	// GetCommitByTitle finds commit info by the title. If the commit is not found, nil is returned.
+	// Remote is not fetched and only commits reachable from the checked out HEAD are searched
+	// (e.g. do CheckoutBranch before).
+	// The search is limited to commits starting from the 'since' time. If 'since' is the zero
+	// value, a default limit of 5 years is used.
+	GetCommitByTitle(title string, since time.Time) (*Commit, error)
 
 	// GetCommitsByTitles is a batch version of GetCommitByTitle.
 	// Returns list of commits and titles of commits that are not found.
-	GetCommitsByTitles(titles []string) ([]*Commit, []string, error)
-
-	// ListRecentCommits returns list of recent commit titles starting from baseCommit.
-	ListRecentCommits(baseCommit string) ([]string, error)
+	// The search is limited to commits starting from the 'since' time. If 'since' is the zero
+	// value, a default limit of 5 years is used.
+	GetCommitsByTitles(titles []string, since time.Time) ([]*Commit, []string, error)
 
 	// ExtractFixTagsFromCommits extracts fixing tags for bugs from git log.
 	// Given email = "user@domain.com", it searches for tags of the form "user+tag@domain.com"
@@ -57,13 +66,43 @@ type Repo interface {
 	// ReleaseTag returns the latest release tag that is reachable from the given commit.
 	ReleaseTag(commit string) (string, error)
 
-	// Returns true if the current tree contains the specified commit
-	// (the commit is reachable from the current HEAD).
+	// Returns true if the current tree contains the specified commit.
+	// Remote is not fetched and only commits reachable from the checked out HEAD are searched
+	// (e.g. do CheckoutBranch before).
+	// A commit that is missing from the repository is reported as not contained,
+	// a malformed revision is reported as an error.
 	Contains(commit string) (bool, error)
+
+	// LatestCommits lists all latest commit hashes well as their commit dates.
+	// If afterCommit is specified, the output only includes the commits from which afterCommit is reachable.
+	// If afterDate is specified, the output only includes the newe commits.
+	LatestCommits(afterCommit string, afterDate time.Time) ([]CommitShort, error)
+
+	// Object returns the contents of a git repository object at the particular moment in history.
+	Object(name, commit string) ([]byte, error)
+
+	// MergeBases returns good common ancestors of the two commits.
+	MergeBases(firstCommit, secondCommit string) ([]*Commit, error)
+
+	// CommitExists check for the commit presence in local checkout.
+	CommitExists(commit string) (bool, error)
+
+	// PushCommit is used to store commit in remote repo.
+	PushCommit(repo, commit string) error
+
+	// cherryPick cherry-picks the given commit without committing it.
+	cherryPick(commit string) error
+
+	// fetchRemote fetches the specified commit from the given remote repo.
+	fetchRemote(repo, commit string) error
 }
 
 // Bisecter may be optionally implemented by Repo.
 type Bisecter interface {
+	// Can be used for last minute preparations like pulling release tags into the bisected repo, which
+	// is required to determin the compiler version to use on linux. Can be an empty function.
+	PrepareBisect() error
+
 	// Bisect bisects good..bad commit range against the provided predicate (wrapper around git bisect).
 	// The predicate should return an error only if there is no way to proceed
 	// (it will abort the process), if possible it should prefer to return BisectSkip.
@@ -74,16 +113,17 @@ type Bisecter interface {
 
 	// PreviousReleaseTags returns list of preceding release tags that are reachable from the given commit.
 	// If the commit itself has a release tag, this tag is not included.
-	PreviousReleaseTags(commit string) ([]string, error)
+	PreviousReleaseTags(commit, compilerType string) ([]string, error)
 
 	IsRelease(commit string) (bool, error)
 
-	EnvForCommit(binDir, commit string, kernelConfig []byte) (*BisectEnv, error)
+	EnvForCommit(defaultCompiler, compilerType, binDir, commit string,
+		kernelConfig []byte, backports []BackportCommit) (*BisectEnv, error)
 }
 
 type ConfigMinimizer interface {
-	Minimize(target *targets.Target, original, baseline []byte, dt debugtracer.DebugTracer,
-		pred func(test []byte) (BisectResult, error)) ([]byte, error)
+	Minimize(target *targets.Target, original, baseline []byte, types []crash.Type,
+		dt debugtracer.DebugTracer, pred func(test []byte) (BisectResult, error)) ([]byte, error)
 }
 
 type Commit struct {
@@ -95,6 +135,12 @@ type Commit struct {
 	Tags       []string
 	Parents    []string
 	Date       time.Time
+	CommitDate time.Time
+	Patch      []byte
+}
+
+type CommitShort struct {
+	Hash       string
 	CommitDate time.Time
 }
 
@@ -123,7 +169,7 @@ func (r Recipients) GetEmails(filter RecipientType) []string {
 			emails = append(emails, user.Address.Address)
 		}
 	}
-	sort.Strings(emails)
+	slices.Sort(emails)
 	return emails
 }
 
@@ -172,20 +218,21 @@ const (
 	OptDontSandbox
 )
 
-func NewRepo(os, vm, dir string, opts ...RepoOpt) (Repo, error) {
+func NewRepo(os, vmType, dir string, opts ...RepoOpt) (Repo, error) {
 	switch os {
 	case targets.Linux:
-		return newLinux(dir, opts), nil
-	case targets.Akaros:
-		return newAkaros(dir, opts), nil
+		if vmType == targets.Starnix {
+			return newFuchsia(dir, opts), nil
+		}
+		return newLinux(dir, opts, vmType), nil
 	case targets.Fuchsia:
 		return newFuchsia(dir, opts), nil
 	case targets.OpenBSD:
-		return newGit(dir, nil, opts), nil
+		return newGitRepo(dir, nil, opts), nil
 	case targets.NetBSD:
-		return newGit(dir, nil, opts), nil
+		return newGitRepo(dir, nil, opts), nil
 	case targets.FreeBSD:
-		return newGit(dir, nil, opts), nil
+		return newGitRepo(dir, nil, opts), nil
 	case targets.TestOS:
 		return newTestos(dir, opts), nil
 	}
@@ -193,22 +240,26 @@ func NewRepo(os, vm, dir string, opts ...RepoOpt) (Repo, error) {
 }
 
 func NewSyzkallerRepo(dir string, opts ...RepoOpt) Repo {
-	git := newGit(dir, nil, append(opts, OptDontSandbox))
+	git := newGitRepo(dir, nil, append(opts, OptDontSandbox))
 	return git
 }
 
+func NewLKMLRepo(dir string) Repo {
+	return newGitRepo(dir, nil, []RepoOpt{OptDontSandbox})
+}
+
 func Patch(dir string, patch []byte) error {
-	// Do --dry-run first to not mess with partially consistent state.
-	cmd := osutil.Command("patch", "-p1", "--force", "--ignore-whitespace", "--dry-run")
+	// Do --check first to not mess with partially consistent state.
+	args := []string{"apply", "-p1", "--ignore-whitespace", "--check", "-"}
+	cmd := osutil.Command("git", args...)
 	if err := osutil.Sandbox(cmd, true, true); err != nil {
 		return err
 	}
 	cmd.Stdin = bytes.NewReader(patch)
 	cmd.Dir = dir
 	if output, err := cmd.CombinedOutput(); err != nil {
-		// If it reverses clean, then it's already applied
-		// (seems to be the easiest way to detect it).
-		cmd = osutil.Command("patch", "-p1", "--force", "--ignore-whitespace", "--reverse", "--dry-run")
+		// If it reverses clean, then it's already applied.
+		cmd = osutil.Command("git", "apply", "-p1", "--ignore-whitespace", "--reverse", "--check", "-")
 		if err := osutil.Sandbox(cmd, true, true); err != nil {
 			return err
 		}
@@ -220,7 +271,8 @@ func Patch(dir string, patch []byte) error {
 		return fmt.Errorf("failed to apply patch:\n%s", output)
 	}
 	// Now apply for real.
-	cmd = osutil.Command("patch", "-p1", "--force", "--ignore-whitespace")
+	args = []string{"apply", "-p1", "--ignore-whitespace", "-"}
+	cmd = osutil.Command("git", args...)
 	if err := osutil.Sandbox(cmd, true, true); err != nil {
 		return err
 	}
@@ -248,6 +300,31 @@ func CheckCommitHash(hash string) bool {
 	return gitHashRe.MatchString(hash)
 }
 
+func ParseReleaseTag(tag string) (v1, v2, rc, v3 int) {
+	invalid := func() {
+		v1, v2, rc, v3 = -1, -1, -1, -1
+	}
+	invalid()
+	matches := releaseTagRe.FindStringSubmatch(tag)
+	if matches == nil {
+		return
+	}
+	for ptr, idx := range map[*int]int{
+		&v1: 1, &v2: 2, &rc: 3, &v3: 4,
+	} {
+		if matches[idx] == "" {
+			continue
+		}
+		var err error
+		*ptr, err = strconv.Atoi(matches[idx])
+		if err != nil {
+			invalid()
+			return
+		}
+	}
+	return
+}
+
 func runSandboxed(dir, command string, args ...string) ([]byte, error) {
 	cmd := osutil.Command(command, args...)
 	cmd.Dir = dir
@@ -258,13 +335,16 @@ func runSandboxed(dir, command string, args ...string) ([]byte, error) {
 }
 
 var (
-	// nolint: lll
 	gitLocalRepoRe = regexp.MustCompile(`^file:///[a-zA-Z0-9-_./~]+(/)?$`)
 	// nolint: lll
 	gitRemoteRepoRe = regexp.MustCompile(`^(git|ssh|http|https|ftp|ftps|sso)://[a-zA-Z0-9-_.]+(:[0-9]+)?(/[a-zA-Z0-9-_./~]+)?(/)?$`)
 	// nolint: lll
 	gitSSHRepoRe = regexp.MustCompile(`^(git|ssh|http|https|ftp|ftps|sso)@[a-zA-Z0-9-_.]+(:[a-zA-Z0-9-_]+)?(/[a-zA-Z0-9-_./~]+)?(/)?$`)
-	gitBranchRe  = regexp.MustCompile("^[a-zA-Z0-9-_/.]{2,200}$")
+	// The first character must not be '-': branch names are passed to git as positional
+	// arguments (e.g. the fetch refspec in CheckoutBranch), and a leading '-' would make
+	// git interpret an attacker-controlled value as a command-line option. git itself
+	// also disallows ref names starting with '-', so no valid branch is rejected.
+	gitBranchRe  = regexp.MustCompile("^[a-zA-Z0-9_/.][a-zA-Z0-9-_/.]{1,199}$")
 	gitHashRe    = regexp.MustCompile("^[a-f0-9]{8,40}$")
 	releaseTagRe = regexp.MustCompile(`^v([0-9]+).([0-9]+)(?:-rc([0-9]+))?(?:\.([0-9]+))?$`)
 	// CC: is intentionally not on this list, see #1441.
@@ -307,76 +387,112 @@ const SyzkallerRepo = "https://github.com/google/syzkaller"
 const HEAD = "HEAD"
 
 func CommitLink(url, hash string) string {
-	return link(url, hash, 0)
+	return link(url, hash, "", 0, 0)
 }
 
 func TreeLink(url, hash string) string {
-	return link(url, hash, 1)
+	return link(url, hash, "", 0, 1)
+}
+
+func init() {
+	// Used externally - do not remove.
+	runtime.KeepAlive(TreeLink)
 }
 
 func LogLink(url, hash string) string {
-	return link(url, hash, 2)
+	return link(url, hash, "", 0, 2)
 }
 
-func link(url, hash string, typ int) string {
+func FileLink(url, hash, file string, line int) string {
+	return link(url, hash, file, line, 3)
+}
+
+func link(url, hash, file string, line, typ int) string {
 	if url == "" || hash == "" {
 		return ""
+	}
+	if colon := strings.IndexByte(url, ':'); colon != -1 && strings.HasPrefix(url, "git@") {
+		url = "https://" + url[4:colon] + "/" + url[colon+1:]
 	}
 	switch url {
 	case "https://fuchsia.googlesource.com":
 		// We collect hashes from the fuchsia repo.
-		return link(url+"/fuchsia", hash, typ)
+		return link(url+"/fuchsia", hash, file, line, typ)
 	}
 	if strings.HasPrefix(url, "https://github.com/") {
-		url = strings.TrimSuffix(url, ".git")
-		switch typ {
-		case 1:
-			return url + "/tree/" + hash
-		case 2:
-			return url + "/commits/" + hash
-		default:
-			return url + "/commit/" + hash
-		}
+		return linkGithub(url, hash, file, line, typ)
 	}
 	if strings.HasPrefix(url, "https://git.kernel.org/pub/scm/") ||
 		strings.HasPrefix(url, "git://git.kernel.org/pub/scm/") {
-		url = strings.TrimPrefix(url, "git")
-		url = strings.TrimPrefix(url, "https")
-		url = "https" + url
-		switch typ {
-		case 1:
-			return url + "/tree/?id=" + hash
-		case 2:
-			return url + "/log/?id=" + hash
-		default:
-			return url + "/commit/?id=" + hash
-		}
+		return linkKernelOrg(url, hash, file, line, typ)
 	}
 	for _, cgitHost := range []string{"git.kernel.dk", "git.breakpoint.cc"} {
 		if strings.HasPrefix(url, "https://"+cgitHost) ||
 			strings.HasPrefix(url, "git://"+cgitHost) {
-			url = strings.TrimPrefix(strings.TrimPrefix(url, "git://"), "https://")
-			url = strings.TrimPrefix(url, cgitHost)
-			url = "https://" + cgitHost + "/cgit" + url
-			switch typ {
-			case 1:
-				return url + "/tree/?id=" + hash
-			case 2:
-				return url + "/log/?id=" + hash
-			default:
-				return url + "/commit/?id=" + hash
-			}
+			return linkCgit(cgitHost, url, hash, file, line, typ)
 		}
 	}
 	if strings.HasPrefix(url, "https://") && strings.Contains(url, ".googlesource.com") {
-		switch typ {
-		case 1:
-			return url + "/+/" + hash + "/"
-		case 2:
-			return url + "/+log/" + hash
-		default:
-			return url + "/+/" + hash + "^!"
-		}
+		return linkGoogleSource(url, hash, file, line, typ)
 	}
 	return ""
+}
+
+func linkGithub(url, hash, file string, line, typ int) string {
+	url = strings.TrimSuffix(url, ".git")
+	switch typ {
+	case 1:
+		return url + "/tree/" + hash
+	case 2:
+		return url + "/commits/" + hash
+	case 3:
+		return url + "/blob/" + hash + "/" + file + "#L" + fmt.Sprint(line)
+	default:
+		return url + "/commit/" + hash
+	}
+}
+
+func linkKernelOrg(url, hash, file string, line, typ int) string {
+	url = strings.TrimPrefix(url, "git")
+	url = strings.TrimPrefix(url, "https")
+	url = "https" + url
+	switch typ {
+	case 1:
+		return url + "/tree/?id=" + hash
+	case 2:
+		return url + "/log/?id=" + hash
+	case 3:
+		return url + "/tree/" + file + "?id=" + hash + "#n" + fmt.Sprint(line)
+	default:
+		return url + "/commit/?id=" + hash
+	}
+}
+
+func linkCgit(cgitHost, url, hash, file string, line, typ int) string {
+	url = strings.TrimPrefix(strings.TrimPrefix(url, "git://"), "https://")
+	url = strings.TrimPrefix(url, cgitHost)
+	url = "https://" + cgitHost + "/cgit" + url
+	switch typ {
+	case 1:
+		return url + "/tree/?id=" + hash
+	case 2:
+		return url + "/log/?id=" + hash
+	case 3:
+		return url + "/tree/" + file + "?id=" + hash + "#n" + fmt.Sprint(line)
+	default:
+		return url + "/commit/?id=" + hash
+	}
+}
+
+func linkGoogleSource(url, hash, file string, line, typ int) string {
+	switch typ {
+	case 1:
+		return url + "/+/" + hash + "/"
+	case 2:
+		return url + "/+log/" + hash
+	case 3:
+		return url + "/+/" + hash + "/" + file + "#" + fmt.Sprint(line)
+	default:
+		return url + "/+/" + hash + "^!"
+	}
 }

@@ -6,40 +6,45 @@ package vcs
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"net/mail"
 	"os"
 	"os/exec"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/google/syzkaller/pkg/debugtracer"
+	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 )
 
-type git struct {
-	dir      string
-	ignoreCC map[string]bool
-	precious bool
-	sandbox  bool
+type gitRepo struct {
+	*Git
 }
 
-func newGit(dir string, ignoreCC map[string]bool, opts []RepoOpt) *git {
-	git := &git{
-		dir:      dir,
-		ignoreCC: ignoreCC,
-		sandbox:  true,
+func newGitRepo(dir string, ignoreCC map[string]bool, opts []RepoOpt) *gitRepo {
+	git := &gitRepo{
+		Git: &Git{
+			Dir:      dir,
+			Sandbox:  true,
+			Env:      filterEnv(),
+			ignoreCC: ignoreCC,
+		},
 	}
 	for _, opt := range opts {
 		switch opt {
 		case OptPrecious:
 			git.precious = true
 		case OptDontSandbox:
-			git.sandbox = false
+			git.Sandbox = false
 		}
 	}
 	return git
@@ -52,23 +57,30 @@ func filterEnv() []string {
 	// repository (e.g the syzkaller tree itself) rather than the
 	// intended repo.
 	env := os.Environ()
-	for i := 0; i < len(env); i++ {
-		if strings.HasPrefix(env[i], "GIT_DIR") ||
-			strings.HasPrefix(env[i], "GIT_WORK_TREE") ||
-			strings.HasPrefix(env[i], "GIT_INDEX_FILE") ||
-			strings.HasPrefix(env[i], "GIT_OBJECT_DIRECTORY") {
-			env = append(env[:i], env[i+1:]...)
-			i--
-		}
-	}
-
+	env = slices.DeleteFunc(env, func(e string) bool {
+		return strings.HasPrefix(e, "GIT_DIR") ||
+			strings.HasPrefix(e, "GIT_WORK_TREE") ||
+			strings.HasPrefix(e, "GIT_INDEX_FILE") ||
+			strings.HasPrefix(e, "GIT_OBJECT_DIRECTORY") ||
+			strings.HasPrefix(e, "GIT_CONFIG_")
+	})
+	// Prevent repo/submodule configs from executing hooks or fsmonitor helpers,
+	// and restrict allowed transport protocols (e.g. to forbid ext::).
+	env = append(env,
+		"GIT_ALLOW_PROTOCOL=file:git:http:https:ssh:sso",
+		"GIT_CONFIG_COUNT=2",
+		"GIT_CONFIG_KEY_0=core.hooksPath",
+		"GIT_CONFIG_VALUE_0=/dev/null",
+		"GIT_CONFIG_KEY_1=core.fsmonitor",
+		"GIT_CONFIG_VALUE_1=false",
+	)
 	return env
 }
 
-func (git *git) Poll(repo, branch string) (*Commit, error) {
-	git.reset()
-	origin, err := git.git("remote", "get-url", "origin")
-	if err != nil || strings.TrimSpace(string(origin)) != repo {
+func (git *gitRepo) Poll(repo, branch string) (*Commit, error) {
+	git.Reset()
+	origin, err := git.getURL("origin")
+	if err != nil || strings.TrimSpace(origin) != repo {
 		// The repo is here, but it has wrong origin (e.g. repo in config has changed), re-clone.
 		if err := git.clone(repo, branch); err != nil {
 			return nil, err
@@ -77,156 +89,212 @@ func (git *git) Poll(repo, branch string) (*Commit, error) {
 	// Use origin/branch for the case the branch was force-pushed,
 	// in such case branch is not the same is origin/branch and we will
 	// stuck with the local version forever (git checkout won't fail).
-	if _, err := git.git("checkout", "origin/"+branch); err != nil {
+	if _, err := git.Run("checkout", "origin/"+branch); err != nil {
 		// No such branch (e.g. branch in config has changed), re-clone.
 		if err := git.clone(repo, branch); err != nil {
 			return nil, err
 		}
 	}
-	if _, err := git.git("fetch", "--force"); err != nil {
-		// Something else is wrong, re-clone.
+	if output, err := git.Run("fetch", "--force"); err != nil {
+		if git.isNetworkError(output) {
+			// The clone operation will fail as well, so no sense to re-clone.
+			return nil, err
+		}
 		if err := git.clone(repo, branch); err != nil {
 			return nil, err
 		}
 	}
-	if _, err := git.git("checkout", "origin/"+branch); err != nil {
+	if _, err := git.Run("checkout", "origin/"+branch); err != nil {
 		return nil, err
 	}
-	return git.HeadCommit()
+	if _, err := git.Run("submodule", "update", "--init"); err != nil {
+		return nil, err
+	}
+	return git.Commit(HEAD)
 }
 
-func (git *git) CheckoutBranch(repo, branch string) (*Commit, error) {
+func (git Git) getURL(remote string) (string, error) {
+	url, err := git.Run("remote", "get-url", remote)
+	if err != nil {
+		return "", err
+	}
+	return string(url), nil
+}
+
+func (git *gitRepo) isNetworkError(output []byte) bool {
+	// The list is not exhaustive and is meant to be extended over time.
+	return bytes.Contains(output, []byte("fatal: read error: Connection reset by peer"))
+}
+
+func (git *gitRepo) CheckoutBranch(repo, branch string) (*Commit, error) {
 	if err := git.repair(); err != nil {
 		return nil, err
 	}
 	repoHash := hash.String([]byte(repo))
-	// Ignore error as we can double add the same remote and that will fail.
-	git.git("remote", "add", repoHash, repo)
-	_, err := git.git("fetch", "--force", repoHash, branch)
+	// Because the HEAD is detached, submodules assumes "origin" to be the default
+	// remote when initializing.
+	// This sets "origin" to be the current remote.
+	// Ignore errors as we can double add or remove the same remote and that will fail.
+	git.Run("remote", "rm", "origin")
+	git.Run("remote", "add", "origin", repo)
+	git.Run("remote", "add", repoHash, repo)
+	_, err := git.Run("fetch", "--force", repoHash, branch)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := git.git("checkout", "FETCH_HEAD"); err != nil {
+	if _, err := git.Run("checkout", "FETCH_HEAD", "--force"); err != nil {
 		return nil, err
 	}
-	return git.HeadCommit()
-}
-
-func (git *git) CheckoutCommit(repo, commit string) (*Commit, error) {
+	if _, err := git.Run("submodule", "update", "--init"); err != nil {
+		return nil, err
+	}
+	// If the branch checkout had to be "forced" the directory may
+	// contain remaining untracked files.
+	// Clean again to ensure the new branch is in a clean state.
 	if err := git.repair(); err != nil {
 		return nil, err
 	}
-	if err := git.fetchRemote(repo); err != nil {
+	return git.Commit(HEAD)
+}
+
+func (git *gitRepo) CheckoutCommit(repo, commit string) (*Commit, error) {
+	if err := git.repair(); err != nil {
+		return nil, err
+	}
+	if err := git.fetchRemote(repo, commit); err != nil {
 		return nil, err
 	}
 	return git.SwitchCommit(commit)
 }
 
-func (git *git) fetchRemote(repo string) error {
+func (git *gitRepo) FetchTags(repo string) error {
+	if err := git.repair(); err != nil {
+		return err
+	}
 	repoHash := hash.String([]byte(repo))
 	// Ignore error as we can double add the same remote and that will fail.
-	git.git("remote", "add", repoHash, repo)
-	_, err := git.git("fetch", "--force", "--tags", repoHash)
+	git.Run("remote", "add", repoHash, repo)
+	_, err := git.Run("fetch", "--force", "--tags", repoHash)
 	return err
 }
 
-func (git *git) SwitchCommit(commit string) (*Commit, error) {
-	if !git.precious {
-		git.git("reset", "--hard")
-		git.git("clean", "-fdx")
+func (git *gitRepo) fetchRemote(repo, commit string) error {
+	if commit != "" && gitFullHashRe.MatchString(commit) {
+		// If the commit is already present locally, we don't need to fetch it.
+		// This also makes us resilient to cases where the remote has force-pushed
+		// and the commit is no longer reachable there (but we still have it).
+		if ok, _ := git.CommitExists(commit); ok {
+			return nil
+		}
 	}
-	if _, err := git.git("checkout", commit); err != nil {
-		return nil, err
+	repoHash := hash.String([]byte(repo))
+	// Ignore error as we can double add the same remote and that will fail.
+	git.Run("remote", "add", repoHash, repo)
+	fetchArgs := []string{"fetch", "--force", "--tags", repoHash}
+	if commit != "" && gitFullHashRe.MatchString(commit) {
+		// This trick only works with full commit hashes.
+		fetchArgs = append(fetchArgs, commit)
 	}
-	return git.HeadCommit()
+	_, err := git.Run(fetchArgs...)
+	if err != nil {
+		var verbose *osutil.VerboseError
+		if errors.As(err, &verbose) &&
+			bytes.Contains(verbose.Output, []byte("error: cannot lock ref")) {
+			// It can happen that the fetched repo has tags names that conflict
+			// with the ones already present in the repository.
+			// Try to fetch more, but this time prune tags, it should help.
+			// The --prune-tags option will remove all tags that are not present
+			// in this remote repo, so don't do it always. Only when necessary.
+			_, err = git.Run("fetch", "--force", "--tags", "--prune", "--prune-tags", repoHash)
+		}
+	}
+	return err
 }
 
-func (git *git) clone(repo, branch string) error {
+func (git *gitRepo) SwitchCommit(commit string) (*Commit, error) {
+	if !git.precious {
+		git.Run("reset", "--hard")
+		git.Run("clean", "-fdx")
+	}
+	if _, err := git.Run("checkout", commit); err != nil {
+		return nil, err
+	}
+	if _, err := git.Run("submodule", "update", "--init"); err != nil {
+		return nil, err
+	}
+	return git.Commit(HEAD)
+}
+
+func (git *gitRepo) clone(repo, branch string) error {
 	if git.precious {
 		return fmt.Errorf("won't reinit precious repo")
 	}
 	if err := git.initRepo(nil); err != nil {
 		return err
 	}
-	if _, err := git.git("remote", "add", "origin", repo); err != nil {
+	if _, err := git.Run("remote", "add", "origin", repo); err != nil {
 		return err
 	}
-	if _, err := git.git("fetch", "origin", branch); err != nil {
+	if _, err := git.Run("fetch", "origin", branch); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (git *git) reset() error {
-	// This function tries to reset git repo state to a known clean state.
-	if git.precious {
-		return nil
-	}
-	git.git("reset", "--hard")
-	git.git("clean", "-fdx")
-	git.git("bisect", "reset")
-	_, err := git.git("reset", "--hard")
-	return err
-}
-
-func (git *git) repair() error {
-	if err := git.reset(); err != nil {
+func (git *gitRepo) repair() error {
+	if err := git.Reset(); err != nil {
 		return git.initRepo(err)
 	}
 	return nil
 }
 
-func (git *git) initRepo(reason error) error {
+func (git *gitRepo) initRepo(reason error) error {
 	if reason != nil {
-		log.Logf(1, "git: initializing repo at %v: %v", git.dir, reason)
+		log.Logf(1, "git: initializing repo at %v: %v", git.Dir, reason)
 	}
-	if err := os.RemoveAll(git.dir); err != nil {
-		return fmt.Errorf("failed to remove repo dir: %v", err)
+	if err := os.RemoveAll(git.Dir); err != nil {
+		return fmt.Errorf("failed to remove repo dir: %w", err)
 	}
-	if err := osutil.MkdirAll(git.dir); err != nil {
-		return fmt.Errorf("failed to create repo dir: %v", err)
+	if err := osutil.MkdirAll(git.Dir); err != nil {
+		return fmt.Errorf("failed to create repo dir: %w", err)
 	}
-	if git.sandbox {
-		if err := osutil.SandboxChown(git.dir); err != nil {
+	if git.Sandbox {
+		if err := osutil.SandboxChown(git.Dir); err != nil {
 			return err
 		}
 	}
-	if _, err := git.git("init"); err != nil {
+	if _, err := git.Run("init"); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (git *git) Contains(commit string) (bool, error) {
-	_, err := git.git("merge-base", "--is-ancestor", commit, "HEAD")
-	return err == nil, nil
-}
-
-func (git *git) HeadCommit() (*Commit, error) {
-	return git.getCommit("HEAD")
-}
-
-func (git *git) getCommit(commit string) (*Commit, error) {
-	output, err := git.git("log", "--format=%H%n%s%n%ae%n%an%n%ad%n%P%n%cd%n%b", "-n", "1", commit)
-	if err != nil {
-		return nil, err
+func (git *gitRepo) Contains(commit string) (bool, error) {
+	contained, err := git.ContainedIn(HEAD, commit)
+	if err == nil {
+		return contained, nil
 	}
-	return gitParseCommit(output, nil, nil, git.ignoreCC)
+	// A commit that is missing from the repository is not contained in HEAD.
+	if exists, existsErr := git.CommitExists(commit); existsErr == nil && !exists {
+		return false, nil
+	}
+	return false, err
 }
+
+const gitDateFormat = "Mon Jan 2 15:04:05 2006 -0700"
 
 func gitParseCommit(output, user, domain []byte, ignoreCC map[string]bool) (*Commit, error) {
 	lines := bytes.Split(output, []byte{'\n'})
 	if len(lines) < 8 || len(lines[0]) != 40 {
 		return nil, fmt.Errorf("unexpected git log output: %q", output)
 	}
-	const dateFormat = "Mon Jan 2 15:04:05 2006 -0700"
-	date, err := time.Parse(dateFormat, string(lines[4]))
+	date, err := time.Parse(gitDateFormat, string(lines[4]))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse date in git log output: %v\n%q", err, output)
+		return nil, fmt.Errorf("failed to parse date in git log output: %w\n%q", err, output)
 	}
-	commitDate, err := time.Parse(dateFormat, string(lines[6]))
+	commitDate, err := time.Parse(gitDateFormat, string(lines[6]))
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse date in git log output: %v\n%q", err, output)
+		return nil, fmt.Errorf("failed to parse date in git log output: %w\n%q", err, output)
 	}
 	recipients := make(map[string]bool)
 	recipients[strings.ToLower(string(lines[2]))] = true
@@ -241,13 +309,7 @@ func gitParseCommit(output, user, domain []byte, ignoreCC map[string]bool) (*Com
 					startPos := userPos + len(user)
 					endPos := userPos + len(user) + domainPos + 1
 					tag := string(line[startPos:endPos])
-					present := false
-					for _, tag1 := range tags {
-						if tag1 == tag {
-							present = true
-							break
-						}
-					}
+					present := slices.Contains(tags, tag)
 					if !present {
 						tags = append(tags, tag)
 					}
@@ -291,15 +353,19 @@ func gitParseCommit(output, user, domain []byte, ignoreCC map[string]bool) (*Com
 	return com, nil
 }
 
-func (git *git) GetCommitByTitle(title string) (*Commit, error) {
-	commits, _, err := git.GetCommitsByTitles([]string{title})
+func (git *gitRepo) GetCommitByTitle(title string, since time.Time) (*Commit, error) {
+	commits, _, err := git.GetCommitsByTitles([]string{title}, since)
 	if err != nil || len(commits) == 0 {
 		return nil, err
 	}
 	return commits[0], nil
 }
 
-func (git *git) GetCommitsByTitles(titles []string) ([]*Commit, []string, error) {
+const (
+	fetchCommitsMaxAgeInYears = 5
+)
+
+func (git *gitRepo) GetCommitsByTitles(titles []string, since time.Time) ([]*Commit, []string, error) {
 	var greps []string
 	m := make(map[string]string)
 	for _, title := range titles {
@@ -307,8 +373,11 @@ func (git *git) GetCommitsByTitles(titles []string) ([]*Commit, []string, error)
 		greps = append(greps, canonical)
 		m[canonical] = title
 	}
-	since := time.Now().Add(-time.Hour * 24 * 365 * 2).Format("01-02-2006")
-	commits, err := git.fetchCommits(since, "HEAD", "", "", greps, true)
+	if since.IsZero() {
+		since = time.Now().AddDate(-fetchCommitsMaxAgeInYears, 0, 0)
+	}
+	sinceStr := since.Format("01-02-2006")
+	commits, err := git.fetchCommits(sinceStr, HEAD, "", "", greps, true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -328,28 +397,347 @@ func (git *git) GetCommitsByTitles(titles []string) ([]*Commit, []string, error)
 	return results, missing, nil
 }
 
-func (git *git) ListRecentCommits(baseCommit string) ([]string, error) {
-	// On upstream kernel this produces ~11MB of output.
-	// Somewhat inefficient to collect whole output in a slice
-	// and then convert to string, but should be bearable.
-	output, err := git.git("log", "--pretty=format:%s", "-n", "200000", baseCommit)
+func (git *gitRepo) LatestCommits(afterCommit string, afterDate time.Time) ([]CommitShort, error) {
+	args := []string{"log", "--pretty=format:%h:%cd"}
+	if !afterDate.IsZero() {
+		args = append(args, "--since", afterDate.Format(time.RFC3339))
+	}
+	if afterCommit != "" {
+		args = append(args, afterCommit+"..")
+	}
+	output, err := git.Run(args...)
 	if err != nil {
 		return nil, err
 	}
-	return strings.Split(string(output), "\n"), nil
+	if len(output) == 0 {
+		return nil, nil
+	}
+	var ret []CommitShort
+	for line := range strings.SplitSeq(string(output), "\n") {
+		hash, date, _ := strings.Cut(line, ":")
+		commitDate, err := time.Parse(gitDateFormat, date)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse date in %q: %w", line, err)
+		}
+		ret = append(ret, CommitShort{Hash: hash, CommitDate: commitDate})
+	}
+	return ret, nil
 }
 
-func (git *git) ExtractFixTagsFromCommits(baseCommit, email string) ([]*Commit, error) {
-	user, domain, err := splitEmail(email)
+func (git *gitRepo) ExtractFixTagsFromCommits(baseCommit, emailStr string) ([]*Commit, error) {
+	user, domain, err := email.Split(emailStr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse email %q: %v", email, err)
+		return nil, fmt.Errorf("failed to parse email %q: %w", emailStr, err)
 	}
 	grep := user + "+.*" + domain
-	since := time.Now().Add(-time.Hour * 24 * 365).Format("01-02-2006")
+	since := time.Now().AddDate(-fetchCommitsMaxAgeInYears, 0, 0).Format("01-02-2006")
 	return git.fetchCommits(since, baseCommit, user, domain, []string{grep}, false)
 }
 
-func (git *git) fetchCommits(since, base, user, domain string, greps []string, fixedStrings bool) ([]*Commit, error) {
+func (git *gitRepo) Bisect(bad, good string, dt debugtracer.DebugTracer, pred func() (BisectResult,
+	error)) ([]*Commit, error) {
+	git.Reset()
+	firstBad, err := git.Commit(bad)
+	if err != nil {
+		return nil, err
+	}
+	output, err := git.Run("bisect", "start", bad, good)
+	if err != nil {
+		return nil, err
+	}
+	defer git.Reset()
+	dt.Logf("# git bisect start %v %v\n%s", bad, good, output)
+	current, err := git.Commit(HEAD)
+	if err != nil {
+		return nil, err
+	}
+	var bisectTerms = [...]string{
+		BisectBad:  "bad",
+		BisectGood: "good",
+		BisectSkip: "skip",
+	}
+	for {
+		res, err := pred()
+		// Linux EnvForCommit may cherry-pick some fixes, reset these before the next step.
+		git.Run("reset", "--hard")
+		if err != nil {
+			return nil, err
+		}
+		if res == BisectBad {
+			firstBad = current
+		}
+		output, err = git.Run("bisect", bisectTerms[res])
+		dt.Logf("# git bisect %v %v\n%s", bisectTerms[res], current.Hash, output)
+		if err != nil {
+			if bytes.Contains(output, []byte("There are only 'skip'ped commits left to test")) {
+				return git.bisectInconclusive(output)
+			}
+			return nil, err
+		}
+		next, err := git.Commit(HEAD)
+		if err != nil {
+			return nil, err
+		}
+		if current.Hash == next.Hash {
+			return []*Commit{firstBad}, nil
+		}
+		current = next
+	}
+}
+
+var gitFullHashRe = regexp.MustCompile("[a-f0-9]{40}")
+
+func (git *gitRepo) bisectInconclusive(output []byte) ([]*Commit, error) {
+	// For inconclusive bisection git prints the following message:
+	//
+	//	There are only 'skip'ped commits left to test.
+	//	The first bad commit could be any of:
+	//	1f43f400a2cbb02f3d34de8fe30075c070254816
+	//	4d96e13ee9cd1f7f801e8c7f4b12f09d1da4a5d8
+	//	5cd856a5ef9aa189df757c322be34ad735a5b17f
+	//	We cannot bisect more!
+	//
+	// For conclusive bisection:
+	//
+	//	7c3850adbcccc2c6c9e7ab23a7dcbc4926ee5b96 is the first bad commit
+	var commits []*Commit
+	for _, hash := range gitFullHashRe.FindAll(output, -1) {
+		com, err := git.Commit(string(hash))
+		if err != nil {
+			return nil, err
+		}
+		commits = append(commits, com)
+	}
+	return commits, nil
+}
+
+func (git *gitRepo) ReleaseTag(commit string) (string, error) {
+	tags, err := git.previousReleaseTags(commit, true, true, true)
+	if err != nil {
+		return "", err
+	}
+	if len(tags) == 0 {
+		return "", fmt.Errorf("no release tags found for commit %v", commit)
+	}
+	return tags[0], nil
+}
+
+func (git *gitRepo) previousReleaseTags(commit string, self, onlyTop, includeRC bool) ([]string, error) {
+	var tags []string
+	if self {
+		output, err := git.Run("tag", "--list", "--points-at", commit, "--merged", commit, "v*.*")
+		if err != nil {
+			return nil, err
+		}
+		tags = gitParseReleaseTags(output, includeRC)
+		if onlyTop && len(tags) != 0 {
+			return tags, nil
+		}
+	}
+	output, err := git.Run("tag", "--no-contains", commit, "--merged", commit, "v*.*")
+	if err != nil {
+		return nil, err
+	}
+	tags1 := gitParseReleaseTags(output, includeRC)
+	tags = append(tags, tags1...)
+	if len(tags) == 0 {
+		return nil, fmt.Errorf("no release tags found for commit %v\n%s", commit, output)
+	}
+	return tags, nil
+}
+
+func (git *gitRepo) IsRelease(commit string) (bool, error) {
+	tags1, err := git.previousReleaseTags(commit, true, false, false)
+	if err != nil {
+		return false, err
+	}
+	tags2, err := git.previousReleaseTags(commit, false, false, false)
+	if err != nil {
+		return false, err
+	}
+	return len(tags1) != len(tags2), nil
+}
+
+func (git *gitRepo) Object(name, commit string) ([]byte, error) {
+	return git.Run("show", fmt.Sprintf("%s:%s", commit, name))
+}
+
+func (git *gitRepo) MergeBases(firstCommit, secondCommit string) ([]*Commit, error) {
+	output, err := git.Run("merge-base", firstCommit, secondCommit)
+	if err != nil {
+		return nil, err
+	}
+	ret := []*Commit{}
+	for hash := range strings.FieldsSeq(string(output)) {
+		commit, err := git.Commit(hash)
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, commit)
+	}
+	return ret, nil
+}
+
+// CommitExists relies on 'git cat-file -e'.
+// If object exists its exit status is 0.
+// If object doesn't exist its exit status is 1 (not documented).
+// Otherwise, the exit status is 128 (not documented).
+func (git Git) CommitExists(commit string) (bool, error) {
+	_, err := git.Run("cat-file", "-e", commit)
+	var vErr *osutil.VerboseError
+	if errors.As(err, &vErr) && vErr.ExitCode == 1 {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (git *gitRepo) CommitExists(commit string) (bool, error) {
+	return git.Git.CommitExists(commit)
+}
+
+func (git *gitRepo) cherryPick(commit string) error {
+	_, err := git.Run("cherry-pick", "--no-commit", commit)
+	return err
+}
+
+func (git *gitRepo) PushCommit(repo, commit string) error {
+	tagName := "tag-" + commit // assign tag to guarantee remote persistence
+	git.Run("tag", tagName)    // ignore errors on re-tagging
+	if _, err := git.Run("push", repo, "tag", tagName); err != nil {
+		return fmt.Errorf("git push %s tag %s: %w", repo, tagName, err)
+	}
+	return nil
+}
+
+var (
+	fileNameRe = regexp.MustCompile(`^diff.* b\/([^\s]+)$`)
+	indexRe    = regexp.MustCompile(`^index (\w+)\.\.(?:\w+)(?:\s\d+)?$`)
+)
+
+type ModifiedFile struct {
+	Name     string
+	LeftHash string
+}
+
+// ParseGitDiff extracts the files modified in the git patch.
+func ParseGitDiff(patch []byte) []ModifiedFile {
+	var ret []ModifiedFile
+	scanner := bufio.NewScanner(bytes.NewReader(patch))
+	for scanner.Scan() {
+		line := scanner.Text()
+		indexMatch := indexRe.FindStringSubmatch(line)
+		if indexMatch != nil && len(ret) > 0 {
+			ret[len(ret)-1].LeftHash = indexMatch[1]
+		} else {
+			fileNameMatch := fileNameRe.FindStringSubmatch(line)
+			if fileNameMatch != nil {
+				ret = append(ret, ModifiedFile{Name: fileNameMatch[1]})
+			}
+		}
+	}
+	return ret
+}
+
+type Git struct {
+	Dir      string
+	Sandbox  bool
+	Env      []string
+	precious bool
+	ignoreCC map[string]bool
+}
+
+func SandboxedGit(dir string) Git {
+	return Git{
+		Dir:     dir,
+		Sandbox: true,
+		Env:     filterEnv(),
+	}
+}
+
+func (git Git) Run(args ...string) ([]byte, error) {
+	return git.RunTimeout(3*time.Hour, args...)
+}
+
+func (git Git) RunTimeout(timeout time.Duration, args ...string) ([]byte, error) {
+	cmd, err := git.command(args...)
+	if err != nil {
+		return nil, err
+	}
+	return osutil.Run(timeout, cmd)
+}
+
+func (git Git) command(args ...string) (*exec.Cmd, error) {
+	args = slices.Concat([]string{"-c", "core.hooksPath=/dev/null"}, args)
+	cmd := osutil.Command("git", args...)
+	cmd.Dir = git.Dir
+	cmd.Env = git.Env
+	if git.Sandbox {
+		if err := osutil.Sandbox(cmd, true, false); err != nil {
+			return nil, err
+		}
+	}
+	return cmd, nil
+}
+
+// Apply invokes git apply for a series of git patches.
+// It is different from Patch() in that it normally handles raw patch emails.
+func (git Git) Apply(patch []byte) error {
+	cmd, err := git.command("apply", "-")
+	if err != nil {
+		return err
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	go func() {
+		stdin.Write(patch)
+		stdin.Close()
+	}()
+	_, err = osutil.Run(time.Minute, cmd)
+	return err
+}
+
+// Reset resets the git repo to a known clean state.
+func (git Git) Reset() error {
+	if git.precious {
+		return nil
+	}
+	git.Run("reset", "--hard", "--recurse-submodules")
+	git.Run("clean", "-xfdf")
+	git.Run("submodule", "foreach", "--recursive", "git", "clean", "-xfdf")
+	git.Run("bisect", "reset")
+	_, err := git.Run("reset", "--hard", "--recurse-submodules")
+	return err
+}
+
+// Commit extracts the information about the particular git commit.
+func (git Git) Commit(hash string) (*Commit, error) {
+	const patchSeparator = "---===syzkaller-patch-separator===---"
+	output, err := git.Run("log", "--format=%H%n%s%n%ae%n%an%n%ad%n%P%n%cd%n%b"+patchSeparator,
+		"-n", "1", "-p", "-U0", hash)
+	if err != nil {
+		return nil, err
+	}
+	before, after, ok := bytes.Cut(output, []byte(patchSeparator))
+	if !ok {
+		return nil, fmt.Errorf("git log output does not contain patch separator")
+	}
+	commit, err := gitParseCommit(before, nil, nil, git.ignoreCC)
+	if err != nil {
+		return nil, err
+	}
+	commit.Patch = after
+	for len(commit.Patch) != 0 && commit.Patch[0] == '\n' {
+		commit.Patch = commit.Patch[1:]
+	}
+	return commit, nil
+}
+
+func (git Git) fetchCommits(since, base, user, domain string, greps []string, fixedStrings bool) ([]*Commit, error) {
 	const commitSeparator = "---===syzkaller-commit-separator===---"
 	args := []string{"log", "--since", since, "--format=%H%n%s%n%ae%n%an%n%ad%n%P%n%cd%n%b%n" + commitSeparator}
 	if fixedStrings {
@@ -359,10 +747,12 @@ func (git *git) fetchCommits(since, base, user, domain string, greps []string, f
 		args = append(args, "--grep", grep)
 	}
 	args = append(args, base)
-	cmd := exec.Command("git", args...)
-	cmd.Dir = git.dir
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := osutil.CommandContext(ctx, "git", args...)
+	cmd.Dir = git.Dir
 	cmd.Env = filterEnv()
-	if git.sandbox {
+	if git.Sandbox {
 		if err := osutil.Sandbox(cmd, true, false); err != nil {
 			return nil, err
 		}
@@ -375,7 +765,6 @@ func (git *git) fetchCommits(since, base, user, domain string, greps []string, f
 		return nil, err
 	}
 	defer cmd.Wait()
-	defer cmd.Process.Kill()
 	var (
 		s           = bufio.NewScanner(stdout)
 		buf         = new(bytes.Buffer)
@@ -407,153 +796,267 @@ func (git *git) fetchCommits(since, base, user, domain string, greps []string, f
 	return commits, s.Err()
 }
 
-func (git *git) git(args ...string) ([]byte, error) {
-	cmd := osutil.Command("git", args...)
-	cmd.Dir = git.dir
-	cmd.Env = filterEnv()
-	if git.sandbox {
-		if err := osutil.Sandbox(cmd, true, false); err != nil {
-			return nil, err
-		}
-	}
-	return osutil.Run(time.Hour, cmd)
+type BaseCommit struct {
+	*Commit
+	Branches []string
 }
 
-func splitEmail(email string) (user, domain string, err error) {
-	addr, err := mail.ParseAddress(email)
-	if err != nil {
-		return "", "", err
-	}
-	at := strings.IndexByte(addr.Address, '@')
-	if at == -1 {
-		return "", "", fmt.Errorf("no @ in email address")
-	}
-	user = addr.Address[:at]
-	domain = addr.Address[at:]
-	if plus := strings.IndexByte(user, '+'); plus != -1 {
-		user = user[:plus]
-	}
-	return
-}
+// BaseForDiff returns a list of commits that could have been the base
+// commit for the specified git patch.
+// For the purposes of optimization, the function only considers the
+// commits that are newer than one year.
+// The returned list is minimized to only contain the commits that are
+// represented in different subsets of branches.
+func (git Git) BaseForDiff(diff []byte, tracer debugtracer.DebugTracer) ([]*BaseCommit, error) {
+	// We can't just query git log with --find-object=HASH because that will only return
+	// the revisions where the hashed content was introduced or removed, while what we actually
+	// want is the latest revision(s) where the content modified in the diff is still in place.
 
-func (git *git) Bisect(bad, good string, dt debugtracer.DebugTracer, pred func() (BisectResult,
-	error)) ([]*Commit, error) {
-	git.reset()
-	firstBad, err := git.getCommit(bad)
-	if err != nil {
-		return nil, err
+	// So we build a set of potential commits of interest:
+	// 1) Tips of the branches.
+	// 2) Parents of the commit that in any way mention the modified blob hashes.
+	// Then these commits are verified.
+
+	args := []string{
+		"log",
+		"--all",
+		"--no-renames",
+		"-m",
+		"-n", "500",
+		// With -m and -n 500, de facto we have scan all repo commits, which takes
+		// significant time on a Linux kernel checkout.
+		// If the blob hashes haven't been touched since one year, any reasonably
+		// fresh kernel branch will pass, so BaseForDiff is not really needed.
+		`--since="1 year ago"`,
+		`--format=%H:%P`,
 	}
-	output, err := git.git("bisect", "start", bad, good)
-	if err != nil {
-		return nil, err
-	}
-	defer git.reset()
-	dt.Log("# git bisect start %v %v\n%s", bad, good, output)
-	current, err := git.HeadCommit()
-	if err != nil {
-		return nil, err
-	}
-	var bisectTerms = [...]string{
-		BisectBad:  "bad",
-		BisectGood: "good",
-		BisectSkip: "skip",
-	}
-	for {
-		res, err := pred()
-		// Linux EnvForCommit may cherry-pick some fixes, reset these before the next step.
-		git.git("reset", "--hard")
-		if err != nil {
-			return nil, err
+	var fileNames []string
+	nameToHash := map[string]string{}
+	ignoreFiles := map[string]struct{}{}
+	for _, file := range ParseGitDiff(diff) {
+		if strings.Trim(file.LeftHash, "0") == "" {
+			// Newly created files are not of any help here.
+			ignoreFiles[file.Name] = struct{}{}
+			continue
 		}
-		if res == BisectBad {
-			firstBad = current
+		if _, ignore := ignoreFiles[file.Name]; ignore {
+			continue
 		}
-		output, err = git.git("bisect", bisectTerms[res])
-		dt.Log("# git bisect %v %v\n%s", bisectTerms[res], current.Hash, output)
-		if err != nil {
-			if bytes.Contains(output, []byte("There are only 'skip'ped commits left to test")) {
-				return git.bisectInconclusive(output)
+		if _, ok := nameToHash[file.Name]; ok {
+			// We only care about the first occurrence of a file in the diff series.
+			continue
+		}
+		if ok, err := git.verifyHash(file.LeftHash); err != nil {
+			return nil, fmt.Errorf("hash verification failed: %w", err)
+		} else if !ok {
+			// The object is not known in this repository, so we won't find the exact base commit.
+			tracer.Logf("unknown object %s, stopping base commit search", file.LeftHash)
+			return nil, nil
+		}
+		fileNames = append(fileNames, file.Name)
+		nameToHash[file.Name] = file.LeftHash
+		args = append(args, "--find-object="+file.LeftHash)
+	}
+	tracer.Logf("extracted %d left blob hashes", len(nameToHash))
+	if len(nameToHash) == 0 {
+		return nil, nil
+	}
+	// Without the pathspec, git has to diff the full trees of every commit against
+	// every of its parents, which takes tens of minutes on a Linux kernel checkout.
+	// Once git knows the file names, it only needs to descend into the corresponding
+	// tree objects, which is orders of magnitude faster.
+	args = append(args, "--")
+	args = append(args, fileNames...)
+	output, err := git.Run(args...)
+	if err != nil {
+		return nil, err
+	}
+	commitBranches := map[string]map[string]struct{}{}
+	record := func(commit string, branch string) {
+		if commitBranches[commit] == nil {
+			commitBranches[commit] = map[string]struct{}{}
+		}
+		commitBranches[commit][branch] = struct{}{}
+	}
+
+	// With -m, git prints a merge commit once per parent, so the same commits
+	// can be mentioned in the output many times.
+	checkedCandidates := map[string]struct{}{}
+	s := bufio.NewScanner(bytes.NewReader(output))
+	for s.Scan() {
+		// TODO: we can further reduce the search space by adding "--raw" to args
+		// and only considering the commits that introduce the blobs from the diff.
+		commit, parents, _ := strings.Cut(s.Text(), ":")
+		candidates := []string{commit}
+		if parents != "" {
+			candidates = append(candidates, strings.Split(parents, " ")...)
+		}
+		for _, candidate := range candidates {
+			if _, checked := checkedCandidates[candidate]; checked {
+				continue
 			}
-			return nil, err
+			checkedCandidates[candidate] = struct{}{}
+			// Only focus on branches that are still alive.
+			const cutOffDays = 60
+			list, err := git.BranchesThatContain(candidate, time.Now().Add(-time.Hour*24*cutOffDays))
+			if err != nil {
+				return nil, fmt.Errorf("failed to query branches: %w", err)
+			}
+			for _, info := range list {
+				record(candidate, info.Branch)
+				record(info.Commit, info.Branch)
+			}
 		}
-		next, err := git.HeadCommit()
-		if err != nil {
-			return nil, err
-		}
-		if current.Hash == next.Hash {
-			return []*Commit{firstBad}, nil
-		}
-		current = next
 	}
+	var ret []*BaseCommit
+	for commit, branches := range commitBranches {
+		tracer.Logf("considering %q [%q]", commit, branches)
+		fileHashes, err := git.fileHashes(commit, fileNames)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract hashes for %s: %w", commit, err)
+		}
+		var noMatch []string
+		for _, name := range fileNames {
+			if !strings.HasPrefix(fileHashes[name], nameToHash[name]) {
+				noMatch = append(noMatch, name)
+			}
+		}
+		if len(noMatch) != 0 {
+			tracer.Logf("hashes don't match for %q", noMatch)
+			continue
+		}
+		branchList := slices.Sorted(maps.Keys(branches))
+		info, err := git.Commit(commit)
+		if err != nil {
+			return nil, fmt.Errorf("failed to extract commit info: %w", err)
+		}
+		tracer.Logf("hashes match, commit date is %v, branches %v", info.CommitDate, branchList)
+		ret = append(ret, &BaseCommit{Commit: info, Branches: branchList})
+	}
+	return git.minimizeBaseCommits(ret)
 }
 
-func (git *git) bisectInconclusive(output []byte) ([]*Commit, error) {
-	// For inconclusive bisection git prints the following message:
-	//
-	//	There are only 'skip'ped commits left to test.
-	//	The first bad commit could be any of:
-	//	1f43f400a2cbb02f3d34de8fe30075c070254816
-	//	4d96e13ee9cd1f7f801e8c7f4b12f09d1da4a5d8
-	//	5cd856a5ef9aa189df757c322be34ad735a5b17f
-	//	We cannot bisect more!
-	//
-	// For conclusive bisection:
-	//
-	//	7c3850adbcccc2c6c9e7ab23a7dcbc4926ee5b96 is the first bad commit
-	var commits []*Commit
-	for _, hash := range regexp.MustCompile("[a-f0-9]{40}").FindAll(output, -1) {
-		com, err := git.getCommit(string(hash))
-		if err != nil {
-			return nil, err
+func (git Git) minimizeBaseCommits(list []*BaseCommit) ([]*BaseCommit, error) {
+	// We want to preserve commits that are present in different subsets of branches.
+	// Then, we want to sort them topologically and break ties by date.
+	lastCommit := map[string]*BaseCommit{}
+	for _, item := range list {
+		key := strings.Join(item.Branches, ":")
+		prev, ok := lastCommit[key]
+		if !ok {
+			lastCommit[key] = item
+			continue
 		}
-		commits = append(commits, com)
+		isNewer, err := git.ContainedIn(item.Hash, prev.Hash)
+		if err != nil {
+			return nil, fmt.Errorf("topological sort step failed: %w", err)
+		}
+		if isNewer {
+			lastCommit[key] = item
+		}
 	}
-	return commits, nil
+	var filtered []*BaseCommit
+	for _, item := range lastCommit {
+		filtered = append(filtered, item)
+	}
+	slices.SortFunc(filtered, func(a, b *BaseCommit) int {
+		return b.CommitDate.Compare(a.CommitDate)
+	})
+	return filtered, nil
 }
 
-func (git *git) ReleaseTag(commit string) (string, error) {
-	tags, err := git.previousReleaseTags(commit, true, true, true)
-	if err != nil {
-		return "", err
-	}
-	if len(tags) == 0 {
-		return "", fmt.Errorf("no release tags found for commit %v", commit)
-	}
-	return tags[0], nil
-}
-
-func (git *git) previousReleaseTags(commit string, self, onlyTop, includeRC bool) ([]string, error) {
-	var tags []string
-	if self {
-		output, err := git.git("tag", "--list", "--points-at", commit, "--merged", commit, "v*.*")
-		if err != nil {
-			return nil, err
-		}
-		tags = gitParseReleaseTags(output, includeRC)
-		if onlyTop && len(tags) != 0 {
-			return tags, nil
-		}
-	}
-	output, err := git.git("tag", "--no-contains", commit, "--merged", commit, "v*.*")
+// fileHashes returns the blob SHA hashes for a particular list of files on a particular commit.
+func (git Git) fileHashes(commit string, files []string) (map[string]string, error) {
+	output, err := git.Run(append([]string{"ls-tree", commit, "--"}, files...)...)
 	if err != nil {
 		return nil, err
 	}
-	tags1 := gitParseReleaseTags(output, includeRC)
-	tags = append(tags, tags1...)
-	if len(tags) == 0 {
-		return nil, fmt.Errorf("no release tags found for commit %v", commit)
+	ret := map[string]string{}
+	s := bufio.NewScanner(bytes.NewReader(output))
+	for s.Scan() {
+		line := s.Text()
+		fields := strings.Fields(line)
+		if len(fields) != 4 {
+			return nil, fmt.Errorf("invalid output: %q", line)
+		}
+		ret[fields[3]] = fields[2]
 	}
-	return tags, nil
+	return ret, nil
 }
 
-func (git *git) IsRelease(commit string) (bool, error) {
-	tags1, err := git.previousReleaseTags(commit, true, false, false)
+type branchCommit struct {
+	Branch string
+	Commit string
+}
+
+func (git Git) BranchesThatContain(commit string, since time.Time) ([]branchCommit, error) {
+	output, err := git.Run(
+		"branch", "-a",
+		"--contains", commit,
+		`--format=%(committerdate);%(objectname);%(refname:short)`,
+	)
 	if err != nil {
+		return nil, err
+	}
+	var ret []branchCommit
+	s := bufio.NewScanner(bytes.NewReader(output))
+	for s.Scan() {
+		dateString, branchInfo, _ := strings.Cut(s.Text(), ";")
+		commit, branch, _ := strings.Cut(branchInfo, ";")
+		date, err := time.Parse(gitDateFormat, dateString)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse git date: %w\n%q", err, dateString)
+		}
+		if date.Before(since) {
+			continue
+		}
+		ret = append(ret, branchCommit{Branch: branch, Commit: commit})
+	}
+	return ret, nil
+}
+
+func (git Git) verifyHash(hash string) (bool, error) {
+	_, err := git.Run("rev-parse", "--quiet", "--verify", hash)
+	if err != nil {
+		var verboseErr *osutil.VerboseError
+		if errors.As(err, &verboseErr) && verboseErr.ExitCode == 1 {
+			return false, nil
+		}
 		return false, err
 	}
-	tags2, err := git.previousReleaseTags(commit, false, false, false)
-	if err != nil {
-		return false, err
+	return true, nil
+}
+
+// ContainedIn returns true if commit is reachable from parent.
+// A commit that is missing from the repository is reported as an error (see CommitExists).
+func (git Git) ContainedIn(parent, commit string) (bool, error) {
+	// 'git merge-base --is-ancestor' exits with 0 if commit is an ancestor of parent,
+	// 1 if it's not, and 128 on errors (e.g. if either revision can't be resolved).
+	_, err := git.Run("merge-base", "--is-ancestor", commit, parent)
+	if err == nil {
+		return true, nil
 	}
-	return len(tags1) != len(tags2), nil
+	var verboseErr *osutil.VerboseError
+	if errors.As(err, &verboseErr) && verboseErr.ExitCode == 1 {
+		return false, nil
+	}
+	return false, err
+}
+
+func (git Git) Diff(commitA, commitB string) ([]byte, error) {
+	return git.Run("diff", commitA+".."+commitB)
+}
+
+// FormatGitAuthor converts an email address into an unquoted Git author format (Name <email>).
+// In Git commit metadata and trailers (e.g. "Signed-off-by:", "Reviewed-by:"), display names
+// must never be double-quoted even if they contain special characters like commas
+// (e.g. "First, Second <user@email.com>").
+func FormatGitAuthor(addr string) string {
+	if parsed, err := mail.ParseAddress(addr); err == nil {
+		if parsed.Name != "" {
+			return fmt.Sprintf("%s <%s>", parsed.Name, parsed.Address)
+		}
+		return parsed.Address
+	}
+	return addr
 }

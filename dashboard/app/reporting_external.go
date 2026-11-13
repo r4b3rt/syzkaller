@@ -4,54 +4,50 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
-	"net/http"
+	"context"
+	"errors"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
-	"golang.org/x/net/context"
-	"google.golang.org/appengine/log"
+	"google.golang.org/appengine/v2/log"
 )
 
 // Interface with external reporting systems.
 // The external system is meant to poll for new bugs with apiReportingPoll,
 // and report back bug status updates with apiReportingUpdate.
 
-func apiReportingPollBugs(c context.Context, r *http.Request, payload []byte) (interface{}, error) {
-	req := new(dashapi.PollBugsRequest)
-	if err := json.Unmarshal(payload, req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal request: %v", err)
+func apiReportingPollBugs(ctx context.Context, req *dashapi.PollBugsRequest) (any, error) {
+	if stop, err := emergentlyStopped(ctx); err != nil || stop {
+		return &dashapi.PollBugsResponse{}, err
 	}
-	reports := reportingPollBugs(c, req.Type)
+	reports := reportingPollBugs(ctx, req.Type)
 	resp := &dashapi.PollBugsResponse{
 		Reports: reports,
 	}
-	jobs, err := pollCompletedJobs(c, req.Type)
+	jobs, err := pollCompletedJobs(ctx, req.Type)
 	if err != nil {
-		log.Errorf(c, "failed to poll jobs: %v", err)
+		log.Errorf(ctx, "failed to poll jobs(bugs): %v", err)
 	}
 	resp.Reports = append(resp.Reports, jobs...)
 	return resp, nil
 }
 
-func apiReportingPollNotifications(c context.Context, r *http.Request, payload []byte) (interface{}, error) {
-	req := new(dashapi.PollNotificationsRequest)
-	if err := json.Unmarshal(payload, req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal request: %v", err)
+func apiReportingPollNotifications(ctx context.Context, req *dashapi.PollNotificationsRequest) (
+	any, error) {
+	if stop, err := emergentlyStopped(ctx); err != nil || stop {
+		return &dashapi.PollNotificationsResponse{}, err
 	}
-	notifs := reportingPollNotifications(c, req.Type)
+	notifs := reportingPollNotifications(ctx, req.Type)
 	resp := &dashapi.PollNotificationsResponse{
 		Notifications: notifs,
 	}
 	return resp, nil
 }
 
-func apiReportingPollClosed(c context.Context, r *http.Request, payload []byte) (interface{}, error) {
-	req := new(dashapi.PollClosedRequest)
-	if err := json.Unmarshal(payload, req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal request: %v", err)
+func apiReportingPollClosed(ctx context.Context, req *dashapi.PollClosedRequest) (any, error) {
+	if stop, err := emergentlyStopped(ctx); err != nil || stop {
+		return &dashapi.PollClosedResponse{}, err
 	}
-	ids, err := reportingPollClosed(c, req.IDs)
+	ids, err := reportingPollClosed(ctx, req.IDs)
 	if err != nil {
 		return nil, err
 	}
@@ -61,27 +57,38 @@ func apiReportingPollClosed(c context.Context, r *http.Request, payload []byte) 
 	return resp, nil
 }
 
-func apiReportingUpdate(c context.Context, r *http.Request, payload []byte) (interface{}, error) {
-	req := new(dashapi.BugUpdate)
-	if err := json.Unmarshal(payload, req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal request: %v", err)
-	}
+func apiReportingUpdate(ctx context.Context, req *dashapi.BugUpdate) (any, error) {
 	if req.JobID != "" {
 		resp := &dashapi.BugUpdateReply{
 			OK:    true,
 			Error: false,
 		}
-		if err := jobReported(c, req.JobID); err != nil {
-			log.Errorf(c, "failed to mark job reported: %v", err)
+		if err := jobReported(ctx, req.JobID); err != nil {
+			log.Errorf(ctx, "failed to mark job reported: %v", err)
 			resp.Text = err.Error()
 			resp.Error = true
 		}
 		return resp, nil
 	}
-	ok, reason, err := incomingCommand(c, req)
+	ok, reason, err := incomingCommand(ctx, req)
 	return &dashapi.BugUpdateReply{
 		OK:    ok,
 		Error: err != nil,
 		Text:  reason,
 	}, nil
+}
+
+func apiNewTestJob(ctx context.Context, req *dashapi.TestPatchRequest) (any, error) {
+	resp := &dashapi.TestPatchReply{}
+	err := handleExternalTestRequest(ctx, req)
+	if err != nil {
+		resp.ErrorText = err.Error()
+		_, badRequest := errors.AsType[*BadTestRequestError](err)
+		_, disabled := errors.AsType[*TestCommandDisabledError](err)
+		if !badRequest && !disabled {
+			// Log errors that are not related to the invalid input.
+			log.Errorf(ctx, "external patch posting error: %v", err)
+		}
+	}
+	return resp, nil
 }

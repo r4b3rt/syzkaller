@@ -1,9 +1,11 @@
 // Copyright 2020 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package vmware implements VMware virtual machine pool management.
 package vmware
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -18,11 +20,14 @@ import (
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm/vmimpl"
 )
 
 func init() {
-	vmimpl.Register("vmware", ctor, false)
+	vmimpl.Register("vmware", vmimpl.Type{
+		Ctor: ctor,
+	})
 }
 
 type Config struct {
@@ -45,6 +50,7 @@ type instance struct {
 	sshuser     string
 	sshkey      string
 	forwardPort int
+	timeouts    targets.Timeouts
 }
 
 func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
@@ -61,10 +67,6 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	if _, err := exec.LookPath("vmrun"); err != nil {
 		return nil, fmt.Errorf("cannot find vmrun")
 	}
-	if env.Debug && cfg.Count > 1 {
-		log.Logf(0, "limiting number of VMs from %v to 1 in debug mode", cfg.Count)
-		cfg.Count = 1
-	}
 	pool := &Pool{
 		cfg: cfg,
 		env: env,
@@ -76,19 +78,20 @@ func (pool *Pool) Count() int {
 	return pool.cfg.Count
 }
 
-func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
+func (pool *Pool) Create(_ context.Context, workdir string, index int) (vmimpl.Instance, error) {
 	createTime := strconv.FormatInt(time.Now().UnixNano(), 10)
 	vmx := filepath.Join(workdir, createTime, "syzkaller.vmx")
 	sshkey := pool.env.SSHKey
 	sshuser := pool.env.SSHUser
 	inst := &instance{
-		cfg:     pool.cfg,
-		debug:   pool.env.Debug,
-		baseVMX: pool.cfg.BaseVMX,
-		vmx:     vmx,
-		sshkey:  sshkey,
-		sshuser: sshuser,
-		closed:  make(chan bool),
+		cfg:      pool.cfg,
+		debug:    pool.env.Debug,
+		baseVMX:  pool.cfg.BaseVMX,
+		vmx:      vmx,
+		sshkey:   sshkey,
+		sshuser:  sshuser,
+		closed:   make(chan bool),
+		timeouts: pool.env.Timeouts,
 	}
 	if err := inst.clone(); err != nil {
 		return nil, err
@@ -141,7 +144,7 @@ func (inst *instance) Forward(port int) (string, error) {
 	return fmt.Sprintf("127.0.0.1:%v", port), nil
 }
 
-func (inst *instance) Close() {
+func (inst *instance) Close() error {
 	if inst.debug {
 		log.Logf(0, "stopping %v", inst.vmx)
 	}
@@ -151,28 +154,29 @@ func (inst *instance) Close() {
 	}
 	osutil.RunCmd(2*time.Minute, "", "vmrun", "deleteVM", inst.vmx)
 	close(inst.closed)
+	return nil
 }
 
 func (inst *instance) Copy(hostSrc string) (string, error) {
 	base := filepath.Base(hostSrc)
 	vmDst := filepath.Join("/", base)
-
-	args := append(vmimpl.SCPArgs(inst.debug, inst.sshkey, 22),
-		hostSrc, fmt.Sprintf("%v@%v:%v", inst.sshuser, inst.ipAddr, vmDst))
-
-	if inst.debug {
-		log.Logf(0, "running command: scp %#v", args)
-	}
-
-	_, err := osutil.RunCmd(3*time.Minute, "", "scp", args...)
+	err := vmimpl.SCP(hostSrc, vmDst, vmimpl.SCPOptions{
+		Debug:        inst.debug,
+		Key:          inst.sshkey,
+		Port:         22,
+		SystemSSHCfg: false,
+		User:         inst.sshuser,
+		Addr:         inst.ipAddr,
+		Timeout:      3 * time.Minute,
+	})
 	if err != nil {
 		return "", err
 	}
 	return vmDst, nil
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
-	<-chan []byte, <-chan error, error) {
+func (inst *instance) Run(ctx context.Context, command string) (
+	<-chan vmimpl.Chunk, <-chan error, error) {
 	vmxDir := filepath.Dir(inst.vmx)
 	serial := filepath.Join(vmxDir, "serial")
 	dmesg, err := net.Dial("unix", serial)
@@ -185,8 +189,15 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 		dmesg.Close()
 		return nil, nil, err
 	}
+	rpipeErr, wpipeErr, err := osutil.LongPipe()
+	if err != nil {
+		dmesg.Close()
+		rpipe.Close()
+		wpipe.Close()
+		return nil, nil, err
+	}
 
-	args := vmimpl.SSHArgs(inst.debug, inst.sshkey, 22)
+	args := vmimpl.SSHArgs(inst.debug, inst.sshkey, 22, false)
 	// Forward target port as part of the ssh connection (reverse proxy)
 	if inst.forwardPort != 0 {
 		proxy := fmt.Sprintf("%v:127.0.0.1:%v", inst.forwardPort, inst.forwardPort)
@@ -198,24 +209,33 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	}
 	cmd := osutil.Command("ssh", args...)
 	cmd.Stdout = wpipe
-	cmd.Stderr = wpipe
+	cmd.Stderr = wpipeErr
 	if err := cmd.Start(); err != nil {
 		dmesg.Close()
 		rpipe.Close()
 		wpipe.Close()
+		rpipeErr.Close()
+		wpipeErr.Close()
 		return nil, nil, err
 	}
 	wpipe.Close()
+	wpipeErr.Close()
 
 	var tee io.Writer
 	if inst.debug {
 		tee = os.Stdout
 	}
 	merger := vmimpl.NewOutputMerger(tee)
-	merger.Add("dmesg", dmesg)
-	merger.Add("ssh", rpipe)
+	merger.Add("dmesg", vmimpl.OutputConsole, dmesg)
+	merger.Add("ssh", vmimpl.OutputStdout, rpipe)
+	merger.Add("ssh-err", vmimpl.OutputStderr, rpipeErr)
 
-	return vmimpl.Multiplex(cmd, merger, dmesg, timeout, stop, inst.closed, inst.debug)
+	return vmimpl.Multiplex(ctx, cmd, merger, vmimpl.MultiplexConfig{
+		Console: dmesg,
+		Close:   inst.closed,
+		Debug:   inst.debug,
+		Scale:   inst.timeouts.Scale,
+	})
 }
 
 func (inst *instance) Diagnose(rep *report.Report) ([]byte, bool) {

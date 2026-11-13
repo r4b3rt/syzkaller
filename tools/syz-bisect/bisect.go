@@ -12,8 +12,8 @@
 // -kernel_commit. HEAD is used if commits are not specified.
 //
 // The crash dir should contain the following files:
-//  - repro.cprog or repro.prog: reproducer for the crash
-//  - repro.opts: syzkaller reproducer options (e.g. {"procs":1,"sandbox":"none",...}) (optional)
+//   - repro.cprog or repro.prog: reproducer for the crash
+//   - repro.opts: syzkaller reproducer options (e.g. {"procs":1,"sandbox":"none",...}) (optional)
 //
 // The tool stores bisection result into cause.commit or fix.commit.
 package main
@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 
@@ -35,19 +34,25 @@ import (
 )
 
 var (
-	flagConfig          = flag.String("config", "", "bisect config file")
-	flagCrash           = flag.String("crash", "", "dir with crash info")
-	flagFix             = flag.Bool("fix", false, "search for crash fix")
-	flagKernelCommit    = flag.String("kernel_commit", "", "original kernel commit")
-	flagSyzkallerCommit = flag.String("syzkaller_commit", "", "original syzkaller commit")
+	flagConfig            = flag.String("config", "", "bisect config file")
+	flagCrash             = flag.String("crash", "", "dir with crash info")
+	flagFix               = flag.Bool("fix", false, "search for crash fix")
+	flagKernelCommit      = flag.String("kernel_commit", "", "original kernel commit")
+	flagKernelCommitTitle = flag.String("kernel_commit_title", "", "original kernel commit title")
+	flagSyzkallerCommit   = flag.String("syzkaller_commit", "", "original syzkaller commit")
 )
 
 type Config struct {
+	Compiler string `json:"compiler"`
+	// Currently either 'gcc' or 'clang'. Note that pkg/bisect requires
+	// explicit plumbing for every os/compiler combination.
+	CompilerType string `json:"compiler_type"`
+	Make         string `json:"make"`
 	// BinDir must point to a dir that contains compilers required to build
 	// older versions of the kernel. For linux, it needs to include several
-	// gcc versions. A working archive can be downloaded from:
-	// https://storage.googleapis.com/syzkaller/bisect_bin.tar.gz
+	// compiler versions.
 	BinDir        string `json:"bin_dir"`
+	Linker        string `json:"linker"`
 	Ccache        string `json:"ccache"`
 	KernelRepo    string `json:"kernel_repo"`
 	KernelBranch  string `json:"kernel_branch"`
@@ -55,11 +60,15 @@ type Config struct {
 	// Directory with user-space system for building kernel images
 	// (for linux that's the input to tools/create-gce-image.sh).
 	Userspace string `json:"userspace"`
+	// Optional VM image used to build the kernel, needed for some cross-compilation targets.
+	KernelBuilderImage string `json:"kernel_builder_image"`
 	// Sysctl/cmdline files used to build the image which was used to crash the kernel, e.g. see:
 	// dashboard/config/upstream.sysctl
 	// dashboard/config/upstream-selinux.cmdline
-	Sysctl  string `json:"sysctl"`
-	Cmdline string `json:"cmdline"`
+	Sysctl    string               `json:"sysctl"`
+	Cmdline   string               `json:"cmdline"`
+	CrossTree bool                 `json:"cross_tree"`
+	Backports []vcs.BackportCommit `json:"backports"`
 
 	KernelConfig         string `json:"kernel_config"`
 	KernelBaselineConfig string `json:"kernel_baseline_config"`
@@ -82,7 +91,7 @@ func main() {
 		os.Exit(1)
 	}
 	if mgrcfg.Workdir == "" {
-		mgrcfg.Workdir, err = ioutil.TempDir("", "syz-bisect")
+		mgrcfg.Workdir, err = os.MkdirTemp("", "syz-bisect")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to create temp dir: %v\n", err)
 			os.Exit(1)
@@ -94,16 +103,24 @@ func main() {
 			TraceWriter: os.Stdout,
 			OutDir:      *flagCrash,
 		},
-		Fix:    *flagFix,
-		BinDir: mycfg.BinDir,
-		Ccache: mycfg.Ccache,
+		Fix:             *flagFix,
+		DefaultCompiler: mycfg.Compiler,
+		CompilerType:    mycfg.CompilerType,
+		Make:            mycfg.Make,
+		Linker:          mycfg.Linker,
+		BinDir:          mycfg.BinDir,
+		Ccache:          mycfg.Ccache,
+		CrossTree:       mycfg.CrossTree,
 		Kernel: bisect.KernelConfig{
-			Repo:      mycfg.KernelRepo,
-			Branch:    mycfg.KernelBranch,
-			Commit:    *flagKernelCommit,
-			Userspace: mycfg.Userspace,
-			Sysctl:    mycfg.Sysctl,
-			Cmdline:   mycfg.Cmdline,
+			Repo:         mycfg.KernelRepo,
+			Branch:       mycfg.KernelBranch,
+			Commit:       *flagKernelCommit,
+			CommitTitle:  *flagKernelCommitTitle,
+			Userspace:    mycfg.Userspace,
+			BuilderImage: mycfg.KernelBuilderImage,
+			Sysctl:       mycfg.Sysctl,
+			Cmdline:      mycfg.Cmdline,
+			Backports:    mycfg.Backports,
 		},
 		Syzkaller: bisect.SyzkallerConfig{
 			Repo:   mycfg.SyzkallerRepo,
@@ -143,7 +160,7 @@ func loadFile(path, file string, dst *[]byte, mandatory bool) {
 	if !mandatory && !osutil.IsExist(filename) {
 		return
 	}
-	data, err := ioutil.ReadFile(filename)
+	data, err := os.ReadFile(filename)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

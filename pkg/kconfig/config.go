@@ -7,7 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"regexp"
 )
 
@@ -36,7 +36,7 @@ const (
 	prefix = "CONFIG_"
 )
 
-//  Value returns config value, or No if it's not present at all.
+// Value returns config value, or No if it's not present at all.
 func (cf *ConfigFile) Value(name string) string {
 	cfg := cf.Map[name]
 	if cfg == nil {
@@ -105,9 +105,9 @@ func (cf *ConfigFile) Serialize() []byte {
 }
 
 func ParseConfig(file string) (*ConfigFile, error) {
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open .config file %v: %v", file, err)
+		return nil, fmt.Errorf("failed to open .config file %v: %w", file, err)
 	}
 	return ParseConfigData(data, file)
 }
@@ -123,7 +123,7 @@ func ParseConfigData(data []byte, file string) (*ConfigFile, error) {
 	return cf, nil
 }
 
-func (cf *ConfigFile) clone() *ConfigFile {
+func (cf *ConfigFile) Clone() *ConfigFile {
 	cf1 := &ConfigFile{
 		Map:      make(map[string]*Config),
 		comments: cf.comments,

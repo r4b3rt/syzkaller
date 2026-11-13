@@ -4,30 +4,32 @@
 // Package csource generates [almost] equivalent C programs from syzkaller programs.
 //
 // Outline of the process:
-// - inputs to the generation are the program and options
-// - options control multiple aspects of the resulting C program,
-//   like if we want a multi-threaded program or a single-threaded,
-//   what type of sandbox we want to use, if we want to setup net devices or not, etc
-// - we use actual executor sources as the base
-// - gen.go takes all executor/common*.h headers and bundles them into generated.go
-// - during generation we tear executor headers apart and take only the bits
-//   we need for the current program/options, this is done by running C preprocessor
-//   with particular set of defines so that the preprocessor removes unneeded
-//   #ifdef SYZ_FOO sections
-// - then we generate actual syscall calls with the given arguments
-//   based on the binary "encodingexec" representation of the program
-//   (the same representation executor uses for interpretation)
-// - then we glue it all together
-// - as the last step we run some text post-processing on the resulting source code:
-//   remove debug calls, replace exitf/fail with exit, hoist/sort/dedup includes,
-//   remove duplicate empty lines, etc
+//   - inputs to the generation are the program and options
+//   - options control multiple aspects of the resulting C program,
+//     like if we want a multi-threaded program or a single-threaded,
+//     what type of sandbox we want to use, if we want to setup net devices or not, etc
+//   - we use actual executor sources as the base
+//   - gen.go takes all executor/common*.h headers and bundles them into generated.go
+//   - during generation we tear executor headers apart and take only the bits
+//     we need for the current program/options, this is done by running C preprocessor
+//     with particular set of defines so that the preprocessor removes unneeded
+//     #ifdef SYZ_FOO sections
+//   - then we generate actual syscall calls with the given arguments
+//     based on the binary "encodingexec" representation of the program
+//     (the same representation executor uses for interpretation)
+//   - then we glue it all together
+//   - as the last step we run some text post-processing on the resulting source code:
+//     remove debug calls, replace exitf/fail with exit, hoist/sort/dedup includes,
+//     remove duplicate empty lines, etc
 package csource
 
 import (
 	"bytes"
 	"fmt"
+	"math/bits"
 	"regexp"
-	"sort"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,7 +40,7 @@ import (
 // Write generates C source for program p based on the provided options opt.
 func Write(p *prog.Prog, opts Options) ([]byte, error) {
 	if err := opts.Check(p.Target.OS); err != nil {
-		return nil, fmt.Errorf("csource: invalid opts: %v", err)
+		return nil, fmt.Errorf("csource: invalid opts: %w", err)
 	}
 	ctx := &context{
 		p:         p,
@@ -50,6 +52,17 @@ func Write(p *prog.Prog, opts Options) ([]byte, error) {
 	return ctx.generateSource()
 }
 
+// WriteLLM generates a minimal, single-threaded C reproducer for LLMs.
+func WriteLLM(p *prog.Prog) ([]byte, error) {
+	opts := Options{
+		Sandbox:      "",
+		CallComments: true,
+		Procs:        1,
+		Slowdown:     1,
+	}
+	return Write(p, opts)
+}
+
 type context struct {
 	p         *prog.Prog
 	opts      Options
@@ -58,21 +71,44 @@ type context struct {
 	calls     map[string]uint64 // CallName -> NR
 }
 
+func generateSandboxFunctionSignature(sandboxName string, sandboxArg int) string {
+	if sandboxName == "" {
+		return "loop();"
+	}
+
+	arguments := "();"
+	if sandboxName == "android" {
+		arguments = "(" + strconv.Itoa(sandboxArg) + ");"
+	}
+	return "do_sandbox_" + sandboxName + arguments
+}
+
 func (ctx *context) generateSource() ([]byte, error) {
 	ctx.filterCalls()
-	calls, vars, err := ctx.generateProgCalls(ctx.p, ctx.opts.Trace)
+	calls, vars, err := ctx.generateProgCalls(ctx.p, ctx.opts.Trace, ctx.opts.CallComments)
 	if err != nil {
 		return nil, err
 	}
 
 	mmapProg := ctx.p.Target.DataMmapProg()
-	mmapCalls, _, err := ctx.generateProgCalls(mmapProg, false)
+	// Disable comments on the mmap calls as they are part of the initial setup
+	// for a program and always very similar. Comments on these provide
+	// little-to-no additional context that can't be inferred from looking at
+	// the call arguments directly, and just make the source longer.
+	mmapCalls, _, err := ctx.generateProgCalls(mmapProg, false, false)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, c := range append(mmapProg.Calls, ctx.p.Calls...) {
 		ctx.calls[c.Meta.CallName] = c.Meta.NR
+		for _, dep := range ctx.sysTarget.PseudoSyscallDeps[c.Meta.CallName] {
+			depCall := ctx.target.SyscallMap[dep]
+			if depCall == nil {
+				panic(dep + " is specified in PseudoSyscallDeps, but not present")
+			}
+			ctx.calls[depCall.CallName] = depCall.NR
+		}
 	}
 
 	varsBuf := new(bytes.Buffer)
@@ -87,10 +123,7 @@ func (ctx *context) generateSource() ([]byte, error) {
 		fmt.Fprintf(varsBuf, "};\n")
 	}
 
-	sandboxFunc := "loop();"
-	if ctx.opts.Sandbox != "" {
-		sandboxFunc = "do_sandbox_" + ctx.opts.Sandbox + "();"
-	}
+	sandboxFunc := generateSandboxFunctionSignature(ctx.opts.Sandbox, ctx.opts.SandboxArg)
 	replacements := map[string]string{
 		"PROCS":           fmt.Sprint(ctx.opts.Procs),
 		"REPEAT_TIMES":    fmt.Sprint(ctx.opts.RepeatTimes),
@@ -109,12 +142,24 @@ func (ctx *context) generateSource() ([]byte, error) {
 	timeouts := ctx.sysTarget.Timeouts(ctx.opts.Slowdown)
 	replacements["PROGRAM_TIMEOUT_MS"] = fmt.Sprint(int(timeouts.Program / time.Millisecond))
 	timeoutExpr := fmt.Sprint(int(timeouts.Syscall / time.Millisecond))
+	replacements["BASE_CALL_TIMEOUT_MS"] = timeoutExpr
 	for i, call := range ctx.p.Calls {
 		if timeout := call.Meta.Attrs.Timeout; timeout != 0 {
 			timeoutExpr += fmt.Sprintf(" + (call == %v ? %v : 0)", i, timeout*uint64(timeouts.Scale))
 		}
 	}
 	replacements["CALL_TIMEOUT_MS"] = timeoutExpr
+	if ctx.p.RequiredFeatures().Async {
+		conditions := []string{}
+		for idx, call := range ctx.p.Calls {
+			if !call.Props.Async {
+				continue
+			}
+			conditions = append(conditions, fmt.Sprintf("call == %v", idx))
+		}
+		replacements["ASYNC_CONDITIONS"] = strings.Join(conditions, " || ")
+	}
+
 	result, err := createCommonHeader(ctx.p, mmapProg, replacements, ctx.opts)
 	if err != nil {
 		return nil, err
@@ -158,9 +203,7 @@ func (ctx *context) generateSyscalls(calls []string, hasVars bool) string {
 		if len(calls) > 0 && (hasVars || opts.Trace) {
 			fmt.Fprintf(buf, "\tintptr_t res = 0;\n")
 		}
-		if opts.Repro {
-			fmt.Fprintf(buf, "\tif (write(1, \"executing program\\n\", sizeof(\"executing program\\n\") - 1)) {}\n")
-		}
+		fmt.Fprintf(buf, "\tif (write(1, \"executing program\\n\", sizeof(\"executing program\\n\") - 1)) {}\n")
 		if opts.Trace {
 			fmt.Fprintf(buf, "\tfprintf(stderr, \"### start\\n\");\n")
 		}
@@ -174,7 +217,7 @@ func (ctx *context) generateSyscalls(calls []string, hasVars bool) string {
 		fmt.Fprintf(buf, "\tswitch (call) {\n")
 		for i, c := range calls {
 			fmt.Fprintf(buf, "\tcase %v:\n", i)
-			fmt.Fprintf(buf, "%s", strings.Replace(c, "\t", "\t\t", -1))
+			fmt.Fprintf(buf, "%s", strings.ReplaceAll(c, "\t", "\t\t"))
 			fmt.Fprintf(buf, "\t\tbreak;\n")
 		}
 		fmt.Fprintf(buf, "\t}\n")
@@ -185,13 +228,12 @@ func (ctx *context) generateSyscalls(calls []string, hasVars bool) string {
 func (ctx *context) generateSyscallDefines() string {
 	var calls []string
 	for name, nr := range ctx.calls {
-		if !ctx.sysTarget.SyscallNumbers ||
-			strings.HasPrefix(name, "syz_") || !ctx.sysTarget.NeedSyscallDefine(nr) {
+		if !ctx.sysTarget.HasCallNumber(name) || !ctx.sysTarget.NeedSyscallDefine(nr) {
 			continue
 		}
 		calls = append(calls, name)
 	}
-	sort.Strings(calls)
+	slices.Sort(calls)
 	buf := new(bytes.Buffer)
 	prefix := ctx.sysTarget.SyscallPrefix
 	for _, name := range calls {
@@ -209,25 +251,69 @@ func (ctx *context) generateSyscallDefines() string {
 	return buf.String()
 }
 
-func (ctx *context) generateProgCalls(p *prog.Prog, trace bool) ([]string, []uint64, error) {
-	exec := make([]byte, prog.ExecBufferSize)
-	progSize, err := p.SerializeForExec(exec)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to serialize program: %v", err)
+const indent string = "  " // Two spaces.
+
+// clang-format produces nicer comments with '//' prefixing versus '/* ... */' style comments.
+const commentPrefix string = "//"
+
+func linesToCStyleComment(lines []string) string {
+	var commentBuilder strings.Builder
+	for i, line := range lines {
+		commentBuilder.WriteString(commentPrefix + indent + line)
+		if i != len(lines)-1 {
+			commentBuilder.WriteString("\n")
+		}
 	}
-	decoded, err := ctx.target.DeserializeExec(exec[:progSize])
+	return commentBuilder.String()
+}
+
+func generateComment(call *prog.Call) string {
+	lines := []string{fmt.Sprintf("%s arguments: [", call.Meta.Name)}
+	for i, arg := range call.Args {
+		argLines := prog.FormatArg(arg, call.Meta.Args[i].Name)
+		// Indent the formatted argument.
+		for i := range argLines {
+			argLines[i] = indent + argLines[i]
+		}
+		lines = append(lines, argLines...)
+	}
+	lines = append(lines, "]")
+	if call.Ret != nil {
+		lines = append(lines, "returns "+call.Ret.Type().Name())
+	}
+	return linesToCStyleComment(lines)
+}
+
+func (ctx *context) generateProgCalls(p *prog.Prog, trace, addComments bool) ([]string, []uint64, error) {
+	var comments []string
+	if addComments {
+		comments = make([]string, len(p.Calls))
+		for i, call := range p.Calls {
+			comments[i] = generateComment(call)
+		}
+	}
+
+	exec, err := p.SerializeForExec()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to serialize program: %w", err)
+	}
+	decoded, err := ctx.target.DeserializeExec(exec, nil)
 	if err != nil {
 		return nil, nil, err
 	}
-	calls, vars := ctx.generateCalls(decoded, trace)
+	calls, vars := ctx.generateCalls(decoded, trace, addComments, comments)
 	return calls, vars, nil
 }
 
-func (ctx *context) generateCalls(p prog.ExecProg, trace bool) ([]string, []uint64) {
+func (ctx *context) generateCalls(p prog.ExecProg, trace, addComments bool,
+	callComments []string) ([]string, []uint64) {
 	var calls []string
 	csumSeq := 0
 	for ci, call := range p.Calls {
 		w := new(bytes.Buffer)
+		if addComments {
+			w.WriteString(callComments[ci] + "\n")
+		}
 		// Copyin.
 		for _, copyin := range call.Copyin {
 			ctx.copyin(w, &csumSeq, copyin)
@@ -242,6 +328,12 @@ func (ctx *context) generateCalls(p prog.ExecProg, trace bool) ([]string, []uint
 
 		ctx.emitCall(w, call, ci, resCopyout || argCopyout, trace)
 
+		if call.Props.Rerun > 0 {
+			fmt.Fprintf(w, "\tfor (int i = 0; i < %v; i++) {\n", call.Props.Rerun)
+			// Rerun invocations should not affect the result value.
+			ctx.emitCall(w, call, ci, false, false)
+			fmt.Fprintf(w, "\t}\n")
+		}
 		// Copyout.
 		if resCopyout || argCopyout {
 			ctx.copyout(w, call, resCopyout)
@@ -251,10 +343,13 @@ func (ctx *context) generateCalls(p prog.ExecProg, trace bool) ([]string, []uint
 	return calls, p.Vars
 }
 
+func isNative(sysTarget *targets.Target, callName string) bool {
+	_, trampoline := sysTarget.SyscallTrampolines[callName]
+	return sysTarget.HasCallNumber(callName) && !trampoline
+}
+
 func (ctx *context) emitCall(w *bytes.Buffer, call prog.ExecCall, ci int, haveCopyout, trace bool) {
-	callName := call.Meta.CallName
-	_, trampoline := ctx.sysTarget.SyscallTrampolines[callName]
-	native := ctx.sysTarget.SyscallNumbers && !strings.HasPrefix(callName, "syz_") && !trampoline
+	native := isNative(ctx.sysTarget, call.Meta.CallName)
 	fmt.Fprintf(w, "\t")
 	if !native {
 		// This mimics the same as executor does for execute_syscall,
@@ -271,11 +366,11 @@ func (ctx *context) emitCall(w *bytes.Buffer, call prog.ExecCall, ci int, haveCo
 	if haveCopyout || trace {
 		fmt.Fprintf(w, "res = ")
 	}
-	ctx.emitCallBody(w, call, native)
+	w.WriteString(ctx.fmtCallBody(call))
 	if !native {
 		fmt.Fprintf(w, ")") // close NONFAILING macro
 	}
-	fmt.Fprintf(w, ");")
+	fmt.Fprintf(w, ";")
 	comment := ctx.target.AnnotateCall(call)
 	if comment != "" {
 		fmt.Fprintf(w, " /* %s */", comment)
@@ -283,7 +378,7 @@ func (ctx *context) emitCall(w *bytes.Buffer, call prog.ExecCall, ci int, haveCo
 	fmt.Fprintf(w, "\n")
 	if trace {
 		cast := ""
-		if !native && !strings.HasPrefix(callName, "syz_") {
+		if !native && !strings.HasPrefix(call.Meta.CallName, "syz_") {
 			// Potentially we casted a function returning int to a function returning intptr_t.
 			// So instead of intptr_t -1 we can get 0x00000000ffffffff. Sign extend it to intptr_t.
 			cast = "(intptr_t)(int)"
@@ -292,53 +387,54 @@ func (ctx *context) emitCall(w *bytes.Buffer, call prog.ExecCall, ci int, haveCo
 	}
 }
 
-func (ctx *context) emitCallBody(w *bytes.Buffer, call prog.ExecCall, native bool) {
+func (ctx *context) fmtCallBody(call prog.ExecCall) string {
+	native := isNative(ctx.sysTarget, call.Meta.CallName)
 	callName, ok := ctx.sysTarget.SyscallTrampolines[call.Meta.CallName]
 	if !ok {
 		callName = call.Meta.CallName
 	}
+	argsStrs := []string{}
+	funcName := ""
 	if native {
-		fmt.Fprintf(w, "syscall(%v%v", ctx.sysTarget.SyscallPrefix, callName)
+		funcName = "syscall"
+		argsStrs = append(argsStrs, ctx.sysTarget.SyscallPrefix+callName)
 	} else if strings.HasPrefix(callName, "syz_") {
-		fmt.Fprintf(w, "%v(", callName)
+		funcName = callName
 	} else {
-		args := strings.Repeat(",intptr_t", len(call.Args))
+		args := strings.Repeat(",intptr_t", len(call.Args)+call.Meta.MissingArgs)
 		if args != "" {
 			args = args[1:]
 		}
-		fmt.Fprintf(w, "((intptr_t(*)(%v))CAST(%v))(", args, callName)
+		funcName = fmt.Sprintf("((intptr_t(*)(%v))CAST(%v))", args, callName)
 	}
-	for ai, arg := range call.Args {
-		if native || ai > 0 {
-			fmt.Fprintf(w, ", ")
-		}
+	for i, arg := range call.Args {
 		switch arg := arg.(type) {
 		case prog.ExecArgConst:
 			if arg.Format != prog.FormatNative && arg.Format != prog.FormatBigEndian {
-				panic("sring format in syscall argument")
+				panic("string format in syscall argument")
 			}
-			fmt.Fprintf(w, "%v", ctx.constArgToStr(arg, true, native))
+			com := ctx.argComment(call.Meta.Args[i], arg)
+			argsStrs = append(argsStrs, com+handleBigEndian(arg, ctx.constArgToStr(arg, native)))
 		case prog.ExecArgResult:
 			if arg.Format != prog.FormatNative && arg.Format != prog.FormatBigEndian {
-				panic("sring format in syscall argument")
+				panic("string format in syscall argument")
 			}
+			com := ctx.argComment(call.Meta.Args[i], arg)
 			val := ctx.resultArgToStr(arg)
 			if native && ctx.target.PtrSize == 4 {
 				// syscall accepts args as ellipsis, resources are uint64
 				// and take 2 slots without the cast, which would be wrong.
 				val = "(intptr_t)" + val
 			}
-			fmt.Fprintf(w, "%v", val)
+			argsStrs = append(argsStrs, com+val)
 		default:
 			panic(fmt.Sprintf("unknown arg type: %+v", arg))
 		}
 	}
-	for i := 0; i < call.Meta.MissingArgs; i++ {
-		if native || len(call.Args) != 0 {
-			fmt.Fprintf(w, ", ")
-		}
-		fmt.Fprintf(w, "0")
+	for range call.Meta.MissingArgs {
+		argsStrs = append(argsStrs, "0")
 	}
+	return fmt.Sprintf("%v(%v)", funcName, strings.Join(argsStrs, ", "))
 }
 
 func (ctx *context) generateCsumInet(w *bytes.Buffer, addr uint64, arg prog.ExecArgCsum, csumSeq int) {
@@ -366,21 +462,21 @@ func (ctx *context) copyin(w *bytes.Buffer, csumSeq *int, copyin prog.ExecCopyin
 	switch arg := copyin.Arg.(type) {
 	case prog.ExecArgConst:
 		if arg.BitfieldOffset == 0 && arg.BitfieldLength == 0 {
-			ctx.copyinVal(w, copyin.Addr, arg.Size, ctx.constArgToStr(arg, true, false), arg.Format)
+			ctx.copyinVal(w, copyin.Addr, arg.Size, handleBigEndian(arg, ctx.constArgToStr(arg, false)), arg.Format)
 		} else {
 			if arg.Format != prog.FormatNative && arg.Format != prog.FormatBigEndian {
 				panic("bitfield+string format")
 			}
 			htobe := ""
-			if ctx.target.LittleEndian && arg.Format == prog.FormatBigEndian {
+			if !ctx.target.BigEndian && arg.Format == prog.FormatBigEndian {
 				htobe = fmt.Sprintf("htobe%v", arg.Size*8)
 			}
 			bitfieldOffset := arg.BitfieldOffset
-			if !ctx.target.LittleEndian {
+			if ctx.target.BigEndian {
 				bitfieldOffset = arg.Size*8 - arg.BitfieldOffset - arg.BitfieldLength
 			}
 			fmt.Fprintf(w, "\tNONFAILING(STORE_BY_BITMASK(uint%v, %v, 0x%x, %v, %v, %v));\n",
-				arg.Size*8, htobe, copyin.Addr, ctx.constArgToStr(arg, false, false),
+				arg.Size*8, htobe, copyin.Addr, ctx.constArgToStr(arg, false),
 				bitfieldOffset, arg.BitfieldLength)
 		}
 	case prog.ExecArgResult:
@@ -460,16 +556,87 @@ func (ctx *context) copyout(w *bytes.Buffer, call prog.ExecCall, resCopyout bool
 	}
 }
 
-func (ctx *context) constArgToStr(arg prog.ExecArgConst, handleBigEndian, native bool) string {
+func (ctx *context) factorizeAsFlags(value uint64, flags []string, attemptsLeft *int) ([]string, uint64) {
+	if len(flags) == 0 || value == 0 || *attemptsLeft == 0 {
+		return nil, value
+	}
+
+	*attemptsLeft -= 1
+	currentFlag := flags[0]
+	subset, remainder := ctx.factorizeAsFlags(value, flags[1:], attemptsLeft)
+
+	if flagMask, ok := ctx.p.Target.ConstMap[currentFlag]; ok && (value&flagMask == flagMask) {
+		subsetIfTaken, remainderIfTaken := ctx.factorizeAsFlags(value & ^flagMask, flags[1:], attemptsLeft)
+		subsetIfTaken = append(subsetIfTaken, currentFlag)
+
+		bits, bitsIfTaken := bits.OnesCount64(remainder), bits.OnesCount64(remainderIfTaken)
+		if (bitsIfTaken < bits) || (bits == bitsIfTaken && len(subsetIfTaken) < len(subset)) {
+			return subsetIfTaken, remainderIfTaken
+		}
+	}
+
+	return subset, remainder
+}
+
+func (ctx *context) prettyPrintValue(field prog.Field, arg prog.ExecArgConst) string {
 	mask := (uint64(1) << (arg.Size * 8)) - 1
 	v := arg.Value & mask
-	val := fmt.Sprintf("%v", v)
-	if v == ^uint64(0)&mask {
-		val = "-1"
-	} else if v >= 10 {
-		val = fmt.Sprintf("0x%x", v)
+
+	f := ctx.p.Target.FlagsMap[field.Type.Name()]
+	if len(f) == 0 {
+		return ""
 	}
-	if native && arg.Size == 8 {
+
+	maxFactorizationAttempts := 256
+	flags, remainder := ctx.factorizeAsFlags(v, f, &maxFactorizationAttempts)
+	if len(flags) == 0 {
+		return ""
+	}
+	if remainder != 0 {
+		flags = append(flags, fmt.Sprintf("0x%x", remainder))
+	}
+
+	return strings.Join(flags, "|")
+}
+
+func (ctx *context) argComment(field prog.Field, arg prog.ExecArg) string {
+	val := ""
+	constArg, isConstArg := arg.(prog.ExecArgConst)
+	if isConstArg {
+		val = ctx.prettyPrintValue(field, constArg)
+	}
+
+	return "/*" + field.Name + "=" + val + "*/"
+}
+
+// enforceBitSize is necessary e.g. in the variadic arguments context of the syscall() function.
+func (ctx *context) constArgToStr(arg prog.ExecArgConst, enforceBitSize bool) string {
+	suffix := ""
+	if enforceBitSize {
+		suffix = ctx.literalSuffix(arg)
+	}
+	mask := (uint64(1) << (arg.Size * 8)) - 1
+	v := arg.Value & mask
+	val := ""
+	if v == ^uint64(0)&mask {
+		if enforceBitSize {
+			val = "(intptr_t)-1"
+		} else {
+			val = "-1"
+		}
+	} else if v >= 10 {
+		val = fmt.Sprintf("0x%x%s", v, suffix)
+	} else {
+		val = fmt.Sprintf("%d%s", v, suffix)
+	}
+	if ctx.opts.Procs > 1 && arg.PidStride != 0 {
+		val += fmt.Sprintf(" + procid*%v", arg.PidStride)
+	}
+	return val
+}
+
+func (ctx *context) literalSuffix(arg prog.ExecArgConst) string {
+	if arg.Size == 8 {
 		// syscall() is variadic, so constant arguments must be explicitly
 		// promoted. Otherwise the compiler is free to leave garbage in the
 		// upper 32 bits of the argument value. In practice this can happen
@@ -486,16 +653,17 @@ func (ctx *context) constArgToStr(arg prog.ExecArgConst, handleBigEndian, native
 		// this should be fine: arguments are passed in 64-bit registers or
 		// at 64 bit-aligned addresses on the stack.
 		if ctx.target.PtrSize == 4 {
-			val += "ull"
+			return "ull"
 		} else {
-			val += "ul"
+			return "ul"
 		}
 	}
-	if ctx.opts.Procs > 1 && arg.PidStride != 0 {
-		val += fmt.Sprintf(" + procid*%v", arg.PidStride)
-	}
-	if handleBigEndian && arg.Format == prog.FormatBigEndian {
-		val = fmt.Sprintf("htobe%v(%v)", arg.Size*8, val)
+	return ""
+}
+
+func handleBigEndian(arg prog.ExecArgConst, val string) string {
+	if arg.Format == prog.FormatBigEndian {
+		return fmt.Sprintf("htobe%v(%v)", arg.Size*8, val)
 	}
 	return val
 }
@@ -519,13 +687,18 @@ func (ctx *context) postProcess(result []byte) []byte {
 	if !ctx.opts.HandleSegv {
 		result = regexp.MustCompile(`\t*NONFAILING\((.*)\);\n`).ReplaceAll(result, []byte("$1;\n"))
 	}
-	result = bytes.Replace(result, []byte("NORETURN"), nil, -1)
-	result = bytes.Replace(result, []byte("doexit("), []byte("exit("), -1)
+	result = bytes.ReplaceAll(result, []byte("NORETURN"), nil)
+	result = bytes.ReplaceAll(result, []byte("doexit("), []byte("exit("))
+	// TODO: Figure out what would be the right replacement for doexit_thread().
+	result = bytes.ReplaceAll(result, []byte("doexit_thread("), []byte("exit("))
 	result = regexp.MustCompile(`PRINTF\(.*?\)`).ReplaceAll(result, nil)
 	result = regexp.MustCompile(`\t*debug\((.*\n)*?.*\);\n`).ReplaceAll(result, nil)
 	result = regexp.MustCompile(`\t*debug_dump_data\((.*\n)*?.*\);\n`).ReplaceAll(result, nil)
 	result = regexp.MustCompile(`\t*exitf\((.*\n)*?.*\);\n`).ReplaceAll(result, []byte("\texit(1);\n"))
 	result = regexp.MustCompile(`\t*fail(msg)?\((.*\n)*?.*\);\n`).ReplaceAll(result, []byte("\texit(1);\n"))
+
+	// Remove executor include guards.
+	result = regexp.MustCompile(`#define\s+[A-Z0-9_]*_H\s*\n`).ReplaceAll(result, nil)
 
 	result = ctx.hoistIncludes(result)
 	result = ctx.removeEmptyLines(result)
@@ -557,10 +730,10 @@ func (ctx *context) hoistIncludes(result []byte) []byte {
 			sorted = append(sorted, include)
 		}
 	}
-	sort.Strings(sortedTop)
-	sort.Strings(sorted)
-	sort.Strings(sortedBottom)
-	newResult := append([]byte{}, result[:includesStart]...)
+	slices.Sort(sortedTop)
+	slices.Sort(sorted)
+	slices.Sort(sortedBottom)
+	newResult := slices.Clone(result[:includesStart])
 	newResult = append(newResult, strings.Join(sortedTop, "")...)
 	newResult = append(newResult, '\n')
 	newResult = append(newResult, strings.Join(sorted, "")...)
@@ -573,9 +746,9 @@ func (ctx *context) hoistIncludes(result []byte) []byte {
 // removeEmptyLines removes duplicate new lines.
 func (ctx *context) removeEmptyLines(result []byte) []byte {
 	for {
-		newResult := bytes.Replace(result, []byte{'\n', '\n', '\n'}, []byte{'\n', '\n'}, -1)
-		newResult = bytes.Replace(newResult, []byte{'\n', '\n', '\t'}, []byte{'\n', '\t'}, -1)
-		newResult = bytes.Replace(newResult, []byte{'\n', '\n', ' '}, []byte{'\n', ' '}, -1)
+		newResult := bytes.ReplaceAll(result, []byte{'\n', '\n', '\n'}, []byte{'\n', '\n'})
+		newResult = bytes.ReplaceAll(newResult, []byte{'\n', '\n', '\t'}, []byte{'\n', '\t'})
+		newResult = bytes.ReplaceAll(newResult, []byte{'\n', '\n', ' '}, []byte{'\n', ' '})
 		if len(newResult) == len(result) {
 			return result
 		}

@@ -4,12 +4,11 @@
 package compiler
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestConstFile(t *testing.T) {
@@ -87,11 +86,11 @@ CONST5_SOME_UNDEFINED2 = 100, arch3:???
 		cf.AddArch(name, arch.consts, arch.undefined)
 	}
 	data := cf.Serialize()
-	if diff := cmp.Diff(serialized, string(data)); diff != "" {
-		t.Fatal(diff)
-	}
+	assert.Equal(t, serialized, string(data))
+	assert.True(t, cf.ExistsAny("CONST3_SOME_UNDEFINED"))
+	assert.False(t, cf.ExistsAny("CONST4_ALL_UNDEFINED"))
 	{
-		file, err := ioutil.TempFile("", "syz-const")
+		file, err := os.CreateTemp("", "syz-const")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -103,28 +102,20 @@ CONST5_SOME_UNDEFINED2 = 100, arch3:???
 		file.Close()
 		cf1 := DeserializeConstFile(file.Name(), nil)
 		for name, arch := range arches {
-			if diff := cmp.Diff(arch.consts, cf1.Arch(name)); diff != "" {
-				t.Errorf("%v: %v", name, diff)
-			}
+			assert.Equal(t, cf1.Arch(name), arch.consts)
 		}
 	}
 	{
-		dir, err := ioutil.TempDir("", "syz-const")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer os.RemoveAll(dir)
+		dir := t.TempDir()
 		for name, arch := range arches {
 			file := filepath.Join(dir, "consts_"+name+".const")
-			if err := ioutil.WriteFile(file, []byte(arch.oldFormat), 0600); err != nil {
+			if err := os.WriteFile(file, []byte(arch.oldFormat), 0600); err != nil {
 				t.Fatal(err)
 			}
 		}
 		cf1 := DeserializeConstFile(filepath.Join(dir, "*"), nil)
 		for name, arch := range arches {
-			if diff := cmp.Diff(arch.consts, cf1.Arch(name)); diff != "" {
-				t.Errorf("%v: %v", name, diff)
-			}
+			assert.Equal(t, cf1.Arch(name), arch.consts)
 		}
 	}
 }

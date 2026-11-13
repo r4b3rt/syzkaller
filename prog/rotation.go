@@ -4,8 +4,9 @@
 package prog
 
 import (
+	"cmp"
 	"math/rand"
-	"sort"
+	"slices"
 )
 
 // Rotator selects a random subset of syscalls for corpus rotation.
@@ -14,7 +15,6 @@ type Rotator struct {
 	calls         map[*Syscall]bool
 	rnd           *rand.Rand
 	resourceless  []*Syscall
-	syscallUses   map[*Syscall][]*ResourceDesc
 	resources     map[*ResourceDesc]rotatorResource
 	goal          int
 	nresourceless int
@@ -32,15 +32,19 @@ type rotatorResource struct {
 
 func MakeRotator(target *Target, calls map[*Syscall]bool, rnd *rand.Rand) *Rotator {
 	r := &Rotator{
-		target:      target,
-		calls:       calls,
-		rnd:         rnd,
-		syscallUses: make(map[*Syscall][]*ResourceDesc),
-		resources:   make(map[*ResourceDesc]rotatorResource),
+		target:    target,
+		calls:     calls,
+		rnd:       rnd,
+		resources: make(map[*ResourceDesc]rotatorResource),
 	}
+	var sorted []*Syscall
 	for call := range calls {
-		r.syscallUses[call] = append(r.syscallUses[call], call.inputResources...)
-		r.syscallUses[call] = append(r.syscallUses[call], call.outputResources...)
+		sorted = append(sorted, call)
+	}
+	slices.SortFunc(sorted, func(a, b *Syscall) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
+	for _, call := range sorted {
 		var inputs []*ResourceDesc
 		for _, res := range call.inputResources {
 			// Don't take into account pid/uid/etc, they create too many links.
@@ -50,7 +54,7 @@ func MakeRotator(target *Target, calls map[*Syscall]bool, rnd *rand.Rand) *Rotat
 		}
 		// VMAs and filenames are effectively resources for our purposes
 		// (but they don't have ctors).
-		ForeachCallType(call, func(t Type, _ TypeCtx) {
+		ForeachCallType(call, func(t Type, _ *TypeCtx) {
 			switch a := t.(type) {
 			case *BufferType:
 				switch a.Kind {
@@ -79,8 +83,8 @@ func MakeRotator(target *Target, calls map[*Syscall]bool, rnd *rand.Rand) *Rotat
 				r.resources[parent] = info
 			}
 		}
-		outputDedup := make(map[string]bool, len(call.outputResources))
-		for _, res := range call.outputResources {
+		outputDedup := make(map[string]bool, len(call.createsResources))
+		for _, res := range call.createsResources {
 			if outputDedup[res.Name] {
 				continue
 			}
@@ -99,7 +103,7 @@ func MakeRotator(target *Target, calls map[*Syscall]bool, rnd *rand.Rand) *Rotat
 				r.resources[parent] = info
 			}
 		}
-		if len(inputs)+len(call.outputResources) == 0 {
+		if len(inputs)+len(call.createsResources) == 0 {
 			r.resourceless = append(r.resourceless, call)
 		}
 	}
@@ -107,17 +111,10 @@ func MakeRotator(target *Target, calls map[*Syscall]bool, rnd *rand.Rand) *Rotat
 	// However, we assume that 200 syscalls is enough for a fuzzing session,
 	// so we cap at that level to make fuzzing more targeted.
 	r.goal = len(calls) * 19 / 20
-	if r.goal < 1 {
-		r.goal = 1
-	}
-	if max := 200; r.goal > max {
-		r.goal = max
-	}
+	r.goal = max(r.goal, 1)
+	r.goal = min(r.goal, 200)
 	// How many syscalls that don't use any resources we want to add?
-	r.nresourceless = r.goal * len(r.resourceless) / len(calls)
-	if r.nresourceless < 1 {
-		r.nresourceless = 1
-	}
+	r.nresourceless = max(1, r.goal*len(r.resourceless)/len(calls))
 	return r
 }
 
@@ -174,11 +171,11 @@ func (rs *rotatorState) Select() map[*Syscall]bool {
 			if nctors0 {
 				continue
 			}
-			rs.selectCalls(info.ctors[1], 2, !nctors0)
+			rs.selectCalls(info.ctors[1], 2, true)
 			if nctors1 {
 				continue
 			}
-			rs.selectCalls(info.ctors[0], 2, !nctors1)
+			rs.selectCalls(info.ctors[2], 2, true)
 			continue
 		}
 		if len(rs.topQueue) == 0 {
@@ -192,8 +189,8 @@ func (rs *rotatorState) Select() map[*Syscall]bool {
 			for res := range rs.resources {
 				rs.topQueue = append(rs.topQueue, res)
 			}
-			sort.Slice(rs.topQueue, func(i, j int) bool {
-				return rs.topQueue[i].Name < rs.topQueue[j].Name
+			slices.SortFunc(rs.topQueue, func(a, b *ResourceDesc) int {
+				return cmp.Compare(a.Name, b.Name)
 			})
 			rs.rnd.Shuffle(len(rs.topQueue), func(i, j int) {
 				rs.topQueue[i], rs.topQueue[j] = rs.topQueue[j], rs.topQueue[i]
@@ -212,7 +209,7 @@ func (rs *rotatorState) Select() map[*Syscall]bool {
 		nctors1 := nctors0 || len(info.ctors[1]) != 0
 		rs.selectCalls(info.ctors[0], 5, true)
 		rs.selectCalls(info.ctors[1], 3, !nctors0)
-		rs.selectCalls(info.ctors[0], 2, !nctors1)
+		rs.selectCalls(info.ctors[2], 2, !nctors1)
 		rs.selectCalls(info.uses[0], 20, true)
 		rs.selectCalls(info.uses[1], 2, len(info.uses[0]) == 0)
 	}
@@ -223,7 +220,7 @@ func (rs *rotatorState) addCall(call *Syscall) {
 		return
 	}
 	rs.calls[call] = true
-	for _, res := range rs.syscallUses[call] {
+	for _, res := range call.usesResources {
 		if rs.topHandled[res] || rs.depHandled[res] {
 			continue
 		}

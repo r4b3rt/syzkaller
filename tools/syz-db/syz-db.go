@@ -6,10 +6,10 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -20,13 +20,14 @@ import (
 	"github.com/google/syzkaller/pkg/tool"
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys"
+	"maps"
 )
 
 func main() {
 	var (
 		flagVersion = flag.Uint64("version", 0, "database version")
-		flagOS      = flag.String("os", "", "target OS")
-		flagArch    = flag.String("arch", "", "target arch")
+		flagOS      = flag.String("os", runtime.GOOS, "target OS")
+		flagArch    = flag.String("arch", runtime.GOARCH, "target arch")
 	)
 	flag.Parse()
 	args := flag.Args()
@@ -44,9 +45,6 @@ func main() {
 		bench(target, args[1])
 		return
 	}
-	if len(args) != 3 {
-		usage()
-	}
 	var target *prog.Target
 	if *flagOS != "" || *flagArch != "" {
 		var err error
@@ -57,30 +55,69 @@ func main() {
 	}
 	switch args[0] {
 	case "pack":
+		if len(args) != 3 {
+			usage()
+		}
 		pack(args[1], args[2], target, *flagVersion)
 	case "unpack":
+		if len(args) != 3 {
+			usage()
+		}
 		unpack(args[1], args[2])
+	case "merge":
+		if len(args) < 3 {
+			usage()
+		}
+		merge(args[1], args[2:], target)
+	case "print":
+		if len(args) != 2 {
+			usage()
+		}
+		print(args[1])
+	case "rm":
+		if len(args) != 3 {
+			usage()
+		}
+		rm(args[1], args[2], target)
 	default:
 		usage()
 	}
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "usage:\n")
-	fmt.Fprintf(os.Stderr, "  syz-db pack dir corpus.db\n")
-	fmt.Fprintf(os.Stderr, "  syz-db unpack corpus.db dir\n")
-	fmt.Fprintf(os.Stderr, "  syz-db bench corpus.db\n")
+	fmt.Fprintf(os.Stderr, `usage: syz-db can be used to manipulate corpus
+databases that are used by syz-managers. The following generic arguments are
+offered:
+  -arch string
+  -os string
+  -version uint
+  -vv int
+
+  they can be used for:
+  packing a database:
+    syz-db pack dir corpus.db
+  unpacking a database. A file containing performed syscalls will be returned:
+    syz-db unpack corpus.db dir
+  merging databases. No additional file will be created: The first file will be replaced by the merged result:
+    syz-db merge dst-corpus.db add-corpus.db* add-prog*
+  running a deserialization benchmark and printing corpus stats:
+    syz-db bench corpus.db
+  print corpus db:
+    syz-db print corpus.db
+  remove a syscall from db
+    syz-db rm corpus.db syscall_name
+`)
 	os.Exit(1)
 }
 
 func pack(dir, file string, target *prog.Target, version uint64) {
-	files, err := ioutil.ReadDir(dir)
+	files, err := os.ReadDir(dir)
 	if err != nil {
 		tool.Failf("failed to read dir: %v", err)
 	}
 	var records []db.Record
 	for _, file := range files {
-		data, err := ioutil.ReadFile(filepath.Join(dir, file.Name()))
+		data, err := os.ReadFile(filepath.Join(dir, file.Name()))
 		if err != nil {
 			tool.Failf("failed to read file %v: %v", file.Name(), err)
 		}
@@ -115,7 +152,7 @@ func pack(dir, file string, target *prog.Target, version uint64) {
 }
 
 func unpack(file, dir string) {
-	db, err := db.Open(file)
+	db, err := db.Open(file, false)
 	if err != nil {
 		tool.Failf("failed to open database: %v", err)
 	}
@@ -131,9 +168,22 @@ func unpack(file, dir string) {
 	}
 }
 
+func merge(file string, adds []string, target *prog.Target) {
+	failures, err := db.Merge(file, adds, target)
+	if err != nil {
+		tool.Failf("%s", err)
+	}
+	if len(failures) > 0 {
+		for _, fail := range failures {
+			fmt.Printf("failed to deserialize a record from %s: %s\n", fail.File, fail.Err)
+		}
+		tool.Failf("there have been deserialization errors")
+	}
+}
+
 func bench(target *prog.Target, file string) {
 	start := time.Now()
-	db, err := db.Open(file)
+	db, err := db.Open(file, false)
 	if err != nil {
 		tool.Failf("failed to open database: %v", err)
 	}
@@ -156,8 +206,57 @@ func bench(target *prog.Target, file string) {
 		stats.Alloc>>20,
 		(stats.Mallocs-stats.Frees)>>20,
 		time.Since(start))
-	sink = corpus
-	_ = sink
+	n := len(corpus)
+	fmt.Printf("corpus size: %v\n", n)
+	if n == 0 {
+		return
+	}
+	sum := 0
+	lens := make([]int, n)
+	for i, p := range corpus {
+		sum += len(p.Calls)
+		lens[i] = len(p.Calls)
+	}
+	slices.Sort(lens)
+	fmt.Printf("program size: min=%v avg=%v max=%v 10%%=%v 50%%=%v 90%%=%v\n",
+		lens[0], sum/n, lens[n-1], lens[n/10], lens[n/2], lens[n*9/10])
 }
 
-var sink interface{}
+func print(file string) {
+	db, err := db.Open(file, false)
+	if err != nil {
+		tool.Failf("failed to open database: %v", err)
+	}
+	keys := slices.Sorted(maps.Keys(db.Records))
+	for _, key := range keys {
+		rec := db.Records[key]
+		fmt.Printf("%v\n%v\n", key, string(rec.Val))
+	}
+}
+
+func rm(file, syscall string, target *prog.Target) {
+	db, err := db.Open(file, false)
+	if err != nil {
+		tool.Failf("failed to open database: %w", err)
+	}
+	for key, rec := range db.Records {
+		p, err := target.Deserialize(rec.Val, prog.NonStrict)
+		if err != nil {
+			tool.Failf("failed to deserialize: %w\n%s", err, rec.Val)
+		}
+		for i, v := range slices.Backward(p.Calls) {
+			if strings.Contains(v.Meta.Name, syscall) {
+				p.RemoveCall(i)
+			}
+		}
+		data := p.Serialize()
+		if len(data) > 0 {
+			db.Save(key, data, rec.Seq)
+		} else {
+			delete(db.Records, key)
+		}
+	}
+	if err := db.Flush(); err != nil {
+		tool.Fail(err)
+	}
+}

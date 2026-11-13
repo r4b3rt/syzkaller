@@ -13,13 +13,15 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"maps"
+	"math"
 	"os"
+	"slices"
 
 	"github.com/google/syzkaller/pkg/hash"
-	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
 )
@@ -28,9 +30,11 @@ type DB struct {
 	Version uint64            // arbitrary user version (0 for new database)
 	Records map[string]Record // in-memory cache, must not be modified directly
 
-	filename    string
-	uncompacted int           // number of records in the file
-	pending     *bytes.Buffer // pending writes to the file
+	readOnly      bool
+	filename      string
+	uncompacted   int           // number of records in the file
+	pending       *bytes.Buffer // pending writes to the file
+	dataDiscarded bool
 }
 
 type Record struct {
@@ -38,37 +42,65 @@ type Record struct {
 	Seq uint64
 }
 
-func Open(filename string) (*DB, error) {
+// Open opens the specified database file.
+// If the database is corrupted and reading failed, then it returns an non-nil db
+// with whatever records were recovered and a non-nil error at the same time.
+func Open(filename string, repair bool) (*DB, error) {
 	db := &DB{
 		filename: filename,
 	}
-	f, err := os.OpenFile(db.filename, os.O_RDONLY|os.O_CREATE, osutil.DefaultFilePerm)
-	if err != nil {
+	var deserializeErr error
+	db.Version, db.Records, db.uncompacted, deserializeErr = deserializeFile(db.filename)
+	if errors.Is(deserializeErr, os.ErrNotExist) {
+		db.Records = make(map[string]Record)
+		deserializeErr = nil
+	} else if deserializeErr != nil && !repair {
+		return nil, deserializeErr
+	}
+	if err := db.compact(); err != nil {
 		return nil, err
 	}
-	db.Version, db.Records, db.uncompacted = deserializeDB(bufio.NewReader(f))
-	f.Close()
-	if len(db.Records) == 0 || db.uncompacted/10*9 > len(db.Records) {
-		if err := db.compact(); err != nil {
-			return nil, err
-		}
+	return db, deserializeErr
+}
+
+// OpenReadOnly opens the specified database file for reading only.
+// Unlike Open, it does not compact or modify the database file on disk.
+func OpenReadOnly(filename string) (*DB, error) {
+	db := &DB{
+		filename: filename,
+		readOnly: true,
+	}
+	var err error
+	db.Version, db.Records, db.uncompacted, err = deserializeFile(db.filename)
+	if err != nil {
+		return nil, err
 	}
 	return db, nil
 }
 
 func (db *DB) Save(key string, val []byte, seq uint64) {
+	if db.readOnly {
+		panic("modifying read-only db")
+	}
 	if seq == seqDeleted {
 		panic("reserved seq")
 	}
-	if rec, ok := db.Records[key]; ok && seq == rec.Seq && bytes.Equal(val, rec.Val) {
+	// If data is discarded, we assume key identifies data (data hash).
+	if rec, ok := db.Records[key]; ok && seq == rec.Seq && (db.dataDiscarded || bytes.Equal(val, rec.Val)) {
 		return
 	}
-	db.Records[key] = Record{val, seq}
 	db.serialize(key, val, seq)
+	if db.dataDiscarded {
+		val = nil
+	}
+	db.Records[key] = Record{val, seq}
 	db.uncompacted++
 }
 
 func (db *DB) Delete(key string) {
+	if db.readOnly {
+		panic("modifying read-only db")
+	}
 	if _, ok := db.Records[key]; !ok {
 		return
 	}
@@ -77,9 +109,20 @@ func (db *DB) Delete(key string) {
 	db.uncompacted++
 }
 
+// DiscardData discards all record's values from memory.
+// This allows to save memory if values are not needed anymore,
+// but in exchange every compaction will need to re-read all data from disk.
+func (db *DB) DiscardData() {
+	db.dataDiscarded = true
+	for key, rec := range db.Records {
+		rec.Val = nil
+		db.Records[key] = rec
+	}
+}
+
 func (db *DB) Flush() error {
-	if db.uncompacted/10*9 > len(db.Records) {
-		return db.compact()
+	if db.readOnly {
+		panic("modifying read-only db")
 	}
 	if db.pending == nil {
 		return nil
@@ -93,21 +136,45 @@ func (db *DB) Flush() error {
 		return err
 	}
 	db.pending = nil
-	return nil
+	if db.uncompacted/10*9 < len(db.Records) {
+		return nil
+	}
+	return db.compact()
 }
 
 func (db *DB) BumpVersion(version uint64) error {
+	if db.readOnly {
+		panic("modifying read-only db")
+	}
+	if err := db.Flush(); err != nil {
+		return err
+	}
 	if db.Version == version {
-		return db.Flush()
+		return nil
 	}
 	db.Version = version
 	return db.compact()
 }
 
 func (db *DB) compact() error {
+	if db.pending != nil {
+		panic("compacting with pending records")
+	}
+	records := db.Records
+	if db.dataDiscarded {
+		var err error
+		_, records, _, err = deserializeFile(db.filename)
+		if err != nil {
+			return err
+		}
+	}
 	buf := new(bytes.Buffer)
 	serializeHeader(buf, db.Version)
-	for key, rec := range db.Records {
+	// Sort the keys to make the resulting file bytes deterministic. Otherwise,
+	// the file hash would change on every compaction, breaking e.g. the cache in
+	// aflow.
+	for _, key := range slices.Sorted(maps.Keys(records)) {
+		rec := records[key]
 		serializeRecord(buf, key, rec.Val, rec.Seq)
 	}
 	f, err := os.Create(db.filename + ".tmp")
@@ -122,8 +189,7 @@ func (db *DB) compact() error {
 	if err := osutil.Rename(f.Name(), db.filename); err != nil {
 		return err
 	}
-	db.uncompacted = len(db.Records)
-	db.pending = nil
+	db.uncompacted = len(records)
 	return nil
 }
 
@@ -139,6 +205,12 @@ const (
 	recMagic   = uint32(0xfee1bad)
 	curVersion = uint32(2)
 	seqDeleted = ^uint64(0)
+	// maxKeyLen guards against OOM when parsing a crafted corpus DB file.
+	// Real keys are SHA-256 hex strings (64 bytes); 64 KiB is a generous cap.
+	maxKeyLen = 64 << 10 // 65536
+	// maxValLen guards against decompression-bomb OOM in deserializeRecord.
+	// Corpus values are syscall-sequence programs; 16 MiB is a generous cap.
+	maxValLen = 16 << 20 // 16 MiB
 )
 
 func serializeHeader(w *bytes.Buffer, version uint64) {
@@ -176,11 +248,20 @@ func serializeRecord(w *bytes.Buffer, key string, val []byte, seq uint64) {
 	}
 }
 
-func deserializeDB(r *bufio.Reader) (version uint64, records map[string]Record, uncompacted int) {
+func deserializeFile(filename string) (version uint64, records map[string]Record, uncompacted int, err error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	defer f.Close()
+	return deserializeDB(bufio.NewReader(f))
+}
+
+func deserializeDB(r *bufio.Reader) (version uint64, records map[string]Record, uncompacted int, err0 error) {
 	records = make(map[string]Record)
 	ver, err := deserializeHeader(r)
 	if err != nil {
-		log.Logf(0, "failed to deserialize database header: %v", err)
+		err0 = fmt.Errorf("failed to deserialize database header: %w", err)
 		return
 	}
 	version = ver
@@ -190,7 +271,7 @@ func deserializeDB(r *bufio.Reader) (version uint64, records map[string]Record, 
 			return
 		}
 		if err != nil {
-			log.Logf(0, "failed to deserialize database record: %v", err)
+			err0 = fmt.Errorf("failed to deserialize database record: %w", err)
 			return
 		}
 		uncompacted++
@@ -241,6 +322,10 @@ func deserializeRecord(r *bufio.Reader) (key string, val []byte, seq uint64, err
 	if err = binary.Read(r, binary.LittleEndian, &keyLen); err != nil {
 		return
 	}
+	if keyLen > maxKeyLen {
+		err = fmt.Errorf("record key length %d exceeds maximum %d", keyLen, maxKeyLen)
+		return
+	}
 	keyBuf := make([]byte, keyLen)
 	if _, err = io.ReadFull(r, keyBuf); err != nil {
 		return
@@ -258,10 +343,17 @@ func deserializeRecord(r *bufio.Reader) (key string, val []byte, seq uint64, err
 	}
 	if valLen != 0 {
 		fr := flate.NewReader(&io.LimitedReader{R: r, N: int64(valLen)})
-		if val, err = ioutil.ReadAll(fr); err != nil {
+		// +1 so len(val) > maxValLen detects output that exactly equals the limit.
+		lr := &io.LimitedReader{R: fr, N: int64(maxValLen) + 1}
+		val, err = io.ReadAll(lr)
+		fr.Close()
+		if err != nil {
 			return
 		}
-		fr.Close()
+		if len(val) > maxValLen {
+			err = fmt.Errorf("decompressed record value exceeds maximum %d bytes", maxValLen)
+			return
+		}
 	}
 	return
 }
@@ -269,18 +361,18 @@ func deserializeRecord(r *bufio.Reader) (key string, val []byte, seq uint64, err
 // Create creates a new database in the specified file with the specified records.
 func Create(filename string, version uint64, records []Record) error {
 	os.Remove(filename)
-	db, err := Open(filename)
+	db, err := Open(filename, true)
 	if err != nil {
-		return fmt.Errorf("failed to open database file: %v", err)
+		return fmt.Errorf("failed to open database file: %w", err)
 	}
 	if err := db.BumpVersion(version); err != nil {
-		return fmt.Errorf("failed to bump database version: %v", err)
+		return fmt.Errorf("failed to bump database version: %w", err)
 	}
 	for _, rec := range records {
 		db.Save(hash.String(rec.Val), rec.Val, rec.Seq)
 	}
 	if err := db.Flush(); err != nil {
-		return fmt.Errorf("failed to save database file: %v", err)
+		return fmt.Errorf("failed to save database file: %w", err)
 	}
 	return nil
 }
@@ -289,16 +381,77 @@ func ReadCorpus(filename string, target *prog.Target) (progs []*prog.Prog, err e
 	if filename == "" {
 		return
 	}
-	db, err := Open(filename)
+	_, records, _, err := deserializeFile(filename)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database file: %v", err)
+		return nil, fmt.Errorf("failed to open database file: %w", err)
 	}
-	for _, rec := range db.Records {
-		p, err := target.Deserialize(rec.Val, prog.NonStrict)
+	recordKeys := slices.Sorted(maps.Keys(records))
+	for _, key := range recordKeys {
+		p, err := target.Deserialize(records[key].Val, prog.NonStrict)
 		if err != nil {
-			return nil, fmt.Errorf("failed to deserialize corpus program: %v", err)
+			return nil, fmt.Errorf("failed to deserialize corpus program: %w", err)
 		}
 		progs = append(progs, p)
 	}
 	return progs, nil
+}
+
+type DeserializeFailure struct {
+	File string
+	Err  error
+}
+
+// Merge merges the other DB files and/or raw program files into the DB file 'into'.
+// The resulting DB version is the minimum of the versions of all merged non-empty
+// DB files (including 'into'). The version denotes what processing was applied to
+// all programs in the DB (see pkg/manager.versionToFlags), so the merged DB can only
+// claim the weakest guarantee among its inputs. Empty DBs contribute no programs and
+// thus don't constrain the version. Raw program files were not processed at all,
+// so merging any of them resets the version to 0.
+func Merge(into string, other []string, target *prog.Target) ([]DeserializeFailure, error) {
+	dstDB, err := Open(into, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+	version := uint64(math.MaxUint64)
+	if len(dstDB.Records) > 0 {
+		version = dstDB.Version
+	}
+	var failed []DeserializeFailure
+	for _, add := range other {
+		addVersion, addRecords, _, err := deserializeFile(add)
+		if err == nil {
+			// It's a DB file.
+			if len(addRecords) > 0 {
+				version = min(version, addVersion)
+			}
+			for _, key := range slices.Sorted(maps.Keys(addRecords)) {
+				rec := addRecords[key]
+				dstDB.Save(key, rec.Val, rec.Seq)
+			}
+			continue
+		}
+		if target == nil {
+			// We were not given a target, so we cannot parse it as a seed file.
+			return nil, fmt.Errorf("failed to open db %v: %w", add, err)
+		}
+		data, err := os.ReadFile(add)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := target.Deserialize(data, prog.NonStrict); err != nil {
+			failed = append(failed, DeserializeFailure{add, err})
+		}
+		version = 0
+		dstDB.Save(hash.String(data), data, 0)
+	}
+	if version == math.MaxUint64 {
+		// No programs were merged, keep the destination as is.
+		if err := dstDB.Flush(); err != nil {
+			return nil, fmt.Errorf("failed to save db: %w", err)
+		}
+	} else if err := dstDB.BumpVersion(version); err != nil {
+		return nil, fmt.Errorf("failed to save db: %w", err)
+	}
+	return failed, nil
 }

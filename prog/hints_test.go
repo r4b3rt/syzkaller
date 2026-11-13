@@ -6,10 +6,15 @@ package prog
 import (
 	"encoding/hex"
 	"fmt"
+	"math"
 	"math/rand"
 	"reflect"
-	"sort"
+	"slices"
+	"strings"
 	"testing"
+
+	"github.com/google/syzkaller/pkg/image"
+	"github.com/stretchr/testify/assert"
 )
 
 type ConstArgTest struct {
@@ -46,16 +51,16 @@ func TestHintsCheckConstArg(t *testing.T) {
 			name:  "multiple-replacers-test",
 			in:    0xabcd,
 			size:  2,
-			comps: CompMap{0xabcd: compSet(0x2, 0x3)},
-			res:   []uint64{0x2, 0x3},
+			comps: CompMap{0xabcd: compSet(0x32, 0x33)},
+			res:   []uint64{0x32, 0x33},
 		},
 		// Checks that special ints are not used.
 		{
 			name:  "special-ints-test",
 			in:    0xabcd,
 			size:  2,
-			comps: CompMap{0xabcd: compSet(0x1, 0x2)},
-			res:   []uint64{0x2},
+			comps: CompMap{0xabcd: compSet(0x1, 0x2, 0x42)},
+			res:   []uint64{0x42},
 		},
 
 		// The following tests check the size limits for each replacer and for the initial value
@@ -121,7 +126,7 @@ func TestHintsCheckConstArg(t *testing.T) {
 				0xffffffffffffffab: compSet(0x12, 0xffffffffffffff0a),
 				0xfffffffffffff8ab: compSet(0x13, 0xffffffffffffff00),
 			},
-			res: []uint64{0x11, 0x13, 0x80a, 0x812, 0xf00},
+			res: []uint64{0x11, 0x13, 0x812, 0xf00},
 		},
 		{
 			name:    "int16-negative-invalid-value-bitsize-12",
@@ -161,8 +166,9 @@ func TestHintsCheckConstArg(t *testing.T) {
 			var res []uint64
 			typ := types[fmt.Sprintf("int%v_%v", test.size, test.bitsize)]
 			constArg := MakeConstArg(typ, DirIn, test.in)
-			checkConstArg(constArg, test.comps, func() {
+			checkConstArg(constArg, nil, test.comps, func() bool {
 				res = append(res, constArg.Val)
+				return true
 			})
 			if !reflect.DeepEqual(res, test.res) {
 				t.Fatalf("\ngot : %v\nwant: %v", res, test.res)
@@ -193,19 +199,19 @@ func TestHintsCheckDataArg(t *testing.T) {
 		// Checks that for every such operand a program is generated.
 		{
 			"multiple-replacers-test",
-			"\xcd\xab",
-			CompMap{0xabcd: compSet(0x2, 0x3)},
+			"\xcd\xab\x42\x42",
+			CompMap{0xabcd: compSet(0x44, 0x45)},
 			map[string]bool{
-				"\x02\x00": true, "\x03\x00": true,
+				"\x44\x00\x42\x42": true, "\x45\x00\x42\x42": true,
 			},
 		},
 		// Checks that special ints are not used.
 		{
 			"special-ints-test",
-			"\xcd\xab",
-			CompMap{0xabcd: compSet(0x1, 0x2)},
+			"\xcd\xab\x42\x42",
+			CompMap{0xabcd: compSet(0x1, 0x45)},
 			map[string]bool{
-				"\x02\x00": true,
+				"\x45\x00\x42\x42": true,
 			},
 		},
 		// Checks that ints of various sizes are extracted.
@@ -299,8 +305,9 @@ func TestHintsCheckDataArg(t *testing.T) {
 		t.Run(fmt.Sprintf("%v", test.name), func(t *testing.T) {
 			res := make(map[string]bool)
 			dataArg := MakeDataArg(typ, DirIn, []byte(test.in))
-			checkDataArg(dataArg, test.comps, func() {
+			checkDataArg(dataArg, test.comps, func() bool {
 				res[string(dataArg.Data())] = true
+				return true
 			})
 			if !reflect.DeepEqual(res, test.res) {
 				s := "\ngot:  ["
@@ -312,8 +319,113 @@ func TestHintsCheckDataArg(t *testing.T) {
 					s += fmt.Sprintf("0x%x, ", x)
 				}
 				s += "]\n"
-				t.Fatalf(s)
+				t.Fatal(s)
 			}
+		})
+	}
+}
+
+// Neutralization of a candidate may replace the argument's buffer (see DataArg.SetData).
+// That must not affect the remaining candidates.
+func TestHintsCheckDataArgNeutralized(t *testing.T) {
+	target := initTargetTest(t, "test", "64")
+	typ := target.SyscallMap["test$hint_data"].Args[0].Type.(*PtrType).Elem
+	dataArg := MakeDataArg(typ, DirIn, []byte("AAAAAAAAAA"))
+	comps := CompMap{0x4141414141414141: compSet(0x4242424242424242)}
+	var got []string
+	checkDataArg(dataArg, comps, func() bool {
+		got = append(got, string(dataArg.Data()))
+		dataArg.SetData([]byte("neutralized"))
+		return true
+	})
+	assert.Equal(t, []string{"BBBBBBBBAA", "ABBBBBBBBA", "AABBBBBBBB"}, got)
+	assert.Equal(t, "AAAAAAAAAA", string(dataArg.Data()))
+}
+
+func TestHintsCompressedImage(t *testing.T) {
+	target := initTargetTest(t, "test", "64")
+	type Test struct {
+		input  string
+		comps  CompMap
+		output []string
+	}
+	var tests = []Test{
+		{
+			"\x00\x11\x22\x33\x44\x55\x66\x77",
+			CompMap{
+				// 1/2-bytes must not be replaced.
+				0x00:   compSet(0xaa),
+				0x11:   compSet(0xaa),
+				0x1122: compSet(0xaabb),
+				0x4455: compSet(0xaabb),
+				// Aligned 4-byte values are replaced in both little/big endian.
+				0x00112233: compSet(0xaabbccdd),
+				0x33221100: compSet(0xaabbccdd),
+				0x44556677: compSet(0xaabbccdd),
+				0x77665544: compSet(0xaabbccdd),
+				// Same for 8-byte values.
+				0x0011223344556677: compSet(0xaabbccddeeff9988),
+				0x7766554433221100: compSet(0xaabbccddeeff9988),
+				// Unaligned 4-bytes are not replaced.
+				0x11223344: compSet(0xaabbccdd),
+				0x22334455: compSet(0xaabbccdd),
+			},
+			[]string{
+				// Mutants for 4-byte values.
+				"\xaa\xbb\xcc\xdd\x44\x55\x66\x77",
+				"\xdd\xcc\xbb\xaa\x44\x55\x66\x77",
+				"\x00\x11\x22\x33\xaa\xbb\xcc\xdd",
+				"\x00\x11\x22\x33\xdd\xcc\xbb\xaa",
+				// Mutants for 8-byte values.
+				"\xaa\xbb\xcc\xdd\xee\xff\x99\x88",
+				"\x88\x99\xff\xee\xdd\xcc\xbb\xaa",
+			},
+		},
+		{
+			"\x00\x11\x22\x33\x44\x55\x66\x77",
+			CompMap{
+				// Special values are used as replacers.
+				0x00112233: compSet(0, 0xffffffff),
+			},
+			[]string{
+				// Mutants for 4-byte values.
+				"\x00\x00\x00\x00\x44\x55\x66\x77",
+				"\xff\xff\xff\xff\x44\x55\x66\x77",
+			},
+		},
+		{
+			// All 0s and 0xff must not be replaced.
+			"\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00",
+			CompMap{
+				0:                  compSet(0xaabbccdd),
+				0xffffffffffffffff: compSet(0xaabbccddaabbccdd),
+			},
+			nil,
+		},
+	}
+	typ := target.SyscallMap["serialize3"].Args[0].Type.(*PtrType).Elem.(*BufferType)
+	if typ.Kind != BufferCompressed {
+		panic("wrong arg type")
+	}
+	for i, test := range tests {
+		t.Run(fmt.Sprintf("%v", i), func(t *testing.T) {
+			var res []string
+			arg := MakeDataArg(typ, DirIn, image.Compress([]byte(test.input)))
+			generateHints(test.comps, arg, nil, func() bool {
+				res = append(res, string(arg.Data()))
+				return true
+			})
+			for i, compressed := range res {
+				data, dtor := image.MustDecompress([]byte(compressed))
+				res[i] = string(data)
+				dtor()
+			}
+			slices.Sort(res)
+			slices.Sort(test.output)
+			assert.Equal(t, test.output, res, "got wrong mutants")
+			data, dtor := image.MustDecompress(arg.Data())
+			defer dtor()
+			assert.Equal(t, test.input, string(data), "argument got changed afterwards")
 		})
 	}
 }
@@ -470,10 +582,81 @@ func TestHintsShrinkExpand(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%v", test.name), func(t *testing.T) {
-			res := shrinkExpand(test.in, test.comps, 64)
+			res := shrinkExpand(test.in, test.comps, 64, false)
 			if !reflect.DeepEqual(res, test.res) {
 				t.Fatalf("\ngot : %v\nwant: %v", res, test.res)
 			}
+		})
+	}
+}
+
+func TestHintsCall(t *testing.T) {
+	target := initTargetTest(t, "test", "64")
+	type Test struct {
+		in    string
+		comps CompMap
+		out   []string
+	}
+	tests := []Test{
+		{
+			in:    `ioctl$1(0x0, 0x111, 0x0)`,
+			comps: CompMap{0x111: compSet(0x0, 0x111, 0x222, 0x333, 0x444, 0x666)},
+			out: []string{
+				`ioctl$1(0x0, 0x666, 0x0)`,
+			},
+		},
+		{
+			// For the generic syscall mutations should not be restricted by related calls.
+			// But we won't have 0x1000 and 0x10000 because they are special ints.
+			in: `socket$generic(0x1, 0x2, 0x3)`,
+			comps: CompMap{
+				0x1: compSet(0x111, 0x333),
+				0x2: compSet(0x1000, 0x1100, 0x1200),
+				0x3: compSet(0x10000, 0x10100, 0x10200),
+			},
+			out: []string{
+				`socket$generic(0x333, 0x2, 0x3)`,
+			},
+		},
+		{
+			in: `socket$inet6(0x111, 0x222, 0x333)`,
+			comps: CompMap{
+				0x111: compSet(0x211),
+				0x222: compSet(0x1100, 0x1200, 0x1300),
+				0x333: compSet(0x10000, 0x10100, 0x10200, 0x10300),
+			},
+			out: []string{
+				`socket$inet6(0x111, 0x222, 0x10100)`,
+				`socket$inet6(0x111, 0x222, 0x10200)`,
+				`socket$inet6(0x111, 0x222, 0x10300)`,
+			},
+		},
+		{
+			in: `socket$netlink(0x111, 0x222, 0x333)`,
+			comps: CompMap{
+				0x111: compSet(0x211),
+				0x222: compSet(0x1100, 0x1200, 0x1300),
+				0x333: compSet(0x10000, 0x10100, 0x10200, 0x10300),
+			},
+			out: []string{
+				`socket$netlink(0x111, 0x1100, 0x333)`,
+				`socket$netlink(0x111, 0x1200, 0x333)`,
+				`socket$netlink(0x111, 0x1300, 0x333)`,
+			},
+		},
+	}
+	for i, test := range tests {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			p, err := target.Deserialize([]byte(test.in), Strict)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			p.MutateWithHints(0, test.comps, func(newP *Prog) bool {
+				got = append(got, strings.TrimSpace(string(newP.Serialize())))
+				return true
+			})
+			assert.ElementsMatch(t, test.out, got)
 		})
 	}
 }
@@ -483,18 +666,31 @@ func TestHintsRandom(t *testing.T) {
 	ct := target.DefaultChoiceTable()
 	iters /= 10 // the test takes long
 	r := newRand(target, rs)
-	for i := 0; i < iters; i++ {
+	for i := range iters {
 		p := target.Generate(rs, 5, ct)
-		for i, c := range p.Calls {
+		// In the test mode, MutateWithHints is essentially quadratic over the number of arguments
+		// since we run full prog validation on each run.
+		// To avoid consuming too much time, let's just skip programs that are too big.
+		if p.countArgs() > maxArgCutoff {
+			t.Logf("iter %d: skipping program - too big", i)
+			continue
+		}
+		for j, c := range p.Calls {
 			vals := extractValues(c)
-			for j := 0; j < 5; j++ {
+			for range 5 {
 				vals[r.randInt64()] = true
+			}
+			// MutateWithHints is also quadratic over the number of values. Skip large calls.
+			const valsCutOff = 10000
+			if len(vals) > valsCutOff {
+				t.Logf("iter %d: skipping call %d - too big", i, j)
+				continue
 			}
 			comps := make(CompMap)
 			for v := range vals {
-				comps.AddComp(v, r.randInt64())
+				comps.Add(1, v, r.randInt64(), true)
 			}
-			p.MutateWithHints(i, comps, func(p1 *Prog) {})
+			p.MutateWithHints(j, comps, func(p1 *Prog) bool { return true })
 		}
 	}
 }
@@ -531,7 +727,7 @@ func extractValues(c *Call) map[uint64]bool {
 			}
 		}
 	})
-	delete(vals, 0) // replacing 0 can yield too many condidates
+	delete(vals, 0) // replacing 0 can yield too many candidates
 	return vals
 }
 
@@ -545,8 +741,8 @@ func TestHintsData(t *testing.T) {
 	tests := []Test{
 		{
 			in:    "0809101112131415",
-			comps: CompMap{0x12111009: compSet(0x10)},
-			out:   []string{"0810000000131415"},
+			comps: CompMap{0x12111009: compSet(0x42)},
+			out:   []string{"0842000000131415"},
 		},
 	}
 	for _, test := range tests {
@@ -555,17 +751,36 @@ func TestHintsData(t *testing.T) {
 			t.Fatal(err)
 		}
 		var got []string
-		p.MutateWithHints(0, test.comps, func(newP *Prog) {
+		p.MutateWithHints(0, test.comps, func(newP *Prog) bool {
 			got = append(got, hex.EncodeToString(
 				newP.Calls[0].Args[0].(*PointerArg).Res.(*DataArg).Data()))
+			return true
 		})
-		sort.Strings(test.out)
-		sort.Strings(got)
+		slices.Sort(test.out)
+		slices.Sort(got)
 		if !reflect.DeepEqual(got, test.out) {
 			t.Fatalf("comps: %v\ninput: %v\ngot : %+v\nwant: %+v",
 				test.comps, test.in, got, test.out)
 		}
 	}
+}
+
+func TestInplaceIntersect(t *testing.T) {
+	m1 := CompMap{
+		0xdead: compSet(0x1, 0x2),
+		0xbeef: compSet(0x3, 0x4),
+		0xffff: compSet(0x5),
+	}
+	m2 := CompMap{
+		0xdead: compSet(0x2),
+		0xbeef: compSet(0x3, 0x6),
+		0xeeee: compSet(0x6),
+	}
+	m1.InplaceIntersect(m2)
+	assert.Equal(t, CompMap{
+		0xdead: compSet(0x2),
+		0xbeef: compSet(0x3),
+	}, m1)
 }
 
 func BenchmarkHints(b *testing.B) {
@@ -578,27 +793,140 @@ func BenchmarkHints(b *testing.B) {
 	comps := make([]CompMap, len(p.Calls))
 	for i, c := range p.Calls {
 		vals := extractValues(c)
-		for j := 0; j < 5; j++ {
+		for range 5 {
 			vals[r.randInt64()] = true
 		}
 		comps[i] = make(CompMap)
 		for v := range vals {
-			comps[i].AddComp(v, r.randInt64())
+			comps[i].Add(1, v, r.randInt64(), true)
 		}
 	}
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			for i := range p.Calls {
-				p.MutateWithHints(i, comps[i], func(p1 *Prog) {})
+				p.MutateWithHints(i, comps[i], func(p1 *Prog) bool { return true })
 			}
 		}
 	})
 }
 
-func compSet(vals ...uint64) map[uint64]bool {
-	m := make(map[uint64]bool)
+func TestHintsLimiter(t *testing.T) {
+	var limiter HintsLimiter
+
+	// Base case.
+	comps := make(CompMap)
+	comps.Add(1000, 1000, 1100, true)
+	for i := range uint64(9) {
+		comps.Add(2000, 2000+i, 2100+i, true)
+	}
+	for i := range uint64(10) {
+		comps.Add(3000, 3000+i, 3100+i, true)
+	}
+	for i := range uint64(11) {
+		comps.Add(4000, 4000+i, 4100+i, true)
+	}
+	for i := range uint64(20) {
+		comps.Add(5000, 5000+i, 5100+i, true)
+	}
+	assert.Equal(t, perPCCount(comps), map[uint64]int{
+		1000: 1,
+		2000: 9,
+		3000: 10,
+		4000: 11,
+		5000: 20,
+	})
+	limiter.Limit(comps)
+	assert.Equal(t, perPCCount(comps), map[uint64]int{
+		1000: 1,
+		2000: 9,
+		3000: 10,
+		4000: 10,
+		5000: 10,
+	})
+
+	// Test that counts are accumulated in the limiter.
+	comps = make(CompMap)
+	for i := range uint64(3) {
+		comps.Add(1000, 1000+i, 1100+i, true)
+	}
+	for i := range uint64(3) {
+		comps.Add(2000, 2000+i, 2100+i, true)
+	}
+	for i := range uint64(3) {
+		comps.Add(3000, 3000+i, 3100+i, true)
+	}
+	assert.Equal(t, perPCCount(comps), map[uint64]int{
+		1000: 3,
+		2000: 3,
+		3000: 3,
+	})
+	limiter.Limit(comps)
+	assert.Equal(t, perPCCount(comps), map[uint64]int{
+		1000: 3,
+		2000: 1,
+	})
+}
+
+func TestIntTypeUselessHintsRange(t *testing.T) {
+	tests := []struct {
+		name              string
+		begin, end, align uint64
+		want              []uint64
+	}{
+		{
+			name:  "end at -1",
+			begin: math.MaxUint64 - 2,
+			end:   math.MaxUint64,
+			want:  []uint64{math.MaxUint64 - 2, math.MaxUint64 - 1, math.MaxUint64},
+		},
+		{
+			name:  "aligned, end at -1",
+			begin: math.MaxUint64 - 15,
+			end:   math.MaxUint64,
+			align: 8,
+			want:  []uint64{math.MaxUint64 - 15, math.MaxUint64 - 7},
+		},
+		{
+			name:  "aligned, last step wraps",
+			begin: math.MaxUint64 - 19,
+			end:   math.MaxUint64 - 2,
+			align: 8,
+			want:  []uint64{math.MaxUint64 - 19, math.MaxUint64 - 11, math.MaxUint64 - 3},
+		},
+		{
+			name:  "crossing zero",
+			begin: math.MaxUint64,
+			end:   1,
+			want:  []uint64{math.MaxUint64, 0, 1},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			typ := &IntType{RangeBegin: test.begin, RangeEnd: test.end, Align: test.align}
+			assert.Equal(t, test.want, typ.calcUselessHints()[len(specialInts):])
+		})
+	}
+}
+
+func perPCCount(comps CompMap) map[uint64]int {
+	res := make(map[uint64]int)
+	for _, ops2 := range comps {
+		for _, pcs := range ops2 {
+			for pc := range pcs {
+				res[pc]++
+			}
+		}
+	}
+	return res
+}
+
+func compSet(vals ...uint64) map[uint64]map[uint64]bool {
+	m := make(map[uint64]map[uint64]bool)
 	for _, v := range vals {
-		m[v] = true
+		if m[v] == nil {
+			m[v] = make(map[uint64]bool)
+		}
+		m[v][1] = true
 	}
 	return m
 }

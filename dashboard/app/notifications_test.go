@@ -4,11 +4,16 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
+	"github.com/google/syzkaller/pkg/email"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestEmailNotifUpstreamEmbargo(t *testing.T) {
@@ -33,10 +38,52 @@ func TestEmailNotifUpstreamEmbargo(t *testing.T) {
 	upstreamReport := c.pollEmailBug()
 	c.expectEQ(notifUpstream.Subject, crash.Title)
 	c.expectEQ(notifUpstream.Sender, report.Sender)
-	c.expectEQ(notifUpstream.Body, "Sending this report upstream.")
+	c.expectEQ(notifUpstream.Body, "Sending this report to the next reporting stage.")
 	c.expectEQ(upstreamReport.Subject, "[syzbot] "+crash.Title)
 	c.expectNE(upstreamReport.Sender, report.Sender)
 	c.expectEQ(upstreamReport.To, []string{"bugs@syzkaller.com", "default@maintainers.com"})
+}
+
+func TestEmailNotifUpstreamEmbargoFunc(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	build := testBuild(1)
+	crash1 := testCrash(build, 1)
+	crash2 := testCrash(build, 2)
+	c.transformContext = func(ctx context.Context) context.Context {
+		newConfig := replaceNamespaceConfig(ctx, "test2", func(cfg *Config) *Config {
+			ret := *cfg
+			ret.Reporting = slices.Clone(ret.Reporting)
+			ret.Reporting[0].Embargo = 0
+			ret.Reporting[0].EmbargoFunc = func(bug *Bug) time.Duration {
+				if bug.Title == crash2.Title {
+					return 0
+				}
+				return 21 * 24 * time.Hour
+			}
+			return &ret
+		})
+		return contextWithConfig(ctx, newConfig)
+	}
+
+	c.client2.UploadBuild(build)
+	c.client2.ReportCrash(crash1)
+	report1 := c.pollEmailBug()
+	c.client2.ReportCrash(crash2)
+	c.pollEmailBug()
+
+	// The 21-day embargo has not passed yet.
+	c.advanceTime(15 * 24 * time.Hour)
+	c.expectNoEmail()
+
+	// The first bug is upstreamed, the second one (zero embargo) is not.
+	c.advanceTime(7 * 24 * time.Hour)
+	notif := c.pollEmailBug()
+	c.expectEQ(notif.Sender, report1.Sender)
+	upstream := c.pollEmailBug()
+	c.expectEQ(upstream.Subject, "[syzbot] "+crash1.Title)
+	c.expectNoEmail()
 }
 
 func TestEmailNotifUpstreamSkip(t *testing.T) {
@@ -62,7 +109,7 @@ func TestEmailNotifUpstreamSkip(t *testing.T) {
 	notifUpstream := c.pollEmailBug()
 	upstreamReport := c.pollEmailBug()
 	c.expectEQ(notifUpstream.Sender, report.Sender)
-	c.expectEQ(notifUpstream.Body, "Sending this report upstream.")
+	c.expectEQ(notifUpstream.Body, "Sending this report to the next reporting stage.")
 	c.expectNE(upstreamReport.Sender, report.Sender)
 	c.expectEQ(upstreamReport.To, []string{"bugs@syzkaller.com", "default@maintainers.com"})
 }
@@ -71,13 +118,22 @@ func TestEmailNotifBadFix(t *testing.T) {
 	c := NewCtx(t)
 	defer c.Close()
 
+	client := c.publicClient
+
 	build := testBuild(1)
-	c.client2.UploadBuild(build)
+	client.UploadBuild(build)
+
+	// Fake more active managers.
+	for i := 1; i < 5; i++ {
+		client.UploadBuild(testBuild(i + 1))
+	}
 
 	crash := testCrash(build, 1)
-	c.client2.ReportCrash(crash)
+	client.ReportCrash(crash)
 	report := c.pollEmailBug()
 	c.expectEQ(report.To, []string{"test@syzkaller.com"})
+	_, extBugID, err := email.RemoveAddrContext(report.Sender)
+	c.expectOK(err)
 
 	c.incomingEmail(report.Sender, "#syz fix some: commit title")
 	c.expectNoEmail()
@@ -89,9 +145,42 @@ func TestEmailNotifBadFix(t *testing.T) {
 	c.expectNoEmail()
 	c.advanceTime(10 * 24 * time.Hour)
 	notif := c.pollEmailBug()
-	if !strings.Contains(notif.Body, "This bug is marked as fixed by commit:\nsome: commit title\n") {
-		t.Fatalf("bad notification text: %q", notif.Body)
-	}
+	t.Logf("%s", notif.Body)
+
+	expectReply := fmt.Sprintf(`This bug is marked as fixed by commit:
+some: commit title
+
+But I can't find it in the tested trees[1] for more than 90 days.
+Is it a correct commit? Please update it by replying:
+
+#syz fix: exact-commit-title
+
+Until then the bug is still considered open and new crashes with
+the same signature are ignored.
+
+Kernel: access-public-email
+Dashboard link: https://testapp.appspot.com/bug?extid=%s
+
+---
+[1] I expect the commit to be present in:
+
+1. branch1 branch of
+repo1
+
+2. branch2 branch of
+repo2
+
+3. branch3 branch of
+repo3
+
+4. branch4 branch of
+repo4
+
+The full list of 5 trees can be found at
+https://testapp.appspot.com/access-public-email/repos
+`, extBugID)
+
+	assert.Equal(t, expectReply, notif.Body, "wrong notification text")
 	// No notifications for another 14 days, then another one.
 	c.advanceTime(13 * 24 * time.Hour)
 	c.expectNoEmail()
@@ -107,8 +196,7 @@ func TestBugObsoleting(t *testing.T) {
 	const day = 24 * time.Hour
 	days := func(n int) time.Time {
 		t := time.Date(2000, 0, 0, 0, 0, 0, 0, time.UTC)
-		t.Add(time.Duration(n+1) * day)
-		return t
+		return t.Add(time.Duration(n+1) * day)
 	}
 	tests := []struct {
 		bug    *Bug
@@ -167,9 +255,10 @@ func TestBugObsoleting(t *testing.T) {
 			period: 80 * day,
 		},
 	}
+	c := context.Background()
 	for i, test := range tests {
 		test.bug.Namespace = "test1"
-		got := test.bug.obsoletePeriod()
+		got := test.bug.obsoletePeriod(c)
 		if got != test.period {
 			t.Errorf("test #%v: got: %.2f, want %.2f",
 				i, float64(got/time.Hour)/24, float64(test.period/time.Hour)/24)
@@ -208,16 +297,18 @@ func TestEmailNotifObsoleted(t *testing.T) {
 	if !strings.Contains(notif.Body, "Auto-closing this bug as obsolete") {
 		t.Fatalf("bad notification text: %q", notif.Body)
 	}
-	c.expectEQ(notif.To, []string{"bugs@syzkaller.com", "default@sender.com", "somebody@else.com"})
+	c.expectEQ(notif.To, []string{"bugs@syzkaller.com", "default@maintainers.com",
+		"default@sender.com", "somebody@else.com"})
 
 	// New crash must create new bug.
 	c.client2.ReportCrash(crash)
 	report = c.pollEmailBug()
 	c.expectEQ(report.Subject, "title1 (2)")
 	// Now the same, but for the last reporting (must have smaller CC list).
-	c.incomingEmail(report.Sender, "#syz upstream")
+	c.incomingEmail(report.Sender, "#syz upstream", EmailOptCC([]string{"test@syzkaller.com"}))
 	report = c.pollEmailBug()
-	c.incomingEmail(report.Sender, "#syz upstream")
+	c.incomingEmail(report.Sender, "#syz upstream",
+		EmailOptCC([]string{"bugs@syzkaller.com", "default@maintainers.com"}))
 	report = c.pollEmailBug()
 	_ = report
 
@@ -315,17 +406,17 @@ func TestExtNotifUpstreamEmbargo(t *testing.T) {
 
 	crash1 := testCrash(build1, 1)
 	c.client.ReportCrash(crash1)
-	rep := c.client.pollBug()
+	rep := c.globalClient.pollBug()
 
 	// Specify fixing commit for the bug.
-	reply, _ := c.client.ReportingUpdate(&dashapi.BugUpdate{
+	reply, _ := c.globalClient.ReportingUpdate(&dashapi.BugUpdate{
 		ID:     rep.ID,
 		Status: dashapi.BugStatusOpen,
 	})
 	c.expectEQ(reply.OK, true)
-	c.client.pollNotifs(0)
+	c.globalClient.pollNotifs(0)
 	c.advanceTime(20 * 24 * time.Hour)
-	notif := c.client.pollNotifs(1)[0]
+	notif := c.globalClient.pollNotifs(1)[0]
 	c.expectEQ(notif.ID, rep.ID)
 	c.expectEQ(notif.Type, dashapi.BugNotifUpstream)
 }
@@ -339,15 +430,15 @@ func TestExtNotifUpstreamOnHold(t *testing.T) {
 
 	crash1 := testCrash(build1, 1)
 	c.client.ReportCrash(crash1)
-	rep := c.client.pollBug()
+	rep := c.globalClient.pollBug()
 
 	// Specify fixing commit for the bug.
-	reply, _ := c.client.ReportingUpdate(&dashapi.BugUpdate{
+	reply, _ := c.globalClient.ReportingUpdate(&dashapi.BugUpdate{
 		ID:     rep.ID,
 		Status: dashapi.BugStatusOpen,
 		OnHold: true,
 	})
 	c.expectEQ(reply.OK, true)
 	c.advanceTime(20 * 24 * time.Hour)
-	c.client.pollNotifs(0)
+	c.globalClient.pollNotifs(0)
 }

@@ -5,6 +5,7 @@ package linux
 
 import (
 	"math/rand"
+	"strings"
 
 	"github.com/google/syzkaller/prog"
 )
@@ -38,11 +39,6 @@ func (arch *arch) generateSockaddrAlg(g *prog.Gen, typ0 prog.Type, dir prog.Dir,
 func (arch *arch) generateAlgName(g *prog.Gen, typ prog.Type, dir prog.Dir, old prog.Arg) (
 	arg prog.Arg, calls []*prog.Call) {
 	return generateAlgNameStruct(g, typ, dir, allTypes[g.Rand().Intn(len(allTypes))].typ)
-}
-
-func (arch *arch) generateAlgAeadName(g *prog.Gen, typ prog.Type, dir prog.Dir, old prog.Arg) (
-	arg prog.Arg, calls []*prog.Call) {
-	return generateAlgNameStruct(g, typ, dir, ALG_AEAD)
 }
 
 func (arch *arch) generateAlgHashName(g *prog.Gen, typ prog.Type, dir prog.Dir, old prog.Arg) (
@@ -79,18 +75,18 @@ func generateAlg(rnd *rand.Rand, typ int) string {
 }
 
 func generateAlgImpl(rnd *rand.Rand, alg algDesc) string {
-	args := ""
+	var args strings.Builder
 	if len(alg.args) != 0 {
-		args += "("
+		args.WriteString("(")
 		for i, a := range alg.args {
 			if i != 0 {
-				args += ","
+				args.WriteString(",")
 			}
-			args += generateAlg(rnd, a)
+			args.WriteString(generateAlg(rnd, a))
 		}
-		args += ")"
+		args.WriteString(")")
 	}
-	return alg.name + args
+	return alg.name + args.String()
 }
 
 func fixedSizeData(str string, sz uint64) []byte {
@@ -123,8 +119,10 @@ var allTypes = []algType{
 }
 
 // Algorithms can be extracted with something along the following lines:
-// cat /proc/crypto | grep -B 8 ": skcipher" | grep -B 7 "internal     : no" | egrep "name |driver " | \
-//	cut -b 16- | sort | uniq | awk '{printf("{\"%s\", nil},\n", $1)}'
+//
+//	cat /proc/crypto | grep -B 8 ": skcipher" | grep -B 7 "internal     : no" | grep -E "name |driver " | \
+//		cut -b 16- | sort | uniq | awk '{printf("{\"%s\", nil},\n", $1)}'
+//
 // Note: the kernel needs to include all crypto configs and CPU needs to support AVX/NEON/etc.
 var allAlgs = map[int][]algDesc{
 	ALG_AEAD: {

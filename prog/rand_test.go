@@ -5,14 +5,19 @@ package prog
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"math/rand"
-	"sort"
+	"slices"
 	"testing"
 )
 
 func TestNotEscaping(t *testing.T) {
-	r := newRand(nil, rand.NewSource(0))
+	target, err := GetTarget("test", "64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := newRand(target, rand.NewSource(0))
 	s := &state{
 		files: map[string]bool{"./file0": true},
 	}
@@ -20,7 +25,7 @@ func TestNotEscaping(t *testing.T) {
 	if testing.Short() {
 		bound = 1000
 	}
-	for i := 0; i < bound; i++ {
+	for range bound {
 		fn := r.filenameImpl(s)
 		if escapingFilename(fn) {
 			t.Errorf("sandbox escaping file name %q", fn)
@@ -33,12 +38,18 @@ func TestDeterminism(t *testing.T) {
 	iters /= 10 // takes too long
 	ct := target.DefaultChoiceTable()
 	var corpus []*Prog
-	for i := 0; i < iters; i++ {
+	for range iters {
 		seed := rs.Int63()
 		rs1 := rand.NewSource(seed)
 		p1 := generateProg(t, target, rs1, ct, corpus)
+		if p1 == nil {
+			continue
+		}
 		rs2 := rand.NewSource(seed)
 		p2 := generateProg(t, target, rs2, ct, corpus)
+		if p2 == nil {
+			continue
+		}
 		ps1 := string(p1.Serialize())
 		ps2 := string(p2.Serialize())
 		r1 := rs1.Int63()
@@ -52,19 +63,27 @@ func TestDeterminism(t *testing.T) {
 
 func generateProg(t *testing.T, target *Target, rs rand.Source, ct *ChoiceTable, corpus []*Prog) *Prog {
 	p := target.Generate(rs, 5, ct)
-	p.Mutate(rs, 10, ct, corpus)
+	p.Mutate(rs, 10, ct, nil, corpus)
+	if p.countArgs() > maxArgCutoff {
+		return nil
+	}
 	for i, c := range p.Calls {
 		comps := make(CompMap)
 		for v := range extractValues(c) {
-			comps.AddComp(v, v+1)
-			comps.AddComp(v, v+10)
+			comps.Add(1, v, v+1, true)
+			comps.Add(1, v, v+10, true)
 		}
-		p.MutateWithHints(i, comps, func(p1 *Prog) {
+		// If unbounded, this code may take O(N^2) time to complete.
+		// Since large programs are not uncommon, let's limit the number of hint iterations.
+		limit := 100
+		p.MutateWithHints(i, comps, func(p1 *Prog) bool {
 			p = p1.Clone()
+			limit--
+			return limit > 0
 		})
 	}
-	for _, crash := range []bool{false, true} {
-		p, _ = Minimize(p, -1, crash, func(*Prog, int) bool {
+	for _, mode := range []MinimizeMode{MinimizeCorpus, MinimizeCrash} {
+		p, _ = Minimize(p, -1, mode, func(*Prog, int) bool {
 			return rs.Int63()%10 == 0
 		})
 	}
@@ -83,7 +102,7 @@ func TestEnabledCalls(t *testing.T) {
 	enabledCalls := make(map[string]bool)
 	enabled := make(map[*Syscall]bool)
 	rnd := rand.New(rs)
-	for i := 0; i < len(target.Syscalls)/10; i++ {
+	for range len(target.Syscalls) / 10 {
 		c := target.Syscalls[rnd.Intn(len(target.Syscalls))]
 		enabled[c] = true
 		enabledCalls[c.Name] = true
@@ -94,14 +113,14 @@ func TestEnabledCalls(t *testing.T) {
 
 	ct := target.BuildChoiceTable(nil, enabled)
 	const tries = 10
-	for i := 0; i < tries; i++ {
+	for range tries {
 		p := target.Generate(rs, 50, ct)
-		for it := 0; it < iters/tries; it++ {
-			p.Mutate(rs, 50, ct, nil)
+		for range iters / tries {
+			p.Mutate(rs, 50, ct, nil, nil)
 		}
 		for _, c := range p.Calls {
 			if _, ok := enabledCalls[c.Meta.Name]; !ok {
-				t.Fatalf("program contains a syscall that is not enabled: %v\n", c.Meta.Name)
+				t.Fatalf("program contains a syscall that is not enabled: %v", c.Meta.Name)
 			}
 		}
 	}
@@ -110,13 +129,13 @@ func TestEnabledCalls(t *testing.T) {
 func TestSizeGenerateConstArg(t *testing.T) {
 	target, rs, iters := initRandomTargetTest(t, "test", "64")
 	r := newRand(target, rs)
-	ForeachType(target.Syscalls, func(typ Type, ctx TypeCtx) {
+	ForeachType(target.Syscalls, func(typ Type, ctx *TypeCtx) {
 		if _, ok := typ.(*IntType); !ok {
 			return
 		}
 		bits := typ.TypeBitSize()
 		limit := uint64(1<<bits - 1)
-		for i := 0; i < iters; i++ {
+		for range iters {
 			newArg, _ := typ.generate(r, nil, ctx.Dir)
 			newVal := newArg.(*ConstArg).Val
 			if newVal > limit {
@@ -149,8 +168,8 @@ func TestFlags(t *testing.T) {
 	r := newRand(target, rs)
 	for _, test := range tests {
 		results := make(map[uint64]uint64)
-		const throws = 1e4
-		for i := 0; i < throws; i++ {
+		const throws = 10000
+		for range throws {
 			var v uint64
 			for {
 				v = r.flags(test.vv, test.bitmask, test.old)
@@ -167,8 +186,8 @@ func TestFlags(t *testing.T) {
 		for v, c := range results {
 			sorted = append(sorted, [2]uint64{v, c})
 		}
-		sort.Slice(sorted, func(i, j int) bool {
-			return sorted[i][0] < sorted[j][0]
+		slices.SortFunc(sorted, func(a, b [2]uint64) int {
+			return cmp.Compare(a[0], b[0])
 		})
 		buf := new(bytes.Buffer)
 		for _, p := range sorted {
@@ -197,5 +216,36 @@ func TestTruncateToBitSize(t *testing.T) {
 				t.Fatalf("truncateToBitSize(0x%x, %v)=0x%x, want 0x%x", test.v, test.bits, res, test.res)
 			}
 		})
+	}
+}
+
+// Checks that a generated program does not contain any "no_generate" syscalls.
+func TestNoGenerate(t *testing.T) {
+	target, rs, iters := initTest(t)
+
+	// Enable all "no_generate" syscalls and ~10% of all others.
+	enabled := make(map[*Syscall]bool)
+	rnd := newRand(target, rs)
+	for range len(target.Syscalls) {
+		syscall := target.Syscalls[rnd.Intn(len(target.Syscalls))]
+		if syscall.Attrs.NoGenerate || rnd.oneOf(10) {
+			enabled[syscall] = true
+		}
+	}
+	c := target.SyscallMap["clock_gettime"]
+	enabled[c] = true
+	ct := target.BuildChoiceTable(nil, enabled)
+
+	const tries = 10
+	for range tries {
+		p := target.Generate(rs, 50, ct)
+		for range iters / tries {
+			p.Mutate(rs, 50, ct, nil, nil)
+		}
+		for _, c := range p.Calls {
+			if c.Meta.Attrs.NoGenerate {
+				t.Fatalf("program contains a no_generate syscall: %v", c.Meta.Name)
+			}
+		}
 	}
 }

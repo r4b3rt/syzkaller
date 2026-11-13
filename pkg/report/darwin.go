@@ -54,4 +54,5 @@ var darwinOopses = append([]*oops{
 		},
 		[]*regexp.Regexp{},
 	},
+	&groupGoRuntimeErrors,
 }, commonOopses...)

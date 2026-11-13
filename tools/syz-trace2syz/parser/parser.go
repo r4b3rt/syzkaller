@@ -2,8 +2,8 @@
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 //go:build !codeanalysis
-// +build !codeanalysis
 
+// Package parser parses execution traces into intermediate representations for trace conversion.
 package parser
 
 import (
@@ -28,7 +28,7 @@ func shouldSkip(line string) bool {
 		strings.Contains(line, "<ptrace(SYSCALL):No such process>")
 }
 
-// ParseLoop parses each line of a strace file in a loop.
+// ParseData parses each line of a strace file in a loop.
 func ParseData(data []byte) (*TraceTree, error) {
 	tree := NewTraceTree()
 	// Creating the process tree

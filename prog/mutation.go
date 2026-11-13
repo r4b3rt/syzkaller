@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"slices"
 	"sort"
+
+	"github.com/google/syzkaller/pkg/image"
 )
 
 // Maximum length of generated binary blobs inserted into the program.
@@ -16,38 +19,83 @@ const maxBlobLen = uint64(100 << 10)
 
 // Mutate program p.
 //
-// p:       The program to mutate.
-// rs:      Random source.
-// ncalls:  The allowed maximum calls in mutated program.
-// ct:      ChoiceTable for syscalls.
-// corpus:  The entire corpus, including original program p.
-func (p *Prog) Mutate(rs rand.Source, ncalls int, ct *ChoiceTable, corpus []*Prog) {
+// p:           The program to mutate.
+// rs:          Random source.
+// ncalls:      The allowed maximum calls in mutated program.
+// ct:          ChoiceTable for syscalls.
+// noMutate:    Set of IDs of syscalls which should not be mutated.
+// corpus:      The entire corpus, including original program p.
+func (p *Prog) Mutate(rs rand.Source, ncalls int, ct *ChoiceTable, noMutate map[int]bool, corpus []*Prog) {
+	p.MutateWithOpts(rs, ncalls, ct, noMutate, corpus, DefaultMutateOpts)
+}
+
+var DefaultMutateOpts = MutateOpts{
+	ExpectedIterations: 5,
+	MutateArgCount:     3,
+
+	SquashWeight:     50,
+	SpliceWeight:     200,
+	InsertWeight:     100,
+	MutateArgWeight:  100,
+	RemoveCallWeight: 10,
+}
+
+type MutateOpts struct {
+	ExpectedIterations int
+	MutateArgCount     int
+	SquashWeight       int
+	SpliceWeight       int
+	InsertWeight       int
+	MutateArgWeight    int
+	RemoveCallWeight   int
+}
+
+func (o MutateOpts) weight() int {
+	return o.SquashWeight + o.SpliceWeight + o.InsertWeight + o.MutateArgWeight + o.RemoveCallWeight
+}
+
+func (p *Prog) MutateWithOpts(rs rand.Source, ncalls int, ct *ChoiceTable, noMutate map[int]bool,
+	corpus []*Prog, opts MutateOpts) {
+	if p.isUnsafe {
+		panic("mutation of unsafe programs is not supposed to be done")
+	}
+	totalWeight := opts.weight()
 	r := newRand(p.Target, rs)
-	if ncalls < len(p.Calls) {
-		ncalls = len(p.Calls)
-	}
+	ncalls = max(ncalls, len(p.Calls))
 	ctx := &mutator{
-		p:      p,
-		r:      r,
-		ncalls: ncalls,
-		ct:     ct,
-		corpus: corpus,
+		p:        p,
+		r:        r,
+		ncalls:   ncalls,
+		ct:       ct,
+		noMutate: noMutate,
+		corpus:   corpus,
+		opts:     opts,
 	}
-	for stop, ok := false, false; !stop; stop = ok && len(p.Calls) != 0 && r.oneOf(3) {
-		switch {
-		case r.oneOf(5):
+	for stop, ok := false, false; !stop; stop = ok && len(p.Calls) != 0 && r.oneOf(opts.ExpectedIterations) {
+		val := r.Intn(totalWeight)
+		val -= opts.SquashWeight
+		if val < 0 {
 			// Not all calls have anything squashable,
 			// so this has lower priority in reality.
 			ok = ctx.squashAny()
-		case r.nOutOf(1, 100):
-			ok = ctx.splice()
-		case r.nOutOf(20, 31):
-			ok = ctx.insertCall()
-		case r.nOutOf(10, 11):
-			ok = ctx.mutateArg()
-		default:
-			ok = ctx.removeCall()
+			continue
 		}
+		val -= opts.SpliceWeight
+		if val < 0 {
+			ok = ctx.splice()
+			continue
+		}
+		val -= opts.InsertWeight
+		if val < 0 {
+			ok = ctx.insertCall()
+			continue
+		}
+		val -= opts.MutateArgWeight
+		if val < 0 {
+			ok = ctx.mutateArg()
+			continue
+		}
+		ok = ctx.removeCall()
 	}
 	p.sanitizeFix()
 	p.debugValidate()
@@ -59,11 +107,13 @@ func (p *Prog) Mutate(rs rand.Source, ncalls int, ct *ChoiceTable, corpus []*Pro
 // Internal state required for performing mutations -- currently this matches
 // the arguments passed to Mutate().
 type mutator struct {
-	p      *Prog        // The program to mutate.
-	r      *randGen     // The randGen instance.
-	ncalls int          // The allowed maximum calls in mutated program.
-	ct     *ChoiceTable // ChoiceTable for syscalls.
-	corpus []*Prog      // The entire corpus, including original program p.
+	p        *Prog        // The program to mutate.
+	r        *randGen     // The randGen instance.
+	ncalls   int          // The allowed maximum calls in mutated program.
+	ct       *ChoiceTable // ChoiceTable for syscalls.
+	noMutate map[int]bool // Set of IDs of syscalls which should not be mutated.
+	corpus   []*Prog      // The entire corpus, including original program p.
+	opts     MutateOpts
 }
 
 // This function selects a random other program p0 out of the corpus, and
@@ -74,8 +124,12 @@ func (ctx *mutator) splice() bool {
 	if len(ctx.corpus) == 0 || len(p.Calls) == 0 || len(p.Calls) >= ctx.ncalls {
 		return false
 	}
+	s := analyze(ctx.ct, ctx.corpus, p, nil)
 	p0 := ctx.corpus[r.Intn(len(ctx.corpus))]
 	p0c := p0.Clone()
+	for _, c := range p0c.Calls {
+		s.relocateCall(c)
+	}
 	idx := r.Intn(len(p.Calls))
 	p.Calls = append(p.Calls[:idx], append(p0c.Calls, p.Calls[idx:]...)...)
 	for i := len(p.Calls) - 1; i >= ctx.ncalls; i-- {
@@ -93,12 +147,18 @@ func (ctx *mutator) squashAny() bool {
 		return false
 	}
 	ptr := complexPtrs[r.Intn(len(complexPtrs))]
-	if !p.Target.isAnyPtr(ptr.Type()) {
-		p.Target.squashPtr(ptr)
+	if ctx.noMutate[ptr.call.Meta.ID] {
+		return false
+	}
+	if ptr.call.Meta.Attrs.NoSquash {
+		return false
+	}
+	if !p.Target.isAnyPtr(ptr.arg.Type()) {
+		p.Target.squashPtr(ptr.arg)
 	}
 	var blobs []*DataArg
 	var bases []*PointerArg
-	ForeachSubArg(ptr, func(arg Arg, ctx *ArgCtx) {
+	ForeachSubArg(ptr.arg, func(arg Arg, ctx *ArgCtx) {
 		if data, ok := arg.(*DataArg); ok && arg.Dir() != DirOut {
 			blobs = append(blobs, data)
 			bases = append(bases, ctx.Base)
@@ -107,6 +167,10 @@ func (ctx *mutator) squashAny() bool {
 	if len(blobs) == 0 {
 		return false
 	}
+	// Note: we need to call analyze before we mutate the blob.
+	// After mutation the blob can grow out of bounds of the data area
+	// and analyze will crash with out-of-bounds access while marking existing allocations.
+	s := analyze(ctx.ct, ctx.corpus, p, ptr.call)
 	// TODO(dvyukov): we probably want special mutation for ANY.
 	// E.g. merging adjacent ANYBLOBs (we don't create them,
 	// but they can appear in future); or replacing ANYRES
@@ -118,7 +182,6 @@ func (ctx *mutator) squashAny() bool {
 	arg.data = mutateData(r, arg.Data(), 0, maxBlobLen)
 	// Update base pointer if size has increased.
 	if baseSize < base.Res.Size() {
-		s := analyze(ctx.ct, ctx.corpus, p, p.Calls[0])
 		newArg := r.allocAddr(s, base.Type(), base.Dir(), base.Res.Size(), base.Res)
 		*base = *newArg
 	}
@@ -169,10 +232,20 @@ func (ctx *mutator) mutateArg() bool {
 		return false
 	}
 	c := p.Calls[idx]
+	if c.Meta.Attrs.KFuzzTest {
+		tmp := r.genKFuzzTest
+		r.genKFuzzTest = true
+		defer func() {
+			r.genKFuzzTest = tmp
+		}()
+	}
+	if ctx.noMutate[c.Meta.ID] {
+		return false
+	}
 	updateSizes := true
-	for stop, ok := false, false; !stop; stop = ok && r.oneOf(3) {
+	for stop, ok := false, false; !stop; stop = ok && r.oneOf(ctx.opts.MutateArgCount) {
 		ok = true
-		ma := &mutationArgs{target: p.Target}
+		ma := &mutationArgs{target: p.Target, ignoreLengths: c.Meta.Attrs.KFuzzTest}
 		ForeachArg(c, ma.collectArg)
 		if len(ma.args) == 0 {
 			return false
@@ -184,6 +257,8 @@ func (ctx *mutator) mutateArg() bool {
 			ok = false
 			continue
 		}
+		moreCalls, fieldsPatched := r.patchConditionalFields(c, s)
+		calls = append(calls, moreCalls...)
 		p.insertBefore(c, calls)
 		idx += len(calls)
 		for len(p.Calls) > ctx.ncalls {
@@ -194,7 +269,7 @@ func (ctx *mutator) mutateArg() bool {
 			panic(fmt.Sprintf("wrong call index: idx=%v calls=%v p.Calls=%v ncalls=%v",
 				idx, len(calls), len(p.Calls), ctx.ncalls))
 		}
-		if updateSizes {
+		if updateSizes || fieldsPatched {
 			p.Target.assignSizesCall(c)
 		}
 	}
@@ -208,7 +283,7 @@ func chooseCall(p *Prog, r *randGen) int {
 	for _, c := range p.Calls {
 		var totalPrio float64
 		ForeachArg(c, func(arg Arg, ctx *ArgCtx) {
-			prio, stopRecursion := arg.Type().getMutationPrio(p.Target, arg, false)
+			prio, stopRecursion := arg.Type().getMutationPrio(p.Target, arg, false, c.Meta.Attrs.KFuzzTest)
 			totalPrio += prio
 			ctx.Stop = stopRecursion
 		})
@@ -330,12 +405,16 @@ func (t *BufferType) mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) (calls []
 	}
 	a := arg.(*DataArg)
 	if a.Dir() == DirOut {
-		mutateBufferSize(r, a, minLen, maxLen)
+		if t.Kind == BufferFilename && r.oneOf(100) {
+			a.size = uint64(r.randFilenameLength())
+		} else {
+			mutateBufferSize(r, a, minLen, maxLen)
+		}
 		return
 	}
 	switch t.Kind {
 	case BufferBlobRand, BufferBlobRange:
-		data := append([]byte{}, a.Data()...)
+		data := slices.Clone(a.Data())
 		a.data = mutateData(r, data, minLen, maxLen)
 	case BufferString:
 		if len(t.Values) != 0 {
@@ -344,7 +423,7 @@ func (t *BufferType) mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) (calls []
 			if t.TypeSize != 0 {
 				minLen, maxLen = t.TypeSize, t.TypeSize
 			}
-			data := append([]byte{}, a.Data()...)
+			data := slices.Clone(a.Data())
 			a.data = mutateData(r, data, minLen, maxLen)
 		}
 	case BufferFilename:
@@ -356,29 +435,52 @@ func (t *BufferType) mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) (calls []
 			a.data = []byte(r.filename(s, t))
 		}
 	case BufferText:
-		data := append([]byte{}, a.Data()...)
+		data := slices.Clone(a.Data())
 		a.data = r.mutateText(t.Text, data)
+	case BufferCompressed:
+		a.data, retry = r.mutateImage(a.Data())
 	default:
 		panic("unknown buffer kind")
 	}
 	return
 }
 
+func (r *randGen) mutateImage(compressed []byte) (data []byte, retry bool) {
+	data, dtor := image.MustDecompress(compressed)
+	defer dtor()
+	if len(data) == 0 {
+		return compressed, true // Do not mutate empty data.
+	}
+	hm := MakeGenericHeatmap(data, r.Rand)
+	for i := hm.NumMutations(); i > 0; i-- {
+		index := hm.ChooseLocation()
+		width := 1 << uint(r.Intn(4))
+		if index+width > len(data) {
+			width = 1
+		}
+		storeInt(data[index:], r.randInt(uint64(width*8)), width)
+	}
+	return image.Compress(data), false
+}
+
 func mutateBufferSize(r *randGen, arg *DataArg, minLen, maxLen uint64) {
 	for oldSize := arg.Size(); oldSize == arg.Size(); {
 		arg.size += uint64(r.Intn(33)) - 16
-		if arg.size < minLen {
-			arg.size = minLen
-		}
-		if arg.size > maxLen {
-			arg.size = maxLen
-		}
+		// Cast to int64 to prevent underflows.
+		arg.size = uint64(max(int64(arg.size), int64(minLen)))
+		arg.size = min(arg.size, maxLen)
 	}
 }
 
 func (t *ArrayType) mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) (calls []*Call, retry, preserve bool) {
-	// TODO: swap elements of the array
 	a := arg.(*GroupArg)
+	if len(a.Inner) > 1 && r.oneOf(5) {
+		// Swap array elements.
+		for r.nOutOf(2, 3) {
+			i, j := r.Intn(len(a.Inner)), r.Intn(len(a.Inner))
+			a.Inner[i], a.Inner[j] = a.Inner[j], a.Inner[i]
+		}
+	}
 	count := uint64(0)
 	switch t.Kind {
 	case ArrayRandLen:
@@ -419,7 +521,10 @@ func (t *ArrayType) mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) (calls []*
 
 func (t *PtrType) mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) (calls []*Call, retry, preserve bool) {
 	a := arg.(*PointerArg)
-	if r.oneOf(1000) {
+	// Do not generate special pointers for KFuzzTest calls, as they are
+	// difficult to identify in the kernel and can lead to false positive
+	// crash reports.
+	if r.oneOf(1000) && !r.genKFuzzTest {
 		removeArg(a.Res)
 		index := r.rand(len(r.target.SpecialPointers))
 		newArg := MakeSpecialPointerArg(t, a.Dir(), index)
@@ -458,7 +563,6 @@ func (t *UnionType) mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) (calls []*
 		index++
 	}
 	optType, optDir := t.Fields[index].Type, t.Fields[index].Dir(a.Dir())
-	removeArg(a.Option)
 	var newOpt Arg
 	newOpt, calls = r.generateArg(s, optType, optDir)
 	replaceArg(arg, MakeUnionArg(t, a.Dir(), newOpt, index))
@@ -476,6 +580,7 @@ func (t *ConstType) mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) (calls []*
 type mutationArgs struct {
 	target        *Target
 	ignoreSpecial bool
+	ignoreLengths bool
 	prioSum       float64
 	args          []mutationArg
 	argsBuffer    [16]mutationArg
@@ -498,7 +603,7 @@ func (ma *mutationArgs) collectArg(arg Arg, ctx *ArgCtx) {
 	ma.ignoreSpecial = false
 
 	typ := arg.Type()
-	prio, stopRecursion := typ.getMutationPrio(ma.target, arg, ignoreSpecial)
+	prio, stopRecursion := typ.getMutationPrio(ma.target, arg, ignoreSpecial, ma.ignoreLengths)
 	ctx.Stop = stopRecursion
 
 	if prio == dontMutate {
@@ -528,7 +633,8 @@ func (ma *mutationArgs) chooseArg(r *rand.Rand) (Arg, ArgCtx) {
 // TODO: find a way to estimate optimal priority values.
 // Assign a priority for each type. The boolean is the reference type and it has
 // the minimum priority, since it has only two possible values.
-func (t *IntType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) {
+func (t *IntType) getMutationPrio(target *Target, arg Arg,
+	ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool) {
 	// For a integer without a range of values, the priority is based on
 	// the number of bits occupied by the underlying type.
 	plainPrio := math.Log2(float64(t.TypeBitSize())) + 0.1*maxPriority
@@ -561,14 +667,16 @@ func (t *IntType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (
 	return prio, false
 }
 
-func (t *StructType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) {
+func (t *StructType) getMutationPrio(target *Target, arg Arg,
+	ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool) {
 	if target.SpecialTypes[t.Name()] == nil || ignoreSpecial {
 		return dontMutate, false
 	}
 	return maxPriority, true
 }
 
-func (t *UnionType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) {
+func (t *UnionType) getMutationPrio(target *Target, arg Arg,
+	ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool) {
 	if target.SpecialTypes[t.Name()] == nil && len(t.Fields) == 1 || ignoreSpecial {
 		return dontMutate, false
 	}
@@ -580,7 +688,8 @@ func (t *UnionType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool)
 	return maxPriority, true
 }
 
-func (t *FlagsType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) {
+func (t *FlagsType) getMutationPrio(target *Target, arg Arg,
+	ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool) {
 	prio = rangeSizePrio(uint64(len(t.Vals)))
 	if t.BitMask {
 		// We want a higher priority because the mutation will include
@@ -605,7 +714,8 @@ func rangeSizePrio(size uint64) (prio float64) {
 	return prio
 }
 
-func (t *PtrType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) {
+func (t *PtrType) getMutationPrio(target *Target, arg Arg,
+	ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool) {
 	if arg.(*PointerArg).IsSpecial() {
 		// TODO: we ought to mutate this, but we don't have code for this yet.
 		return dontMutate, false
@@ -613,32 +723,42 @@ func (t *PtrType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (
 	return 0.3 * maxPriority, false
 }
 
-func (t *ConstType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) {
+func (t *ConstType) getMutationPrio(target *Target, arg Arg,
+	ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool) {
 	return dontMutate, false
 }
 
-func (t *CsumType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) {
+func (t *CsumType) getMutationPrio(target *Target, arg Arg,
+	ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool) {
 	return dontMutate, false
 }
 
-func (t *ProcType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) {
+func (t *ProcType) getMutationPrio(target *Target, arg Arg,
+	ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool) {
 	return 0.5 * maxPriority, false
 }
 
-func (t *ResourceType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) {
+func (t *ResourceType) getMutationPrio(target *Target, arg Arg,
+	ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool) {
 	return 0.5 * maxPriority, false
 }
 
-func (t *VmaType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) {
+func (t *VmaType) getMutationPrio(target *Target, arg Arg,
+	ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool) {
 	return 0.5 * maxPriority, false
 }
 
-func (t *LenType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) {
+func (t *LenType) getMutationPrio(target *Target, arg Arg,
+	ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool) {
 	// Mutating LenType only produces "incorrect" results according to descriptions.
+	if ignoreLengths {
+		return dontMutate, false
+	}
 	return 0.1 * maxPriority, false
 }
 
-func (t *BufferType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) {
+func (t *BufferType) getMutationPrio(target *Target, arg Arg,
+	ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool) {
 	if arg.Dir() == DirOut && !t.Varlen() {
 		return dontMutate, false
 	}
@@ -646,10 +766,15 @@ func (t *BufferType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool
 		// These are effectively consts (and frequently file names).
 		return dontMutate, false
 	}
+	if t.Kind == BufferCompressed {
+		// Prioritise mutation of compressed buffers, e.g. disk images (`compressed_image`).
+		return maxPriority, false
+	}
 	return 0.8 * maxPriority, false
 }
 
-func (t *ArrayType) getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) {
+func (t *ArrayType) getMutationPrio(target *Target, arg Arg,
+	ignoreSpecial, ignoreLengths bool) (prio float64, stopRecursion bool) {
 	if t.Kind == ArrayRangeLen && t.RangeBegin == t.RangeEnd {
 		return dontMutate, false
 	}
@@ -684,16 +809,13 @@ var mutateDataFuncs = [...]func(r *randGen, data []byte, minLen, maxLen uint64) 
 		if len(data) == 0 || uint64(len(data)) >= maxLen {
 			return data, false
 		}
-		n := r.Intn(16) + 1
-		if r := int(maxLen) - len(data); n > r {
-			n = r
-		}
+		n := min(r.Intn(16)+1, int(maxLen)-len(data))
 		pos := r.Intn(len(data))
-		for i := 0; i < n; i++ {
+		for range n {
 			data = append(data, 0)
 		}
 		copy(data[pos+n:], data[pos:])
-		for i := 0; i < n; i++ {
+		for i := range n {
 			data[pos+i] = byte(r.Int31())
 		}
 		if uint64(len(data)) > maxLen || r.bin() {
@@ -706,10 +828,7 @@ var mutateDataFuncs = [...]func(r *randGen, data []byte, minLen, maxLen uint64) 
 		if len(data) == 0 {
 			return data, false
 		}
-		n := r.Intn(16) + 1
-		if n > len(data) {
-			n = len(data)
-		}
+		n := min(r.Intn(16)+1, len(data))
 		pos := 0
 		if n < len(data) {
 			pos = r.Intn(len(data) - n)
@@ -717,7 +836,7 @@ var mutateDataFuncs = [...]func(r *randGen, data []byte, minLen, maxLen uint64) 
 		copy(data[pos:], data[pos+n:])
 		data = data[:len(data)-n]
 		if uint64(len(data)) < minLen || r.bin() {
-			for i := 0; i < n; i++ {
+			for range n {
 				data = append(data, 0) // preserve original length
 			}
 		}
@@ -729,11 +848,8 @@ var mutateDataFuncs = [...]func(r *randGen, data []byte, minLen, maxLen uint64) 
 			return data, false
 		}
 		const max = 256
-		n := max - r.biasedRand(max, 10)
-		if r := int(maxLen) - len(data); n > r {
-			n = r
-		}
-		for i := 0; i < n; i++ {
+		n := min(max-r.biasedRand(max, 10), int(maxLen)-len(data))
+		for range n {
 			data = append(data, byte(r.rand(256)))
 		}
 		return data, true

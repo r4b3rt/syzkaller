@@ -70,18 +70,21 @@ fscrypt_key_descriptor_hex [
 # regular Linux keyrings via the add_key() syscall.  Note that this part of the
 # API is deprecated in favor of FS_IOC_ADD_ENCRYPTION_KEY and fscrypt_policy_v2.
 
+fscrypt_v1_key_prefixes = "fscrypt:", "ext4:", "f2fs:", "ubifs:"
+fscrypt_v1_key_sizes = 0, 16, 32, 64
+
 fscrypt_v1_key_description {
-	prefix		stringnoz["fscrypt:"]
+	prefix		stringnoz[fscrypt_v1_key_prefixes]
 	descriptor	fscrypt_key_descriptor_hex
 	nil		const[0, int8]
-}
+} [packed]
 
 fscrypt_v1_key_payload {
 	mode	const[0, int32]
 # This really should be fscrypt_raw_key, but that has the varlen attribute so it
 # doesn't work in this struct.
 	raw	array[int8, 64]
-	size	int32[16:64]
+	size	flags[fscrypt_v1_key_sizes, int32]
 }
 
 # Structs for the ioctls that get and set encryption policies
@@ -151,7 +154,7 @@ fscrypt_key_specifier__by_identifier {
 # 'fscrypt_add_key_arg::key_spec.identifier' is an output field.  The version of
 # fscrypt_key_specifier below has per-field directions set to represent this.
 fscrypt_key_specifier__for_add_key [
-	desc	fscrypt_key_specifier__by_descriptor	(in)
+	desc	fscrypt_key_specifier__by_descriptor
 	id	fscrypt_key_specifier__by_identifier_for_add_key
 ]
 
@@ -180,7 +183,7 @@ fscrypt_add_key_arg {
 
 fscrypt_remove_key_arg {
 	key_spec		fscrypt_key_specifier	(in)
-	removal_status_flags	const[0, int32]	(out)
+	removal_status_flags	int32	(out)
 	reserved		array[const[0, int32], 5]	(in)
 }
 
@@ -188,8 +191,8 @@ fscrypt_get_key_status_arg {
 	key_spec	fscrypt_key_specifier	(in)
 	reserved	array[const[0, int32], 6]	(in)
 
-	status		const[0, int32]	(out)
-	status_flags	const[0, int32]	(out)
-	user_count	const[0, int32]	(out)
+	status		int32	(out)
+	status_flags	int32	(out)
+	user_count	int32	(out)
 	out_reserved	array[const[0, int32], 13]	(out)
 }

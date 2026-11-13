@@ -25,7 +25,7 @@
 # The image then needs to be compressed with:
 #   tar -Sczf disk.tar.gz disk.raw
 # and uploaded to GCS with:
-#   gsutil cp disk.tar.gz gs://my-images/image.tar.gz
+#   gcloud storage cp disk.tar.gz gs://my-images/image.tar.gz
 # finally, my-images/image.tar.gz can be used to create a new GCE image.
 #
 # The image can be tested locally with e.g.:
@@ -99,7 +99,7 @@ case "$IMG_ARCH" in
 		;;
 	ppc64le)
 		# Create a small PowerPC PReP boot partition, and a Linux partition for the rest
-		echo -en "g\nn\n1\n2048\n16383\nt\n7\nn\n2\n\n\nw\n" | sudo fdisk $DISKDEV
+		echo -en "o\nn\np\n1\n2048\n16383\na\nt\n41\nn\np\n2\n\n\nw\n" | sudo fdisk $DISKDEV
 		PARTDEV=$DISKDEV"p2"
 		;;
 esac
@@ -139,7 +139,7 @@ if [ "$SYZ_SYSCTL_FILE" != "" ]; then
 fi
 
 echo -en "127.0.0.1\tlocalhost\n" | sudo tee disk.mnt/etc/hosts
-echo "nameserver 8.8.8.8" | sudo tee -a disk.mnt/etc/resolve.conf
+echo "nameserver 8.8.8.8" | sudo tee -a disk.mnt/etc/resolv.conf
 echo "syzkaller" | sudo tee disk.mnt/etc/hostname
 sudo mkdir -p disk.mnt/boot/grub
 
@@ -149,6 +149,7 @@ PermitRootLogin yes
 PasswordAuthentication yes
 PermitEmptyPasswords yes
 ClientAliveInterval 420
+Subsystem sftp /usr/lib/openssh/sftp-server
 EOF
 # Reset root password.
 sudo sed -i "s#^root:\*:#root::#g" disk.mnt/etc/shadow
@@ -192,10 +193,10 @@ set timeout=0
 # debug is not set as it produces too much output
 menuentry 'linux' --class gnu-linux --class gnu --class os {
 	insmod gzio
-	insmod part_gpt
+	insmod part_msdos
 	insmod ext2
-	set root='(ieee1275/disk,gpt2)'
-	linux /vmlinuz root=/dev/sda2 console=ttyS0 earlyprintk=serial oops=panic panic_on_warn=1 nmi_watchdog=panic panic=86400 net.ifnames=0 $CMDLINE
+	search -f --set /vmlinuz
+	linux /vmlinuz root=/dev/sda2 rootwait console=ttyS0 earlyprintk=serial oops=panic panic_on_warn=1 nmi_watchdog=panic panic=60 net.ifnames=0 $CMDLINE
 }
 EOF
 	sudo grub-install --target=powerpc-ieee1275 --boot-directory=disk.mnt/boot $DISKDEV"p1"

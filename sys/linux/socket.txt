@@ -19,7 +19,7 @@ type sock_port int16be[20000:20004]
 
 # TODO: describe socketcall syscall
 
-socket(domain flags[socket_domain], type flags[socket_type], proto int32) sock
+socket(domain flags[socket_domain], type flags[socket_type], proto int32) sock (automatic_helper)
 socketpair(domain flags[socket_domain], type flags[socket_type], proto int32, fds ptr[out, sock_pair])
 bind(fd sock, addr ptr[in, sockaddr_storage], addrlen len[addr])
 connect(fd sock, addr ptr[in, sockaddr_storage], addrlen len[addr])
@@ -41,13 +41,13 @@ shutdown(fd sock, how flags[shutdown_flags])
 getsockopt(fd sock, level int32, optname int32, optval buffer[out], optlen ptr[inout, len[optval, int32]])
 setsockopt(fd sock, level int32, optname int32, optval buffer[in], optlen len[optval])
 
-socket_domain = AF_UNIX, AF_INET, AF_INET6, AF_IPX, AF_NETLINK, AF_X25, AF_AX25, AF_ATMPVC, AF_APPLETALK, AF_PACKET, AF_VSOCK, AF_XDP, AF_TIPC, AF_RXRPC, AF_PPPOX, AF_RDS, AF_ROSE, AF_PHONET, AF_NFC, AF_NETROM, AF_KEY, AF_KCM, AF_ISDN, AF_SMC, AF_CAN, AF_CAIF, AF_BLUETOOTH, AF_LLC, AF_ALG, AF_QIPCRTR
+socket_domain = AF_UNIX, AF_INET, AF_INET6, AF_NETLINK, AF_X25, AF_AX25, AF_ATMPVC, AF_APPLETALK, AF_PACKET, AF_VSOCK, AF_XDP, AF_TIPC, AF_RXRPC, AF_PPPOX, AF_RDS, AF_ROSE, AF_PHONET, AF_NFC, AF_NETROM, AF_KEY, AF_KCM, AF_ISDN, AF_SMC, AF_CAN, AF_CAIF, AF_BLUETOOTH, AF_LLC, AF_ALG, AF_QIPCRTR
 socket_type = SOCK_STREAM, SOCK_DGRAM, SOCK_RAW, SOCK_RDM, SOCK_SEQPACKET, SOCK_DCCP, SOCK_PACKET, SOCK_NONBLOCK, SOCK_CLOEXEC
 accept_flags = SOCK_NONBLOCK, SOCK_CLOEXEC
 shutdown_flags = SHUT_RD, SHUT_WR
 send_flags = MSG_CONFIRM, MSG_DONTROUTE, MSG_DONTWAIT, MSG_EOR, MSG_MORE, MSG_NOSIGNAL, MSG_OOB, MSG_PROBE, MSG_BATCH, MSG_FASTOPEN, MSG_ZEROCOPY
 recv_flags = MSG_CMSG_CLOEXEC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, MSG_WAITFORONE
-cmsg_levels = SOL_SOCKET, IPPROTO_ICMP, SOL_IP, SOL_TCP, SOL_UDP, SOL_IPV6, SOL_ICMPV6, SOL_SCTP, SOL_UDPLITE, SOL_RAW, SOL_IPX, SOL_AX25, SOL_ATALK, SOL_NETROM, SOL_ROSE, SOL_DECNET, SOL_PACKET, SOL_ATM, SOL_AAL, SOL_IRDA, SOL_NETBEUI, SOL_LLC, SOL_DCCP, SOL_NETLINK, SOL_TIPC, SOL_RXRPC, SOL_PPPOL2TP, SOL_BLUETOOTH, SOL_PNPIPE, SOL_RDS, SOL_IUCV, SOL_CAIF, SOL_ALG, SOL_NFC, SOL_KCM
+cmsg_levels = SOL_SOCKET, IPPROTO_ICMP, SOL_IP, SOL_TCP, SOL_UDP, SOL_IPV6, SOL_ICMPV6, SOL_SCTP, SOL_UDPLITE, SOL_RAW, SOL_AX25, SOL_ATALK, SOL_NETROM, SOL_ROSE, SOL_PACKET, SOL_ATM, SOL_AAL, SOL_IRDA, SOL_NETBEUI, SOL_LLC, SOL_DCCP, SOL_NETLINK, SOL_TIPC, SOL_RXRPC, SOL_PPPOL2TP, SOL_BLUETOOTH, SOL_PNPIPE, SOL_RDS, SOL_IUCV, SOL_CAIF, SOL_ALG, SOL_NFC, SOL_KCM
 
 sock_pair {
 	fd0	sock
@@ -55,13 +55,12 @@ sock_pair {
 }
 
 # This sockaddr type corresponds to the struct sockaddr and is 16 bytes or less.
-# TODO: add AF_APPLETALK, AF_ATMPVC, AF_ROSE, AF_DECnet, AF_ATMSVC, AF_IRDA, AF_IB, AF_IUCV
+# TODO: add AF_APPLETALK, AF_ATMPVC, AF_ROSE, AF_ATMSVC, AF_IRDA, AF_IB, AF_IUCV
 # Note: AF_UNIX, AF_INET6, AF_PACKET, AF_ALG, AF_PPPOX sockaddr is bigger than 16 bytes
 # Note: AF_NETROM sockaddr is the same as AF_AX25
 sockaddr [
 	in		sockaddr_in
 	ax25		sockaddr_ax25
-	ipx		sockaddr_ipx
 	nl		sockaddr_nl
 	llc		sockaddr_llc
 	can		sockaddr_can
@@ -87,7 +86,6 @@ sockaddr_storage [
 	in		sockaddr_in
 	x25		sockaddr_x25
 	ax25		full_sockaddr_ax25
-	ipx		sockaddr_ipx
 	in6		sockaddr_in6
 	nl		sockaddr_nl
 	ll		sockaddr_ll
@@ -227,6 +225,7 @@ setsockopt$SO_BINDTODEVICE(fd sock, level const[SOL_SOCKET], optname const[SO_BI
 getsockopt$SO_BINDTODEVICE(fd sock, level const[SOL_SOCKET], optname const[SO_BINDTODEVICE], optval ptr[out, devname], optlen len[optval])
 getsockopt$sock_buf(fd sock, level const[SOL_SOCKET], optname flags[sockopt_opt_sock_buf], optval buffer[out], optlen ptr[inout, len[optval, int32]])
 getsockopt$SO_COOKIE(fd sock, level const[SOL_SOCKET], optname const[SO_COOKIE], optval ptr[out, int64], optlen ptr[inout, len[optval, int32]])
+getsockopt$SO_NETNS_COOKIE(fd sock, level const[SOL_SOCKET], optname const[SO_NETNS_COOKIE], optval ptr[out, int64], optlen ptr[inout, len[optval, int32]])
 
 linger {
 	onoff	bool32
@@ -234,7 +233,7 @@ linger {
 }
 
 sockopt_opt_sock_void = SO_DETACH_FILTER, SO_MARK
-sockopt_opt_sock_int = SO_ACCEPTCONN, SO_BROADCAST, SO_DEBUG, SO_DOMAIN, SO_ERROR, SO_DONTROUTE, SO_KEEPALIVE, SO_PEEK_OFF, SO_PRIORITY, SO_PROTOCOL, SO_RCVBUF, SO_RCVBUFFORCE, SO_RCVLOWAT, SO_SNDLOWAT, SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE, SO_TIMESTAMP_OLD, SO_TYPE, SO_REUSEPORT, SO_OOBINLINE, SO_NO_CHECK, SO_PASSCRED, SO_TIMESTAMPNS_OLD, SO_LOCK_FILTER, SO_PASSSEC, SO_RXQ_OVFL, SO_WIFI_STATUS, SO_NOFCS, SO_SELECT_ERR_QUEUE, SO_BUSY_POLL, SO_MAX_PACING_RATE, SO_ZEROCOPY
+sockopt_opt_sock_int = SO_ACCEPTCONN, SO_BROADCAST, SO_DEBUG, SO_DOMAIN, SO_ERROR, SO_DONTROUTE, SO_KEEPALIVE, SO_PEEK_OFF, SO_PRIORITY, SO_PROTOCOL, SO_RCVBUF, SO_RCVBUFFORCE, SO_RCVLOWAT, SO_SNDLOWAT, SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE, SO_TIMESTAMP_OLD, SO_TYPE, SO_REUSEPORT, SO_OOBINLINE, SO_NO_CHECK, SO_PASSCRED, SO_TIMESTAMPNS_OLD, SO_LOCK_FILTER, SO_PASSSEC, SO_RXQ_OVFL, SO_WIFI_STATUS, SO_NOFCS, SO_SELECT_ERR_QUEUE, SO_BUSY_POLL, SO_MAX_PACING_RATE, SO_ZEROCOPY, SO_INQ, SO_PASSPIDFD, SO_PEERPIDFD, SO_TXREHASH, SO_RCVMARK, SO_RCVPRIORITY, SO_BUF_LOCK, SO_RESERVE_MEM, SO_PREFER_BUSY_POLL, SO_BUSY_POLL_BUDGET, SO_INCOMING_CPU, SO_INCOMING_NAPI_ID, SO_BINDTOIFINDEX, SO_PASSRIGHTS, SO_RIGHTS_NOTRUNC
 sockopt_opt_sock_timeval = SO_RCVTIMEO_OLD, SO_RCVTIMEO_NEW, SO_SNDTIMEO_OLD, SO_SNDTIMEO_NEW
 sockopt_opt_sock_timestamp = SO_TIMESTAMP_OLD, SO_TIMESTAMP_NEW, SO_TIMESTAMPNS_OLD, SO_TIMESTAMPNS_NEW
 sockopt_opt_sock_timestamping = SO_TIMESTAMPING_OLD, SO_TIMESTAMPING_NEW
@@ -285,7 +284,7 @@ ifreq_ioctls = SIOCGIFNAME, SIOCSIFLINK, SIOCGIFFLAGS, SIOCSIFFLAGS, SIOCGIFADDR
 
 ioctl$sock_ifreq(fd sock, cmd flags[ifreq_ioctls], arg ptr[inout, ifreq])
 
-ioctl$sock_SIOCGIFINDEX(fd sock, cmd const[SIOCGIFINDEX], arg ptr[inout, ifreq_t[ifindex]])
+ioctl$sock_SIOCGIFINDEX(fd sock, cmd const[SIOCGIFINDEX], arg ptr[out, ifreq_t[ifindex]]) (automatic_helper)
 
 ioctl$sock_SIOCGIFBR(fd sock, cmd const[SIOCGIFBR], arg ptr[inout, brctl_arg])
 ioctl$sock_SIOCSIFBR(fd sock, cmd const[SIOCSIFBR], arg ptr[inout, brctl_arg])
@@ -328,7 +327,7 @@ resource ifindex[int32]
 
 type ifreq_dev_t[DEVNAME, ELEM] {
 	ifr_ifrn	string[DEVNAME, IFNAMSIZ]	(in)
-	elem		ELEM	(out)
+	elem		ELEM
 } [size[IFREQ_SIZE]]
 
 type ifreq_t[ELEM] ifreq_dev_t[devnames, ELEM]
@@ -385,7 +384,8 @@ rtentry {
 # Note: lapb0, bpq0 and hwsim0 are only present in init namespace.
 # Note: for roseN and nrN we should use proc type, but for simplicity we currently use N=0.
 # Note: netdevsim0 and netpci0 are renamed in initialize_devlink_ports()
-devnames = "", "lo", "tunl0", "gre0", "gretap0", "ip_vti0", "ip6_vti0", "sit0", "ip6tnl0", "ip6gre0", "ip6gretap0", "bond0", "dummy0", "nr0", "rose0", "erspan0", "vlan0", "bridge0", "vcan0", "team0", "syz_tun", "veth0", "veth1", "veth0_to_bridge", "veth1_to_bridge", "veth0_to_bond", "veth1_to_bond", "veth0_to_team", "veth1_to_team", "bridge_slave_0", "bridge_slave_1", "bond_slave_0", "bond_slave_1", "team_slave_0", "team_slave_1", "syzkaller0", "syzkaller1", "veth0_to_hsr", "veth1_to_hsr", "hsr0", "ip6erspan0", "vxcan1", "caif0", "batadv0", "veth0_to_batadv", "veth1_to_batadv", "batadv_slave_0", "batadv_slave_1", "netdevsim0", "netpci0", "xfrm0", "veth0_virt_wifi", "veth1_virt_wifi", "virt_wifi0", "veth0_vlan", "veth1_vlan", "vlan0", "vlan1", "macvlan0", "macvlan1", "ipvlan0", "ipvlan1", "veth0_macvtap", "veth1_macvtap", "macvtap0", "macsec0", "geneve0", "geneve1", "wg0", "wg1", "wg2", "wlan0", "wlan1"
+
+devnames = "", "lo", "tunl0", "gre0", "gretap0", "ip_vti0", "ip6_vti0", "sit0", "ip6tnl0", "ip6gre0", "ip6gretap0", "bond0", "dummy0", "nr0", "rose0", "erspan0", "vlan0", "bridge0", "vcan0", "team0", "syz_tun", "veth0", "veth1", "veth0_to_bridge", "veth1_to_bridge", "veth0_to_bond", "veth1_to_bond", "veth0_to_team", "veth1_to_team", "bridge_slave_0", "bridge_slave_1", "bond_slave_0", "bond_slave_1", "team_slave_0", "team_slave_1", "syzkaller0", "syzkaller1", "veth0_to_hsr", "veth1_to_hsr", "hsr0", "ip6erspan0", "vxcan1", "caif0", "batadv0", "veth0_to_batadv", "veth1_to_batadv", "batadv_slave_0", "batadv_slave_1", "netdevsim0", "netpci0", "nicvf0", "xfrm0", "veth0_virt_wifi", "veth1_virt_wifi", "virt_wifi0", "veth0_vlan", "veth1_vlan", "vlan1", "macvlan0", "macvlan1", "ipvlan0", "ipvlan1", "veth0_macvtap", "veth1_macvtap", "macvtap0", "ipvtap0", "macsec0", "geneve0", "geneve1", "wg0", "wg1", "wg2", "wlan0", "wlan1", "dvmrp0", "dvmrp1", "pimreg", "pimreg0", "pimreg1", "pim6reg", "pim6reg0", "pim6reg1"
 
 type devname string[devnames, IFNAMSIZ]
 
@@ -563,7 +563,7 @@ ethtool_cmd {
 	reserved		array[int32, 2]
 }
 
-ethtool_cmd_flags = ETHTOOL_GSET, ETHTOOL_SSET, ETHTOOL_GDRVINFO, ETHTOOL_GREGS, ETHTOOL_GWOL, ETHTOOL_SWOL, ETHTOOL_GMSGLVL, ETHTOOL_SMSGLVL, ETHTOOL_NWAY_RST, ETHTOOL_GLINK, ETHTOOL_GEEPROM, ETHTOOL_SEEPROM, ETHTOOL_GCOALESCE, ETHTOOL_SCOALESCE, ETHTOOL_GRINGPARAM, ETHTOOL_SRINGPARAM, ETHTOOL_GPAUSEPARAM, ETHTOOL_SPAUSEPARAM, ETHTOOL_GRXCSUM, ETHTOOL_SRXCSUM, ETHTOOL_GTXCSUM, ETHTOOL_STXCSUM, ETHTOOL_GSG, ETHTOOL_SSG, ETHTOOL_TEST, ETHTOOL_PHYS_ID, ETHTOOL_GSTATS, ETHTOOL_GTSO, ETHTOOL_STSO, ETHTOOL_GPERMADDR, ETHTOOL_GUFO, ETHTOOL_SUFO, ETHTOOL_GGSO, ETHTOOL_SGSO, ETHTOOL_GFLAGS, ETHTOOL_SFLAGS, ETHTOOL_GPFLAGS, ETHTOOL_SPFLAGS, ETHTOOL_GRXFH, ETHTOOL_SRXFH, ETHTOOL_GGRO, ETHTOOL_SGRO, ETHTOOL_GRXRINGS, ETHTOOL_GRXCLSRLCNT, ETHTOOL_GRXCLSRULE, ETHTOOL_GRXCLSRLALL, ETHTOOL_SRXCLSRLDEL, ETHTOOL_SRXCLSRLINS, ETHTOOL_RESET, ETHTOOL_SRXNTUPLE, ETHTOOL_GRXNTUPLE, ETHTOOL_GSSET_INFO, ETHTOOL_GRXFHINDIR, ETHTOOL_SRXFHINDIR, ETHTOOL_GFEATURES, ETHTOOL_SFEATURES, ETHTOOL_GCHANNELS, ETHTOOL_SCHANNELS, ETHTOOL_SET_DUMP, ETHTOOL_GET_DUMP_FLAG, ETHTOOL_GET_DUMP_DATA, ETHTOOL_GET_TS_INFO, ETHTOOL_GMODULEEEPROM, ETHTOOL_GEEE, ETHTOOL_SEEE, ETHTOOL_GRSSH, ETHTOOL_SRSSH, ETHTOOL_GTUNABLE, ETHTOOL_STUNABLE, ETHTOOL_GPHYSTATS, ETHTOOL_PERQUEUE, ETHTOOL_GLINKSETTINGS, ETHTOOL_SLINKSETTINGS, ETHTOOL_PHY_GTUNABLE, ETHTOOL_PHY_STUNABLE
+ethtool_cmd_flags = ETHTOOL_GSET, ETHTOOL_SSET, ETHTOOL_GDRVINFO, ETHTOOL_GREGS, ETHTOOL_GWOL, ETHTOOL_SWOL, ETHTOOL_GMSGLVL, ETHTOOL_SMSGLVL, ETHTOOL_NWAY_RST, ETHTOOL_GLINK, ETHTOOL_GCOALESCE, ETHTOOL_SCOALESCE, ETHTOOL_GRINGPARAM, ETHTOOL_SRINGPARAM, ETHTOOL_GPAUSEPARAM, ETHTOOL_SPAUSEPARAM, ETHTOOL_GRXCSUM, ETHTOOL_SRXCSUM, ETHTOOL_GTXCSUM, ETHTOOL_STXCSUM, ETHTOOL_GSG, ETHTOOL_SSG, ETHTOOL_TEST, ETHTOOL_PHYS_ID, ETHTOOL_GSTATS, ETHTOOL_GTSO, ETHTOOL_STSO, ETHTOOL_GPERMADDR, ETHTOOL_GUFO, ETHTOOL_SUFO, ETHTOOL_GGSO, ETHTOOL_SGSO, ETHTOOL_GFLAGS, ETHTOOL_SFLAGS, ETHTOOL_GPFLAGS, ETHTOOL_SPFLAGS, ETHTOOL_GGRO, ETHTOOL_SGRO, ETHTOOL_RESET, ETHTOOL_SRXNTUPLE, ETHTOOL_GRXNTUPLE, ETHTOOL_GSSET_INFO, ETHTOOL_GRXFHINDIR, ETHTOOL_SRXFHINDIR, ETHTOOL_GFEATURES, ETHTOOL_SFEATURES, ETHTOOL_GCHANNELS, ETHTOOL_SCHANNELS, ETHTOOL_GET_TS_INFO, ETHTOOL_GEEE, ETHTOOL_SEEE, ETHTOOL_GRSSH, ETHTOOL_SRSSH, ETHTOOL_GTUNABLE, ETHTOOL_STUNABLE, ETHTOOL_GPHYSTATS, ETHTOOL_PERQUEUE, ETHTOOL_GLINKSETTINGS, ETHTOOL_SLINKSETTINGS, ETHTOOL_PHY_GTUNABLE, ETHTOOL_PHY_STUNABLE, ethtool_eeprom_cmd_flags, ethtool_rxnfc_cmd_flags, ethtool_dump_cmd_flags
 
 ethtool_drvinfo {
 	cmd		const[ETHTOOL_GDRVINFO, int32]

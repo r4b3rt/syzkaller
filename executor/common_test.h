@@ -31,7 +31,7 @@ static long syz_errno(volatile long v)
 // syz_exit(status int32)
 static long syz_exit(volatile long status)
 {
-	_exit(status);
+	doexit(status);
 	return 0;
 }
 #endif
@@ -45,7 +45,7 @@ static long syz_sleep_ms(volatile long ms)
 }
 #endif
 
-#if SYZ_EXECUTOR || __NR_syz_compare
+#if SYZ_EXECUTOR || __NR_syz_compare || __NR_syz_compare_zlib
 #include <errno.h>
 #include <string.h>
 
@@ -101,11 +101,108 @@ static long syz_compare_int(volatile long n, ...)
 }
 #endif
 
+#if SYZ_EXECUTOR || __NR_syz_compare_zlib
+#include "common_zlib.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+
+// syz_compare_zlib(data ptr[in, array[int8]], size bytesize[data], zdata ptr[in, compressed_image], zsize bytesize[zdata])
+static long syz_compare_zlib(volatile long data, volatile long size, volatile long zdata, volatile long zsize)
+{
+	int fd = open("./uncompressed", O_RDWR | O_CREAT | O_EXCL, 0666);
+	if (fd == -1)
+		return -1;
+	if (puff_zlib_to_file((unsigned char*)zdata, zsize, fd))
+		return -1;
+	struct stat statbuf;
+	if (fstat(fd, &statbuf))
+		return -1;
+	void* uncompressed = NULL;
+	if (statbuf.st_size > 0) {
+		// We cannot mmap 0 bytes.
+		uncompressed = mmap(0, statbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+		if (uncompressed == MAP_FAILED)
+			return -1;
+	}
+	return syz_compare(data, size, (long)uncompressed, statbuf.st_size);
+}
+#endif
+
 #if SYZ_EXECUTOR || SYZ_SANDBOX_NONE
 static void loop();
 static int do_sandbox_none(void)
 {
+	// Test various ways how feature setup can fail.
+	// We don't care about these features for test OS,
+	// this is just to test the feature support detection code.
+#if SYZ_EXECUTOR || SYZ_NET_INJECTION
+#if SYZ_EXECUTOR
+	if (flag_net_injection)
+#endif
+		fail("net injection is not supported");
+#endif
+#if SYZ_EXECUTOR || SYZ_DEVLINK_PCI
+#if SYZ_EXECUTOR
+	if (flag_devlink_pci)
+#endif
+		exitf("devlink_pci is not supported");
+#endif
 	loop();
 	return 0;
+}
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_test_fuzzer1
+
+static void fake_crash(const char* name)
+{
+	failmsg("crash", "{{CRASH: %s}}", name);
+	doexit(1);
+}
+
+static long syz_test_fuzzer1(volatile long a, volatile long b, volatile long c)
+{
+	// We probably want something more interesting here.
+	if (a == 1 && b == 1 && c == 1)
+		fake_crash("first bug");
+	if (a == 1 && b == 2 && c == 3)
+		fake_crash("second bug");
+	return 0;
+}
+
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_inject_cover
+static long syz_inject_cover(volatile long a, volatile long b)
+#if SYZ_EXECUTOR
+    ; // defined in executor_test.h
+#else
+{
+	return 0;
+}
+#endif
+#endif
+
+#if SYZ_EXECUTOR || __NR_syz_inject_remote_cover
+static long syz_inject_remote_cover(volatile long a, volatile long b)
+#if SYZ_EXECUTOR
+    ; // defined in executor_test.h
+#else
+{
+	return 0;
+}
+#endif
+#endif
+
+#if SYZ_EXECUTOR || SYZ_SYSCTL
+static void setup_sysctl()
+{
+}
+#endif
+
+#if SYZ_EXECUTOR || (SYZ_CGROUPS && (SYZ_SANDBOX_NONE || SYZ_SANDBOX_SETUID || SYZ_SANDBOX_NAMESPACE || SYZ_SANDBOX_ANDROID))
+static void setup_cgroups()
+{
 }
 #endif

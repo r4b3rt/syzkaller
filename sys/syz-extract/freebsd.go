@@ -27,14 +27,20 @@ func (*freebsd) prepareArch(arch *Arch) error {
 	if archName == "386" {
 		archName = "i386"
 	}
+
+	if archName == "riscv64" {
+		archName = "riscv"
+	}
+
 	if err := os.Symlink(filepath.Join(arch.sourceDir, "sys", archName, "include"),
 		filepath.Join(arch.buildDir, "machine")); err != nil {
-		return fmt.Errorf("failed to create link: %v", err)
+		return fmt.Errorf("failed to create link: %w", err)
 	}
 	if err := os.Symlink(filepath.Join(arch.sourceDir, "sys", "x86", "include"),
 		filepath.Join(arch.buildDir, "x86")); err != nil {
-		return fmt.Errorf("failed to create link: %v", err)
+		return fmt.Errorf("failed to create link: %w", err)
 	}
+
 	return nil
 }
 
@@ -42,9 +48,11 @@ func (*freebsd) processFile(arch *Arch, info *compiler.ConstInfo) (map[string]ui
 	args := []string{
 		"-fmessage-length=0",
 		"-nostdinc",
-		"-DGENOFFSET",
-		"-D_KERNEL",
 		"-D__BSD_VISIBLE=1",
+		"-DCOMPAT_FREEBSD13",
+		"-DCOMPAT_FREEBSD14",
+		"-DCOMPAT_FREEBSD15",
+		"-D_WANT_ALL_LIO_OPCODES",
 		"-I", filepath.Join(arch.sourceDir, "sys"),
 		"-I", filepath.Join(arch.sourceDir, "sys", "sys"),
 		"-I", filepath.Join(arch.sourceDir, "sys", "contrib", "ck", "include"),
@@ -55,15 +63,16 @@ func (*freebsd) processFile(arch *Arch, info *compiler.ConstInfo) (map[string]ui
 		args = append(args, "-I"+filepath.Join(arch.sourceDir, incdir))
 	}
 	if arch.includeDirs != "" {
-		for _, dir := range strings.Split(arch.includeDirs, ",") {
+		for dir := range strings.SplitSeq(arch.includeDirs, ",") {
 			args = append(args, "-I"+dir)
 		}
 	}
 	args = append(args, arch.target.CFlags...)
 	params := &extractParams{
-		AddSource:     "#include <sys/syscall.h>",
-		DeclarePrintf: true,
-		TargetEndian:  arch.target.HostEndian,
+		AddSource:      "#include <sys/syscall.h>",
+		DeclarePrintf:  true,
+		ExtractFromELF: true,
+		TargetEndian:   arch.target.HostEndian,
 	}
 	cc := arch.target.CCompiler
 	return extract(info, cc, args, params)

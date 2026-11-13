@@ -4,35 +4,35 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/google/syzkaller/pkg/kcidb"
-	"golang.org/x/net/context"
-	"google.golang.org/appengine"
-	db "google.golang.org/appengine/datastore"
-	"google.golang.org/appengine/log"
+	"google.golang.org/appengine/v2"
+	db "google.golang.org/appengine/v2/datastore"
+	"google.golang.org/appengine/v2/log"
 )
 
 func initKcidb() {
-	http.HandleFunc("/kcidb_poll", handleKcidbPoll)
+	http.HandleFunc("/cron/kcidb_poll", handleKcidbPoll)
 }
 
 func handleKcidbPoll(w http.ResponseWriter, r *http.Request) {
-	c := appengine.NewContext(r)
-	for ns, cfg := range config.Namespaces {
+	ctx := appengine.NewContext(r)
+	for ns, cfg := range getConfig(ctx).Namespaces {
 		if cfg.Kcidb == nil {
 			continue
 		}
-		if err := handleKcidbNamespce(c, ns, cfg.Kcidb); err != nil {
-			log.Errorf(c, "kcidb: %v failed: %v", ns, err)
+		if err := handleKcidbNamespce(ctx, ns, cfg.Kcidb); err != nil {
+			log.Errorf(ctx, "kcidb: %v failed: %v", ns, err)
 		}
 	}
 }
 
-func handleKcidbNamespce(c context.Context, ns string, cfg *KcidbConfig) error {
-	client, err := kcidb.NewClient(c, cfg.Origin, cfg.Project, cfg.Topic, cfg.Credentials)
+func handleKcidbNamespce(ctx context.Context, ns string, cfg *KcidbConfig) error {
+	client, err := kcidb.NewClient(ctx, cfg.Origin, cfg.RestURI, cfg.Token)
 	if err != nil {
 		return err
 	}
@@ -43,11 +43,11 @@ func handleKcidbNamespce(c context.Context, ns string, cfg *KcidbConfig) error {
 			Filter("Status=", BugStatusOpen)
 	}
 	reported := 0
-	return foreachBug(c, filter, func(bug *Bug, bugKey *db.Key) error {
+	return foreachBug(ctx, filter, func(bug *Bug, bugKey *db.Key) error {
 		if reported >= 30 {
 			return nil
 		}
-		ok, err := publishKcidbBug(c, client, bug, bugKey)
+		ok, err := publishKcidbBug(ctx, client, bug, bugKey)
 		if err != nil {
 			return err
 		}
@@ -58,46 +58,44 @@ func handleKcidbNamespce(c context.Context, ns string, cfg *KcidbConfig) error {
 	})
 }
 
-func publishKcidbBug(c context.Context, client *kcidb.Client, bug *Bug, bugKey *db.Key) (bool, error) {
+func publishKcidbBug(ctx context.Context, client *kcidb.Client, bug *Bug, bugKey *db.Key) (bool, error) {
 	if bug.KcidbStatus != 0 ||
-		bug.sanitizeAccess(AccessPublic) > AccessPublic ||
+		bug.sanitizeAccess(ctx, AccessPublic) > AccessPublic ||
 		bug.Reporting[len(bug.Reporting)-1].Reported.IsZero() ||
-		bug.Status != BugStatusOpen && timeSince(c, bug.LastTime) > 7*24*time.Hour {
+		bug.Status != BugStatusOpen && timeSince(ctx, bug.LastTime) > 7*24*time.Hour {
 		return false, nil
 	}
-	rep, err := loadBugReport(c, bug)
+	rep, err := loadBugReport(ctx, bug)
 	if err != nil {
 		return false, err
 	}
-	publish := true
-	if rep.KernelCommit == "" || len(rep.KernelConfig) == 0 {
-		// This should happen only for syzkaller build/test errors, which we don't want to publish.
-		// But if this ever happens for a kernel bug, then we also don't want to publish such bugs
-		// with missing critical info.
-		publish = false
-	}
+	// publish == false happens only for syzkaller build/test errors.
+	// But if this ever happens for a kernel bug, then we also don't want to publish such bugs
+	// with missing critical info.
+	publish := rep.KernelCommit != "" && len(rep.KernelConfig) != 0
+
 	if publish {
 		if err := client.Publish(rep); err != nil {
 			return false, err
 		}
 	}
-	tx := func(c context.Context) error {
+	tx := func(ctx context.Context) error {
 		bug := new(Bug)
-		if err := db.Get(c, bugKey, bug); err != nil {
+		if err := db.Get(ctx, bugKey, bug); err != nil {
 			return err
 		}
 		bug.KcidbStatus = 1
 		if !publish {
 			bug.KcidbStatus = 2
 		}
-		if _, err := db.Put(c, bugKey, bug); err != nil {
-			return fmt.Errorf("failed to put bug: %v", err)
+		if _, err := db.Put(ctx, bugKey, bug); err != nil {
+			return fmt.Errorf("failed to put bug: %w", err)
 		}
 		return nil
 	}
-	if err := db.RunInTransaction(c, tx, nil); err != nil {
+	if err := runInTransaction(ctx, tx, nil); err != nil {
 		return false, err
 	}
-	log.Infof(c, "published bug to kcidb: %v:%v '%v'", bug.Namespace, bugKey.StringID(), bug.displayTitle())
+	log.Infof(ctx, "published bug to kcidb: %v:%v '%v'", bug.Namespace, bugKey.StringID(), bug.displayTitle())
 	return publish, nil
 }

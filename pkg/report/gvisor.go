@@ -17,9 +17,6 @@ func ctorGvisor(cfg *config) (reporterImpl, []string, error) {
 		config: cfg,
 	}
 	suppressions := []string{
-		"fatal error: runtime: out of memory",
-		"fatal error: runtime: cannot allocate memory",
-		"fatal error: newosproc",
 		"panic: ptrace sysemu failed: no such process",                                          // OOM kill
 		`panic: ptrace (s|g)et fpregs.* failed: no such process`,                                // OOM kill
 		`panic: ptrace (s|g)et regs.* failed: no such process`,                                  // OOM kill
@@ -31,6 +28,7 @@ func ctorGvisor(cfg *config) (reporterImpl, []string, error) {
 		"race: limit on 8128 simultaneously alive goroutines is exceeded, dying",
 		"ERROR: ThreadSanitizer", // Go race failing due to OOM.
 		"FATAL: ThreadSanitizer",
+		"ThreadSanitizer: clock allocator overflow \\(65536\\*1024\\). Dying.",
 	}
 	return ctx, suppressions, nil
 }
@@ -55,7 +53,7 @@ func (ctx *gvisor) shortenReport(report []byte) []byte {
 	// So we always take 5 lines from report and then cut it at the next empty line.
 	// The intention is to capture panic header and traceback of the first goroutine.
 	pos := 0
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		pos1 := bytes.IndexByte(report[pos:], '\n')
 		if pos1 == -1 {
 			return report
@@ -108,17 +106,6 @@ var gvisorOopses = append([]*oops{
 		[]*regexp.Regexp{},
 	},
 	{
-		[]byte("fatal error:"),
-		[]oopsFormat{
-			{
-				title:        compile("fatal error:(.*)"),
-				fmt:          "fatal error:%[1]v",
-				noStackTrace: true,
-			},
-		},
-		[]*regexp.Regexp{},
-	},
-	{
 		[]byte("SIGSEGV:"),
 		[]oopsFormat{
 			{
@@ -156,7 +143,7 @@ var gvisorOopses = append([]*oops{
 		[]oopsFormat{
 			{
 				title:        compile("WARNING: DATA RACE"),
-				report:       compile("WARNING: DATA RACE\n(?:.*\n)*?  (?:[a-zA-Z0-9./-_]+/)([a-zA-Z0-9.()*_]+)\\(\\)\n"),
+				report:       compile("WARNING: DATA RACE\n(?:.*\n)*?  (?:[a-zA-Z0-9./_-]+/)([a-zA-Z0-9.()*_]+)\\(\\)\n"),
 				fmt:          "DATA RACE in %[1]v",
 				noStackTrace: true,
 			},
@@ -170,6 +157,28 @@ var gvisorOopses = append([]*oops{
 				title:        compile("Invalid request partialResult"),
 				report:       compile("Invalid request partialResult .* for (.*) operation"),
 				fmt:          "Invalid request partialResult in %[1]v",
+				noStackTrace: true,
+			},
+		},
+		[]*regexp.Regexp{},
+	},
+	{
+		[]byte("fatal error:"),
+		[]oopsFormat{
+			{
+				title:        compile("fatal error:(.*)"),
+				fmt:          "fatal error:%[1]v",
+				noStackTrace: true,
+			},
+		},
+		[]*regexp.Regexp{},
+	},
+	{
+		[]byte("WARNING: BUG on"),
+		[]oopsFormat{
+			{
+				title:        compile("WARNING: BUG on (.*)"),
+				fmt:          "WARNING: BUG on %[1]v",
 				noStackTrace: true,
 			},
 		},

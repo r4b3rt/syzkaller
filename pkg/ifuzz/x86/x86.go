@@ -1,7 +1,7 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-//go:generate bash -c "go run gen/gen.go gen/all-enc-instructions.txt > generated/insns.go"
+//go:generate go run gen/gen.go gen/all-enc-instructions.txt generated/insns.go
 
 // Package x86 allows to generate and mutate x86 machine code.
 package x86
@@ -76,7 +76,7 @@ func (insn *Insn) Info() (string, iset.Mode, bool, bool) {
 func generateArg(cfg *iset.Config, r *rand.Rand, size int) []byte {
 	v := iset.GenerateInt(cfg, r, size)
 	arg := make([]byte, size)
-	for i := 0; i < size; i++ {
+	for i := range size {
 		arg[i] = byte(v)
 		v >>= 8
 	}

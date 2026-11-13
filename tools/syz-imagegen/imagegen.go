@@ -3,30 +3,35 @@
 
 // As we use syscall package:
 //go:build linux
-// +build linux
 
 // syz-imagegen generates sys/linux/test/syz_mount_image_* test files.
 // It requires the following packages to be installed:
-//	f2fs-tools, xfsprogs, reiserfsprogs, gfs2-utils, ocfs2-tools, genromfs, erofs-utils, makefs, udftools,
-//	mtd-utils, nilfs-tools, squashfs-tools, genisoimage.
+//
+//	f2fs-tools xfsprogs reiserfsprogs gfs2-utils ocfs2-tools genromfs erofs-utils makefs udftools
+//	mtd-utils nilfs-tools squashfs-tools genisoimage jfsutils exfat-utils ntfs-3g hfsprogs
+//	bcachefs-tools.
 package main
 
 import (
+	"bufio"
 	"bytes"
-	"encoding/hex"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"hash/crc32"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
+	"github.com/google/syzkaller/pkg/image"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/tool"
 	"github.com/google/syzkaller/prog"
@@ -37,18 +42,22 @@ import (
 // FileSystem represents one file system.
 // Each FileSystem produces multiple images, see MkfsFlagCombinations and Image type.
 type FileSystem struct {
-	// Name of the file system. Needs to match syz_mount_image$NAME name.
-	Name string
+	// Name of the file system. Needs to match the name passed to mount().
+	Name string `json:"name"`
+	// By default, syz_mount_image$NAME are generated. SyscallSuffix overrides the part after $.
+	SyscallSuffix string `json:"syscall_suffix"`
 	// Imagegen autodetects size for images starting from MinSize and then repeatedly doubling it if mkfs fails.
-	MinSize int
+	MinSize int `json:"min_size"`
 	// Don't populate this image with files (can't mount read-write).
-	ReadOnly bool
+	ReadOnly bool `json:"read_only"`
 	// These flags are always appended to mkfs as is.
-	MkfsFlags []string
+	MkfsFlags []string `json:"mkfs_flags"`
 	// Generate images for all possible permutations of these flag combinations.
-	MkfsFlagCombinations [][]string
+	MkfsFlagCombinations [][]string `json:"mkfs_flag_combinations"`
+	// Limit the resulting number of seeds (in case there are too many possible combinations).
+	MaxSeeds int `json:"max_seeds"`
 	// Custom mkfs invocation, if nil then mkfs.name is invoked in a standard way.
-	Mkfs func(image *Image) error
+	Mkfs func(img *Image) error
 }
 
 // nolint:lll
@@ -60,7 +69,6 @@ var fileSystems = []FileSystem{
 		MkfsFlagCombinations: [][]string{
 			{"-a 0", "-a 1"},
 			{"-s 1", "-s 2"},
-			{"", "-m"},
 			{
 				"",
 				"-O encrypt",
@@ -86,7 +94,24 @@ var fileSystems = []FileSystem{
 		MkfsFlagCombinations: [][]string{
 			{"", "-a -I"},
 			{"", "-h 3 -f 4"},
-			{"-s 1", "-s 8", "-s 128"},
+			{"-s 1", "-s 8", "-s 64"},
+			{
+				"-F 12 -r 64 -S 512",
+				"-F 12 -r 64 -S 2048 -A",
+				"-F 16 -r 112 -S 512",
+				"-F 32 -r 768 -S 512",
+				"-F 32 -r 768 -S 2048 -A",
+			},
+		},
+	},
+	{
+		Name:      "msdos",
+		MinSize:   64 << 10,
+		MkfsFlags: []string{"-n", "SYZKALLER"},
+		MkfsFlagCombinations: [][]string{
+			{"", "-a -I"},
+			{"", "-h 3 -f 4"},
+			{"-s 1", "-s 8", "-s 64"},
 			{
 				"-F 12 -r 64 -S 512",
 				"-F 12 -r 64 -S 2048 -A",
@@ -116,7 +141,7 @@ var fileSystems = []FileSystem{
 	{
 		Name:      "xfs",
 		MinSize:   16 << 20,
-		MkfsFlags: []string{"-l", "internal"},
+		MkfsFlags: []string{"-l", "internal", "--unsupported"},
 		MkfsFlagCombinations: [][]string{
 			// Most XFS options are inter-dependent and total number of combinations is huge,
 			// so we enumerate some combinations that don't produce errors.
@@ -181,7 +206,6 @@ var fileSystems = []FileSystem{
 		MkfsFlags: []string{"-f", "-F", "-L", "syzkaller"},
 		MkfsFlagCombinations: [][]string{
 			{
-				"-s 256 -c 256",
 				"-s 256 -c 2048",
 				"-s 512 -c 1024",
 				"-s 512 -c 4096",
@@ -196,38 +220,124 @@ var fileSystems = []FileSystem{
 		},
 	},
 	{
-		Name:      "ext4",
-		MinSize:   64 << 10,
-		MkfsFlags: []string{"-L", "syzkaller", "-U", "clear", "-E", "test_fs"},
+		Name:      "ntfs3",
+		MinSize:   1 << 20,
+		MkfsFlags: []string{"-f", "-F", "-L", "syzkaller"},
 		MkfsFlagCombinations: [][]string{
-			{"-t ext2", "-t ext3", "-t ext4"},
-			// Total number of combinations is too large and there are lots of dependencies between flags,
-			// so we create just few permutations generated with fair dice rolls.
-			// TODO: We also need to give some combination of -E encoding=utf8/utf8-12.1 and -E encoding_flags=strict,
-			// but mounting such fs on my host fails with "Filesystem with casefold feature cannot be mounted without CONFIG_UNICODE".
 			{
-				"-b 1024 -I 128 -E lazy_itable_init=0 -E num_backup_sb=0 -E packed_meta_blocks=0 -O ^64bit -O extents -O ^bigalloc -O ^dir_index -O dir_nlink -O ea_inode -O ^encrypt -O ext_attr -O extra_isize -O flex_bg -O ^huge_file -O ^inline_data -O large_dir -O ^metadata_csum -O meta_bg -O mmp -O quota -O ^resize_inode -O ^sparse_super -O ^uninit_bg -O ^verity -j -J size=1024",
-				"-b 1024 -I 256 -E lazy_itable_init=0 -E num_backup_sb=1 -E packed_meta_blocks=1 -O  64bit -O extents -O bigalloc -O ^dir_index -O ^dir_nlink -O ^ea_inode -O ^encrypt -O ext_attr -O ^extra_isize -O flex_bg -O ^huge_file -O ^inline_data -O large_dir -O ^metadata_csum -O meta_bg -O ^mmp -O quota -O ^resize_inode -O ^sparse_super -O uninit_bg -O ^verity",
-				"-b 1024 -I 1024 -E lazy_itable_init=0 -E num_backup_sb=1 -E packed_meta_blocks=1 -O  64bit -O extents -O bigalloc -O ^dir_index -O ^dir_nlink -O ^ea_inode -O encrypt -O ext_attr -O ^extra_isize -O flex_bg -O ^huge_file -O inline_data -O large_dir -O ^metadata_csum -O meta_bg -O ^mmp -O quota -O ^resize_inode -O ^sparse_super -O uninit_bg -O ^verity -j -J size=1024",
-				"-b 1024 -I 128 -E lazy_itable_init=1 -E num_backup_sb=0 -E packed_meta_blocks=1 -O  64bit -O extents -O bigalloc -O ^dir_index -O dir_nlink -O ea_inode -O ^encrypt -O ext_attr -O ^extra_isize -O ^flex_bg -O huge_file -O ^inline_data -O ^large_dir -O ^metadata_csum -O ^meta_bg -O mmp -O ^quota -O resize_inode -O sparse_super -O ^uninit_bg -O ^verity",
-				"-b 1024 -I 256 -E lazy_itable_init=1 -E num_backup_sb=0 -E packed_meta_blocks=1 -O  64bit -O extents -O bigalloc -O ^dir_index -O dir_nlink -O ea_inode -O ^encrypt -O ext_attr -O ^extra_isize -O ^flex_bg -O huge_file -O inline_data -O ^large_dir -O ^metadata_csum -O ^meta_bg -O mmp -O ^quota -O resize_inode -O sparse_super -O ^uninit_bg -O ^verity",
-				"-b 1024 -I 256 -E lazy_itable_init=1 -E num_backup_sb=1 -E packed_meta_blocks=0 -O ^64bit -O ^extents -O ^bigalloc -O dir_index -O ^dir_nlink -O ea_inode -O encrypt -O ^ext_attr -O ^extra_isize -O ^flex_bg -O huge_file -O inline_data -O ^large_dir -O ^metadata_csum -O ^meta_bg -O ^mmp -O ^quota -O ^resize_inode -O sparse_super2 -O uninit_bg -O ^verity -j -J size=1024",
-				"-b 1024 -I 512 -E lazy_itable_init=1 -E num_backup_sb=1 -E packed_meta_blocks=0 -O ^64bit -O ^extents -O ^bigalloc -O dir_index -O ^dir_nlink -O ea_inode -O encrypt -O ^ext_attr -O ^extra_isize -O ^flex_bg -O huge_file -O inline_data -O ^large_dir -O ^metadata_csum -O ^meta_bg -O ^mmp -O ^quota -O ^resize_inode -O sparse_super2 -O uninit_bg -O ^verity",
-				"-b 2048 -I 128 -E lazy_itable_init=0 -E num_backup_sb=0 -E packed_meta_blocks=0 -O ^64bit -O extents -O ^bigalloc -O ^dir_index -O dir_nlink -O ea_inode -O ^encrypt -O ext_attr -O extra_isize -O flex_bg -O ^huge_file -O ^inline_data -O large_dir -O ^metadata_csum -O meta_bg -O mmp -O quota -O ^resize_inode -O ^sparse_super -O ^uninit_bg -O ^verity",
-				"-b 2048 -I 256 -E lazy_itable_init=0 -E num_backup_sb=1 -E packed_meta_blocks=1 -O  64bit -O extents -O bigalloc -O ^dir_index -O ^dir_nlink -O ^ea_inode -O encrypt -O ext_attr -O ^extra_isize -O flex_bg -O ^huge_file -O ^inline_data -O large_dir -O ^metadata_csum -O meta_bg -O ^mmp -O quota -O ^resize_inode -O ^sparse_super -O uninit_bg -O ^verity -j -J size=1024",
-				"-b 2048 -I 1024 -E lazy_itable_init=0 -E num_backup_sb=1 -E packed_meta_blocks=1 -O  64bit -O extents -O bigalloc -O ^dir_index -O ^dir_nlink -O ^ea_inode -O encrypt -O ext_attr -O ^extra_isize -O flex_bg -O ^huge_file -O inline_data -O large_dir -O ^metadata_csum -O meta_bg -O ^mmp -O quota -O ^resize_inode -O ^sparse_super -O uninit_bg -O ^verity",
-				"-b 2048 -I 128 -E lazy_itable_init=1 -E num_backup_sb=0 -E packed_meta_blocks=1 -O  64bit -O extents -O bigalloc -O ^dir_index -O dir_nlink -O ea_inode -O ^encrypt -O ext_attr -O ^extra_isize -O ^flex_bg -O huge_file -O ^inline_data -O ^large_dir -O ^metadata_csum -O ^meta_bg -O mmp -O ^quota -O resize_inode -O sparse_super -O ^uninit_bg -O ^verity",
-				"-b 2048 -I 256 -E lazy_itable_init=1 -E num_backup_sb=0 -E packed_meta_blocks=1 -O  64bit -O extents -O bigalloc -O ^dir_index -O dir_nlink -O ea_inode -O ^encrypt -O ext_attr -O ^extra_isize -O ^flex_bg -O huge_file -O inline_data -O ^large_dir -O ^metadata_csum -O ^meta_bg -O mmp -O ^quota -O resize_inode -O sparse_super -O ^uninit_bg -O ^verity -j -J size=1024",
-				"-b 2048 -I 256 -E lazy_itable_init=1 -E num_backup_sb=1 -E packed_meta_blocks=0 -O ^64bit -O ^extents -O ^bigalloc -O dir_index -O ^dir_nlink -O ea_inode -O encrypt -O ^ext_attr -O ^extra_isize -O ^flex_bg -O huge_file -O inline_data -O ^large_dir -O ^metadata_csum -O ^meta_bg -O ^mmp -O ^quota -O ^resize_inode -O sparse_super2 -O uninit_bg -O ^verity",
-				"-b 2048 -I 512 -E lazy_itable_init=1 -E num_backup_sb=1 -E packed_meta_blocks=0 -O ^64bit -O ^extents -O ^bigalloc -O dir_index -O ^dir_nlink -O ea_inode -O ^encrypt -O ^ext_attr -O ^extra_isize -O ^flex_bg -O huge_file -O inline_data -O ^large_dir -O ^metadata_csum -O ^meta_bg -O ^mmp -O ^quota -O ^resize_inode -O sparse_super2 -O uninit_bg -O ^verity",
-				"-b 4096 -I 128 -E lazy_itable_init=0 -E num_backup_sb=0 -E packed_meta_blocks=0 -O ^64bit -O extents -O ^bigalloc -O ^dir_index -O dir_nlink -O ea_inode -O ^encrypt -O ext_attr -O extra_isize -O flex_bg -O ^huge_file -O ^inline_data -O large_dir -O ^metadata_csum -O meta_bg -O mmp -O quota -O ^resize_inode -O ^sparse_super -O ^uninit_bg -O ^verity -j -J size=1024",
-				"-b 4096 -I 256 -E lazy_itable_init=0 -E num_backup_sb=1 -E packed_meta_blocks=1 -O  64bit -O extents -O bigalloc -O ^dir_index -O ^dir_nlink -O ^ea_inode -O encrypt -O ext_attr -O ^extra_isize -O flex_bg -O ^huge_file -O ^inline_data -O large_dir -O ^metadata_csum -O meta_bg -O ^mmp -O quota -O ^resize_inode -O ^sparse_super -O uninit_bg -O verity",
-				"-b 4096 -I 1024 -E lazy_itable_init=0 -E num_backup_sb=1 -E packed_meta_blocks=1 -O  64bit -O extents -O bigalloc -O ^dir_index -O ^dir_nlink -O ^ea_inode -O ^encrypt -O ext_attr -O ^extra_isize -O flex_bg -O ^huge_file -O inline_data -O large_dir -O ^metadata_csum -O meta_bg -O ^mmp -O quota -O ^resize_inode -O ^sparse_super -O uninit_bg -O ^verity",
-				"-b 4096 -I 128 -E lazy_itable_init=1 -E num_backup_sb=0 -E packed_meta_blocks=1 -O  64bit -O extents -O bigalloc -O ^dir_index -O dir_nlink -O ea_inode -O ^encrypt -O ext_attr -O ^extra_isize -O ^flex_bg -O huge_file -O ^inline_data -O ^large_dir -O ^metadata_csum -O ^meta_bg -O mmp -O ^quota -O resize_inode -O sparse_super -O ^uninit_bg -O verity -j -J size=1024",
-				"-b 4096 -I 256 -E lazy_itable_init=1 -E num_backup_sb=0 -E packed_meta_blocks=1 -O  64bit -O extents -O bigalloc -O ^dir_index -O dir_nlink -O ea_inode -O ^encrypt -O ext_attr -O ^extra_isize -O ^flex_bg -O huge_file -O inline_data -O ^large_dir -O ^metadata_csum -O ^meta_bg -O mmp -O ^quota -O resize_inode -O sparse_super -O ^uninit_bg -O ^verity",
-				"-b 4096 -I 256 -E lazy_itable_init=1 -E num_backup_sb=1 -E packed_meta_blocks=0 -O ^64bit -O ^extents -O ^bigalloc -O dir_index -O ^dir_nlink -O ea_inode -O ^encrypt -O ^ext_attr -O ^extra_isize -O ^flex_bg -O huge_file -O inline_data -O ^large_dir -O ^metadata_csum -O ^meta_bg -O ^mmp -O ^quota -O ^resize_inode -O sparse_super2 -O uninit_bg -O verity -j -J size=1024",
-				"-b 4096 -I 512 -E lazy_itable_init=1 -E num_backup_sb=1 -E packed_meta_blocks=0 -O ^64bit -O ^extents -O ^bigalloc -O dir_index -O ^dir_nlink -O ea_inode -O encrypt -O ^ext_attr -O ^extra_isize -O ^flex_bg -O huge_file -O inline_data -O ^large_dir -O ^metadata_csum -O ^meta_bg -O ^mmp -O ^quota -O ^resize_inode -O sparse_super2 -O uninit_bg -O ^verity",
+				"-s 512 -c 1024",
+				"-s 512 -c 4096",
+				"-s 1024 -c 4096",
+				"-s 1024 -c 65536",
+				"-s 2048 -c 2048",
+				"-s 2048 -c 4096",
+				"-s 4096 -c 4096",
+				"-s 4096 -c 131072",
 			},
+			{"", "-I"},
+		},
+		Mkfs: func(img *Image) error {
+			_, err := runCmd("mkfs.ntfs", append(img.flags, img.disk)...)
+			return err
+		},
+	},
+	{
+		Name:     "ext4",
+		MinSize:  8 << 20,
+		MaxSeeds: 48,
+		// Mkfs populates the image directly via mkfs.ext4 -d without requiring root/mount.
+		// Note: mkfs.ext4 -d copies file ownership from the template directory, so run the tool
+		// inside syz-env (where the user is mapped to root) or as root to get root-owned files.
+		ReadOnly:  true,
+		MkfsFlags: []string{"-F", "-L", "syzkaller", "-U", "clear", "-N", "256"},
+		MkfsFlagCombinations: [][]string{
+			{
+				"-O has_journal -O ^orphan_file -O ^fast_commit",
+				"-O has_journal -O orphan_file -O ^fast_commit",
+				"-O has_journal -O orphan_file -O fast_commit",
+				"-O ^has_journal -O ^orphan_file -O ^fast_commit",
+			},
+			// Otherwise we get: invalid blocks '^64bit' on device 'num_backup_sb=0'.
+			// And: "Extents MUST be enabled for a 64-bit filesystem. Pass -O extents to rectify".
+			{
+				"-O 64bit -O sparse_super2 -E num_backup_sb=1 -O extents",
+				"-O ^64bit -O ^sparse_super2 -E num_backup_sb=0 -O extents",
+				"-O ^64bit -O ^sparse_super2 -E num_backup_sb=0 -O ^extents",
+			},
+			// Place bigalloc after extents so -O extents re-enables extents when needed.
+			// Small -g values split the 8 MiB images into several block groups.
+			{
+				"-b 1024 -g 2048 -O ^bigalloc",
+				"-b 2048 -g 1024 -O ^bigalloc",
+				"-b 4096 -O ^bigalloc",
+				"-b 4096 -g 512 -O ^bigalloc",
+				"-b 4096 -O bigalloc -O extents",
+				"-b 4096 -C 16384 -O bigalloc -O extents",
+			},
+			{
+				"-O metadata_csum -O ^metadata_csum_seed -O ^uninit_bg",
+				"-O metadata_csum -O metadata_csum_seed -O ^uninit_bg",
+				"-O ^metadata_csum -O ^metadata_csum_seed -O uninit_bg",
+				"-O ^metadata_csum -O ^metadata_csum_seed -O ^uninit_bg",
+			},
+			// The resize_inode and meta_bg features are not compatible, and reserved
+			// online resize blocks are not supported on non-sparse filesystems.
+			{
+				"-O ^meta_bg -O resize_inode -O sparse_super",
+				"-O meta_bg -O ^resize_inode -O sparse_super",
+				"-O meta_bg -O ^resize_inode -O ^sparse_super",
+				"-O ^meta_bg -O ^resize_inode -O ^sparse_super",
+			},
+			{"-O ^quota -O ^project", "-O quota -O ^project", "-O quota -O project"},
+			{
+				"-O ^encrypt -O ^stable_inodes -O ^verity",
+				"-O encrypt -O ^stable_inodes -O ^verity",
+				"-O encrypt -O stable_inodes -O ^verity",
+				"-O ^encrypt -O ^stable_inodes -O verity -O extents",
+				"-O encrypt -O ^stable_inodes -O verity -O extents",
+			},
+			{
+				"-O ^inline_data -O ^mmp",
+				"-O inline_data -O ^mmp",
+				"-O ^inline_data -O mmp",
+			},
+			{"-O extra_isize", "-O ^extra_isize"},
+			// Place -I after inline_data/extra_isize/project so -I 128 disables features
+			// that require >= 256B inodes without overriding -I on other rows.
+			{"-I 256", "-I 512", "-I 1024", "-I 128 -O ^inline_data -O ^extra_isize -O ^project -O ^encrypt -O ^verity"},
+			{"-O ^casefold", "-O casefold -E encoding=utf8"},
+			{"-E lazy_itable_init=0", "-E lazy_itable_init=1"},
+			{"-E packed_meta_blocks=0", "-E packed_meta_blocks=1"},
+			{"-O dir_index", "-O ^dir_index"},
+			{"-O dir_nlink", "-O ^dir_nlink"},
+			{"-O ^ea_inode", "-O ea_inode"},
+			{"-O flex_bg", "-O ^flex_bg"},
+			{"-O huge_file", "-O ^huge_file"},
+			{"-O ^large_dir", "-O large_dir"},
+		},
+		Mkfs: func(img *Image) error {
+			args := append(slices.Clone(img.flags), "-d", img.templateDir, img.disk)
+			output, err := runCmd("mkfs.ext4", args...)
+			if err != nil {
+				return err
+			}
+			// mkfs.ext4 silently drops has_journal (and still exits 0) when the image has
+			// fewer than 2048 blocks. Turn that into an error so that generate() retries
+			// with a doubled image size instead of emitting a journal-less seed. 8 MiB
+			// images with 4K blocks are exactly at that limit.
+			if bytes.Contains(output, []byte("Filesystem too small for a journal")) {
+				return errors.New(string(output))
+			}
+			// mkfs.ext4 -O quota -d leaves quota usage inconsistent with the populated
+			// template directory; reconcile it with e2fsck so every seed passes fsck -n.
+			if _, err := runCmd("e2fsck", "-fy", img.disk); err != nil {
+				var verboseErr *osutil.VerboseError
+				if !errors.As(err, &verboseErr) || verboseErr.ExitCode != 1 {
+					return err
+				}
+			}
+			_, err = runCmd("e2fsck", "-fn", img.disk)
+			return err
 		},
 	},
 	{
@@ -295,8 +405,8 @@ var fileSystems = []FileSystem{
 			{"-b 4096", "-b 8192"},
 			{"-N big", "-N little"},
 		},
-		Mkfs: func(image *Image) error {
-			_, err := runCmd("mkfs.cramfs", append(image.flags, image.templateDir, image.disk)...)
+		Mkfs: func(img *Image) error {
+			_, err := runCmd("mkfs.cramfs", append(img.flags, img.templateDir, img.disk)...)
 			return err
 		},
 	},
@@ -308,8 +418,8 @@ var fileSystems = []FileSystem{
 		MkfsFlagCombinations: [][]string{
 			{"-a 16", "-a 256"},
 		},
-		Mkfs: func(image *Image) error {
-			_, err := runCmd("genromfs", append(image.flags, "-f", image.disk, "-d", image.templateDir)...)
+		Mkfs: func(img *Image) error {
+			_, err := runCmd("genromfs", append(img.flags, "-f", img.disk, "-d", img.templateDir)...)
 			return err
 		},
 	},
@@ -320,12 +430,12 @@ var fileSystems = []FileSystem{
 		ReadOnly:  true,
 		MkfsFlags: []string{"-T1000"},
 		MkfsFlagCombinations: [][]string{
-			{"-z lz4,1", "-z lz4,9", "-z lz4hc,1", "-z lz4hc,9"},
+			{"-z lz4", "-z lz4hc,1", "-z lz4hc,9"},
 			{"-x 1", "-x 2"},
 			{"", "-E legacy-compress"},
 		},
-		Mkfs: func(image *Image) error {
-			_, err := runCmd("mkfs.erofs", append(image.flags, image.disk, image.templateDir)...)
+		Mkfs: func(img *Image) error {
+			_, err := runCmd("mkfs.erofs", append(img.flags, img.disk, img.templateDir)...)
 			return err
 		},
 	},
@@ -353,8 +463,8 @@ var fileSystems = []FileSystem{
 				"-t cd9660 -o rockridge",
 			},
 		},
-		Mkfs: func(image *Image) error {
-			_, err := runCmd("makefs", append(image.flags, image.disk, image.templateDir)...)
+		Mkfs: func(img *Image) error {
+			_, err := runCmd("makefs", append(img.flags, img.disk, img.templateDir)...)
 			return err
 		},
 	},
@@ -379,8 +489,8 @@ var fileSystems = []FileSystem{
 				"-m cdrw -r 1.50 --space=unalloctable --ad=long",
 				"-m cdrw -r 2.01",
 				"-m dvdrw -r 1.50 --space=unallocbitmap --ad=short",
-				"-m dvdrw -r 2.01 --space=unalloctable --noefe",
-				"-m dvdrw -r 2.01",
+				"-m dvdrw -r 2.01 --sparspace=512 --space=unalloctable --noefe",
+				"-m dvdrw -r 2.01 --sparspace=512",
 				"-m dvdram -r 1.50  --ad=long",
 				"-m dvdram -r 2.01 ",
 				"-m dvdram -r 2.01 --space=unallocbitmap  --ad=long",
@@ -397,8 +507,8 @@ var fileSystems = []FileSystem{
 			{"--little-endian", "--big-endian"},
 			{"--compression-mode=none", "--compression-mode=size"},
 		},
-		Mkfs: func(image *Image) error {
-			_, err := runCmd("mkfs.jffs2", append(image.flags, "-o", image.disk, "--root", image.templateDir)...)
+		Mkfs: func(img *Image) error {
+			_, err := runCmd("mkfs.jffs2", append(img.flags, "-o", img.disk, "--root", img.templateDir)...)
 			return err
 		},
 	},
@@ -420,9 +530,9 @@ var fileSystems = []FileSystem{
 			{"", "-noI -noX", "-noI -noD -noF -noX"},
 			{"-no-fragments", "-always-use-fragments -nopad"},
 		},
-		Mkfs: func(image *Image) error {
-			os.Remove(image.disk)
-			_, err := runCmd("mksquashfs", append([]string{image.templateDir, image.disk}, image.flags...)...)
+		Mkfs: func(img *Image) error {
+			os.Remove(img.disk)
+			_, err := runCmd("mksquashfs", append([]string{img.templateDir, img.disk}, img.flags...)...)
 			return err
 		},
 	},
@@ -436,11 +546,90 @@ var fileSystems = []FileSystem{
 			{"-pad", "-no-pad"},
 			{"", "-hfs", "-apple -r"},
 		},
-		Mkfs: func(image *Image) error {
-			_, err := runCmd("genisoimage", append(image.flags, "-o", image.disk, image.templateDir)...)
+		Mkfs: func(img *Image) error {
+			_, err := runCmd("genisoimage", append(img.flags, "-o", img.disk, img.templateDir)...)
 			return err
 		},
 	},
+	{
+		Name:    "hfs",
+		MinSize: 16 << 10,
+		MkfsFlagCombinations: [][]string{
+			{"", "-P"},
+			{"", "-c a=1024,b=512,c=128,d=256"},
+		},
+	},
+	{
+		Name:    "hfsplus",
+		MinSize: 512 << 10,
+		MkfsFlagCombinations: [][]string{
+			{"", "-P"},
+			{"", "-s"},
+			{"-b 512", "-b 1024", "-b 2048"},
+		},
+	},
+	{
+		Name:    "bcachefs",
+		MinSize: 512 << 10,
+		MkfsFlagCombinations: [][]string{
+			{"", "--encrypted --no_passphrase"},
+			{"", "--compression=lz4"},
+			{"", "--data_checksum=none --metadata_checksum=none"},
+		},
+	},
+	{
+		Name:     parttable,
+		MinSize:  1 << 20,
+		ReadOnly: true,
+		MkfsFlagCombinations: [][]string{{
+			// You can test/explore these commands with:
+			// $ rm -f disk && touch disk && fallocate -l 16M disk && fdisk disk
+			"g n 1 34 47 n 2 48 96 n 3 97 2013 t 1 uefi t 2 linux t 3 swap w",
+			"g n 1 100 200 n 2 50 80 n 3 1000 1900 M a c r x n 1 syzkaller A 1 r w",
+			"g n 3 200 300 n 7 400 500 n 2 600 700 x l 700 r w",
+			"G n 1 16065 16265 w",
+			"G n 16 20000 30000 i w",
+			"o n p 1 2048 4096 n p 3 4097 4100 n e 2 4110 4200 a 1 t 2 a5 t 3 uefi b y x 1 e r w",
+			"o n p 1 2048 3071 n e 3 3072 32767 n 6200 7999 n 10240 20000 w",
+			"s c 1 a 2 w",
+		}},
+		Mkfs: func(img *Image) error {
+			cmd := exec.Command("fdisk", "--noauto-pt", "--color=always", img.disk)
+			cmd.Stdin = strings.NewReader(strings.Join(img.flags, "\n"))
+			output, err := osutil.Run(10*time.Minute, cmd)
+			if err != nil {
+				return err
+			}
+			// It's hard to understand if any of the commands fail,
+			// fdisk does not exit with an error and print assorted error messages.
+			// So instead we run it with --color=always and grep for red color marker
+			// in the output (ESC[31m).
+			if bytes.Contains(output, []byte{0x1b, 0x5b, 0x33, 0x31, 0x6d}) {
+				return errors.New(string(output))
+			}
+			return err
+		},
+	},
+}
+
+const (
+	syzMountImage    = "syz_mount_image"
+	syzReadPartTable = "syz_read_part_table"
+	parttable        = "parttable"
+)
+
+func (fs FileSystem) filePrefix() string {
+	if fs.Name == parttable {
+		return syzReadPartTable
+	}
+	return syzMountImage + "_" + fs.suffix()
+}
+
+func (fs FileSystem) suffix() string {
+	if fs.SyscallSuffix != "" {
+		return fs.SyscallSuffix
+	}
+	return fs.Name
 }
 
 // Image represents one image we generate for a file system.
@@ -456,6 +645,14 @@ type Image struct {
 	done        chan error
 }
 
+func (img *Image) String() string {
+	size := fmt.Sprintf("%vKB", img.size>>10)
+	if img.size >= 1<<20 {
+		size = fmt.Sprintf("%vMB", img.size>>20)
+	}
+	return fmt.Sprintf("#%02v: mkfs.%v[%5v] %v", img.index, img.fs.Name, size, img.flags)
+}
+
 var errShutdown = errors.New("shutdown")
 
 func main() {
@@ -465,7 +662,8 @@ func main() {
 		flagDebug     = flag.Bool("debug", false, "print lots of debugging output")
 		flagPopulate  = flag.String("populate", "", "populate the specified image with files (for internal use)")
 		flagKeepImage = flag.Bool("keep", false, "save disk images as .img files")
-		flagFS        = flag.String("fs", "", "generate images only for this single filesystem")
+		flagFS        = flag.String("fs", "", "comma-separated list of filesystems to generate, all if empty")
+		flagFromJSON  = flag.String("from_json", "", "load the fs config from the file and generate seeds for it")
 	)
 	flag.Parse()
 	if *flagDebug {
@@ -481,6 +679,13 @@ func main() {
 	if err != nil {
 		tool.Fail(err)
 	}
+	if *flagFromJSON != "" {
+		fs := loadFilesystem(*flagFromJSON)
+		fileSystems = append(fileSystems, fs)
+		// Generate seeds only for the specific filesystem.
+		*flagFS = fs.suffix()
+	}
+	addEmptyImages(target)
 	images, err := generateImages(target, *flagFS, *flagList)
 	if err != nil {
 		tool.Fail(err)
@@ -489,7 +694,7 @@ func main() {
 		return
 	}
 	// Create a single template dir for file systems that need the root dir at creation time.
-	templateDir, err := ioutil.TempDir("", "syz-imagegen")
+	templateDir, err := os.MkdirTemp("", "syz-imagegen")
 	if err != nil {
 		tool.Fail(err)
 	}
@@ -502,20 +707,20 @@ func main() {
 	procs := runtime.NumCPU()
 	requests := make(chan *Image, procs)
 	go func() {
-		for _, image := range images {
-			image.templateDir = templateDir
-			requests <- image
+		for _, img := range images {
+			img.templateDir = templateDir
+			requests <- img
 		}
 		close(requests)
 	}()
-	for p := 0; p < procs; p++ {
+	for range procs {
 		go func() {
-			for image := range requests {
+			for img := range requests {
 				select {
 				case <-shutdown:
-					image.done <- errShutdown
+					img.done <- errShutdown
 				default:
-					image.done <- image.generate()
+					img.done <- img.generate()
 				}
 			}
 		}()
@@ -523,13 +728,57 @@ func main() {
 	printResults(images, shutdown, *flagKeepImage, *flagVerbose)
 }
 
+func addEmptyImages(target *prog.Target) {
+	// Since syz_mount_image calls are no_generate we need to add at least some
+	// empty seeds for all the filesystems.
+	have := make(map[string]bool)
+	for _, fs := range fileSystems {
+		have[fs.Name] = true
+	}
+	for _, call := range target.Syscalls {
+		if call.CallName != syzMountImage {
+			continue
+		}
+		name := call.Attrs.Filesystem
+		if name == "" {
+			name = strings.TrimPrefix(call.Name, syzMountImage+"$")
+		}
+		if have[name] {
+			continue
+		}
+		fileSystems = append(fileSystems, FileSystem{
+			Name:      name,
+			MinSize:   64 << 10,
+			ReadOnly:  true,
+			MkfsFlags: []string{"fake image"},
+			Mkfs: func(img *Image) error {
+				// Fill the image with unique 4-byte values.
+				// This allows hints mutation to easily guess magic numbers and checksums.
+				f, err := os.Create(img.disk)
+				if err != nil {
+					return err
+				}
+				defer f.Close()
+				buf := bufio.NewWriter(f)
+				defer buf.Flush()
+				for i := uint32(0); i < uint32(img.size/int(unsafe.Sizeof(i))); i++ {
+					if err := binary.Write(buf, binary.LittleEndian, i+0x7b3184b5); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+		})
+	}
+}
+
 func printResults(images []*Image, shutdown chan struct{}, keepImage, verbose bool) {
 	good, failed := 0, 0
 	hashes := make(map[uint32][]*Image)
-	for _, image := range images {
-		err := <-image.done
-		if image.disk != "" && !keepImage {
-			os.Remove(image.disk)
+	for _, img := range images {
+		err := <-img.done
+		if img.disk != "" && !keepImage {
+			os.Remove(img.disk)
 		}
 		select {
 		case <-shutdown:
@@ -539,34 +788,30 @@ func printResults(images []*Image, shutdown chan struct{}, keepImage, verbose bo
 		if err == errShutdown {
 			continue
 		}
-		size := fmt.Sprintf("%vKB", image.size>>10)
-		if image.size >= 1<<20 {
-			size = fmt.Sprintf("%vMB", image.size>>20)
-		}
 		res := "ok"
 		if err != nil {
 			res = fmt.Sprintf("failed:\n\t%v", err)
 		}
 		if verbose || err != nil {
-			fmt.Printf("#%02v: mkfs.%v[%5v] %v: %v\n", image.index, image.fs.Name, size, image.flags, res)
+			fmt.Printf("%v: %v\n", img, res)
 		}
 		if err != nil {
 			failed++
 			continue
 		}
-		hashes[image.hash] = append(hashes[image.hash], image)
+		hashes[img.hash] = append(hashes[img.hash], img)
 		good++
 	}
 	fmt.Printf("generated images: %v/%v\n", good, len(images))
-	for _, image := range images {
-		group := hashes[image.hash]
+	for _, img := range images {
+		group := hashes[img.hash]
 		if len(group) <= 1 {
 			continue
 		}
-		delete(hashes, image.hash)
+		delete(hashes, img.hash)
 		fmt.Printf("equal images:\n")
-		for _, image := range group {
-			fmt.Printf("\tmkfs.%v %v\n", image.fs.Name, image.flags)
+		for _, img := range group {
+			fmt.Printf("\tmkfs.%v %v\n", img.fs.Name, img.flags)
 		}
 	}
 	if failed != 0 {
@@ -577,106 +822,114 @@ func printResults(images []*Image, shutdown chan struct{}, keepImage, verbose bo
 func generateImages(target *prog.Target, flagFS string, list bool) ([]*Image, error) {
 	var images []*Image
 	for _, fs := range fileSystems {
-		if flagFS != "" && flagFS != fs.Name {
+		if flagFS != "" && !strings.Contains(","+flagFS+",", ","+fs.suffix()+",") {
 			continue
 		}
-		index := 0
-		enumerateFlags(target, &images, &index, fs, fs.MkfsFlags, 0)
+		newImages := enumerateFlags(target, fs)
+		images = append(images, newImages...)
 		if list {
-			fmt.Printf("%v [%v images]\n", fs.Name, index)
+			fmt.Printf("%v [%v images]\n", fs.Name, len(newImages))
+			for i, image := range newImages {
+				fmt.Printf("#%d: %q\n", i, image.flags)
+			}
 			continue
 		}
-		files, err := filepath.Glob(filepath.Join("sys", targets.Linux, "test", "syz_mount_image_"+fs.Name+"_*"))
+		files, err := filepath.Glob(filepath.Join("sys", targets.Linux, "test", fs.filePrefix()+"_*"))
 		if err != nil {
-			return nil, fmt.Errorf("error reading output dir: %v", err)
+			return nil, fmt.Errorf("error reading output dir: %w", err)
 		}
 		for _, file := range files {
 			if err := os.Remove(file); err != nil {
-				return nil, fmt.Errorf("error removing output file: %v", err)
+				return nil, fmt.Errorf("error removing output file: %w", err)
 			}
 		}
+	}
+	for i, image := range images {
+		image.index = i
 	}
 	return images, nil
 }
 
-func enumerateFlags(target *prog.Target, images *[]*Image, index *int, fs FileSystem, flags []string, flagsIndex int) {
-	if flagsIndex == len(fs.MkfsFlagCombinations) {
-		*images = append(*images, &Image{
-			target: target,
-			fs:     fs,
-			flags:  append([]string{}, flags...),
-			index:  *index,
-			done:   make(chan error, 1),
-		})
-		*index++
-		return
-	}
-	for _, flag := range fs.MkfsFlagCombinations[flagsIndex] {
-		flags1 := flags
-		for _, f := range strings.Split(flag, " ") {
-			if f != "" {
-				flags1 = append(flags1, f)
+func enumerateFlags(target *prog.Target, fs FileSystem) []*Image {
+	var images []*Image
+	for _, flags := range CoveringArray(fs.MkfsFlagCombinations, fs.MaxSeeds) {
+		imageFlags := slices.Clone(fs.MkfsFlags)
+		for _, rawFlag := range flags {
+			for f := range strings.SplitSeq(rawFlag, " ") {
+				if f == "" {
+					continue
+				}
+				imageFlags = append(imageFlags, f)
 			}
 		}
-		enumerateFlags(target, images, index, fs, flags1, flagsIndex+1)
+		images = append(images, &Image{
+			target: target,
+			fs:     fs,
+			flags:  imageFlags,
+			done:   make(chan error, 1),
+		})
 	}
+	return images
 }
 
-func (image *Image) generate() error {
+func (img *Image) generate() error {
 	var err error
-	for image.size = image.fs.MinSize; image.size <= 128<<20; image.size *= 2 {
-		if err = image.generateSize(); err == nil {
+	for img.size = img.fs.MinSize; img.size <= 128<<20; img.size *= 2 {
+		if err = img.generateSize(); err == nil {
 			return nil
 		}
 	}
 	return err
 }
 
-func (image *Image) generateSize() error {
+func (img *Image) generateSize() error {
 	outFile := filepath.Join("sys", targets.Linux, "test",
-		fmt.Sprintf("syz_mount_image_%v_%v", image.fs.Name, image.index))
-	image.disk = outFile + ".img"
-	f, err := os.Create(image.disk)
+		fmt.Sprintf("%v_%v", img.fs.filePrefix(), img.index))
+	img.disk = outFile + ".img"
+	f, err := os.Create(img.disk)
 	if err != nil {
 		return err
 	}
 	f.Close()
-	if err := os.Truncate(image.disk, int64(image.size)); err != nil {
+	if err := os.Truncate(img.disk, int64(img.size)); err != nil {
 		return err
 	}
-	if image.fs.Mkfs == nil {
-		if _, err := runCmd("mkfs."+image.fs.Name, append(image.flags, image.disk)...); err != nil {
+	if img.fs.Mkfs == nil {
+		if _, err := runCmd("mkfs."+img.fs.Name, append(img.flags, img.disk)...); err != nil {
 			return err
 		}
 	} else {
-		if err := image.fs.Mkfs(image); err != nil {
+		if err := img.fs.Mkfs(img); err != nil {
 			return err
 		}
 	}
-	if !image.fs.ReadOnly {
+	if !img.fs.ReadOnly {
 		// This does not work with runCmd -- sudo does not show password prompt on console.
-		cmd := exec.Command("sudo", os.Args[0], "-populate", image.disk, "-fs", image.fs.Name)
+		cmd := exec.Command("sudo", os.Args[0], "-populate", img.disk, "-fs", img.fs.Name)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("image population failed: %v\n%s", err, out)
+			return fmt.Errorf("image population failed: %w\n%s", err, out)
 		}
 	}
-	data, err := ioutil.ReadFile(image.disk)
+	data, err := os.ReadFile(img.disk)
 	if err != nil {
 		return err
 	}
-	image.hash = crc32.ChecksumIEEE(data)
-	out, err := writeImage(image.fs, data)
+	img.hash = crc32.ChecksumIEEE(data)
+
+	// Write out image *with* change of directory.
+	out, err := writeImage(img, data)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to write image: %w", err)
 	}
-	p, err := image.target.Deserialize(out, prog.Strict)
+
+	p, err := img.target.Deserialize(out, prog.Strict)
 	if err != nil {
-		return fmt.Errorf("failed to deserialize resulting program: %v", err)
+		return fmt.Errorf("failed to deserialize resulting program: %w", err)
 	}
-	exec := make([]byte, prog.ExecBufferSize)
-	if _, err := p.SerializeForExec(exec); err != nil {
-		return fmt.Errorf("failed to serialize for execution: %v", err)
+	if _, err := p.SerializeForExec(); err != nil {
+		return fmt.Errorf("failed to serialize for execution: %w", err)
 	}
+
 	return osutil.WriteFile(outFile, out)
 }
 
@@ -689,13 +942,13 @@ func populate(disk, fs string) error {
 	loop := strings.TrimSpace(string(output))
 	defer runCmd("losetup", "-d", loop)
 
-	dir, err := ioutil.TempDir("", "syz-imagegen")
+	dir, err := os.MkdirTemp("", "syz-imagegen")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(dir)
 	if _, err := runCmd("mount", "-t", fs, loop, dir); err != nil {
-		return fmt.Errorf("%v\n%s", err, output)
+		return fmt.Errorf("%w\n%s", err, output)
 	}
 	defer runCmd("umount", dir)
 	return populateDir(dir)
@@ -712,23 +965,23 @@ func populateDir(dir string) error {
 	if err := os.Mkdir(filepath.Join(dir, "file0"), 0777); err != nil {
 		return err
 	}
-	if err := ioutil.WriteFile(filepath.Join(dir, "file0", "file0"), nonzeros(1050), 0777); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "file0", "file0"), nonzeros(1050), 0777); err != nil {
 		return err
 	}
 	os.Symlink(filepath.Join(dir, "file0", "file0"), filepath.Join(dir, "file0", "file1"))
-	if err := ioutil.WriteFile(filepath.Join(dir, "file1"), nonzeros(10), 0777); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "file1"), nonzeros(10), 0777); err != nil {
 		return err
 	}
 	// Note: some errors are not checked because some file systems don't have support for links/attrs.
 	// TODO: does it make sense to create other attribute types (system./trusted./security./btrfs.)?
 	syscall.Setxattr(filepath.Join(dir, "file1"), "user.xattr1", []byte("xattr1"), 0)
 	syscall.Setxattr(filepath.Join(dir, "file1"), "user.xattr2", []byte("xattr2"), 0)
-	if err := ioutil.WriteFile(filepath.Join(dir, "file2"), zeros(9000), 0777); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "file2"), zeros(9000), 0777); err != nil {
 		return err
 	}
 	os.Link(filepath.Join(dir, "file2"), filepath.Join(dir, "file3"))
 	// f2fs considers .cold extension specially.
-	if err := ioutil.WriteFile(filepath.Join(dir, "file.cold"), nonzeros(100), 0777); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "file.cold"), nonzeros(100), 0777); err != nil {
 		return err
 	}
 	return nil
@@ -738,81 +991,35 @@ func runCmd(cmd string, args ...string) ([]byte, error) {
 	return osutil.RunCmd(10*time.Minute, "", cmd, args...)
 }
 
-func writeImage(fs FileSystem, data []byte) ([]byte, error) {
+func writeImage(img *Image, data []byte) ([]byte, error) {
 	buf := new(bytes.Buffer)
 	fmt.Fprintf(buf, "# Code generated by tools/syz-imagegen. DO NOT EDIT.\n")
 	fmt.Fprintf(buf, "# requires: manual\n\n")
-	segs := calculateSegments(data)
-	fmt.Fprintf(buf, `syz_mount_image$%v(&(0x7f0000000000)='%v\x00', &(0x7f0000000100)='./file0\x00',`+
-		` 0x%x, 0x%x, &(0x7f0000000200)=[`,
-		fs.Name, fs.Name, len(data), len(segs))
-	addr := 0x7f0000010000
-	for i, seg := range segs {
-		if i != 0 {
-			fmt.Fprintf(buf, ", ")
-		}
-		fmt.Fprintf(buf, `{&(0x%x)="%v", 0x%x, 0x%x}`,
-			addr, hex.EncodeToString(seg.data), len(seg.data), seg.offset)
-		addr += len(seg.data)
+	fmt.Fprintf(buf, "# %v\n\n", img)
+	compressedData := image.Compress(data)
+	b64Data := image.EncodeB64(compressedData)
+	if img.fs.Name == parttable {
+		fmt.Fprintf(buf, `%s(AUTO, &AUTO="$`, syzReadPartTable)
+	} else {
+		fmt.Fprintf(buf, `%s$%v(&AUTO='%v\x00', &AUTO='./file0\x00', 0x0, &AUTO, 0x1, AUTO, &AUTO="$`,
+			syzMountImage, img.fs.suffix(), img.fs.Name)
 	}
-	fmt.Fprintf(buf, "], 0x0, &(0x%x))\n", addr)
+	buf.Write(b64Data)
+	fmt.Fprintf(buf, "\")\n")
+
 	return buf.Bytes(), nil
 }
 
-type Segment struct {
-	offset int
-	data   []byte
-}
-
-func calculateSegments(data []byte) []Segment {
-	const (
-		skip  = 32 // min zero bytes to skip
-		align = 32 // non-zero block alignment
-	)
-	data0 := data
-	zeros := make([]byte, skip+align)
-	var segs []Segment
-	offset := 0
-	for len(data) != 0 {
-		pos := bytes.Index(data, zeros)
-		if pos == -1 {
-			segs = append(segs, Segment{offset, data})
-			break
-		}
-		pos = (pos + align - 1) & ^(align - 1)
-		if pos != 0 {
-			segs = append(segs, Segment{offset, data[:pos]})
-		}
-		for pos < len(data) && data[pos] == 0 {
-			pos++
-		}
-		pos = pos & ^(align - 1)
-		offset += pos
-		data = data[pos:]
+func loadFilesystem(fileName string) FileSystem {
+	file, err := os.Open(fileName)
+	if err != nil {
+		tool.Fail(err)
 	}
-	if false {
-		// self-test.
-		restored := make([]byte, len(data0))
-		for _, seg := range segs {
-			copy(restored[seg.offset:], seg.data)
-		}
-		if !bytes.Equal(data0, restored) {
-			panic("restored data differs!")
-		}
+	defer file.Close()
+	var fs FileSystem
+	err = json.NewDecoder(file).Decode(&fs)
+	if err != nil {
+		tool.Failf("failed to parse JSON: %v", err)
 	}
-	return segs
+	return fs
 }
-
-// TODO: also generate syz_read_part_table tests:
-//	fmt.Printf(`syz_read_part_table(0x%x, 0x%x, &(0x7f0000000200)=[`,
-//		len(data0), len(segs))
-//	addr := 0x7f0000010000
-//	for i, seg := range segs {
-//		if i != 0 {
-//			fmt.Printf(", ")
-//		}
-//		fmt.Printf(`{&(0x%x)="%v", 0x%x, 0x%x}`,
-//			addr, hex.EncodeToString(seg.data), len(seg.data), seg.offset)
-//		addr = (addr + len(seg.data) + 0xff) & ^0xff
-//	}
-//	fmt.Printf("])\n")

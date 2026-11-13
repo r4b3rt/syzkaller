@@ -6,14 +6,13 @@ package ifuzz
 import (
 	"encoding/hex"
 	"math/rand"
-	"os"
 	"testing"
-	"time"
 
 	"github.com/google/syzkaller/pkg/ifuzz/iset"
+	"github.com/google/syzkaller/pkg/testutil"
 )
 
-var allArches = []string{ArchX86, ArchPowerPC}
+var allArches = []string{ArchX86, ArchPowerPC, ArchArm64, ArchRiscv64}
 
 func TestMode(t *testing.T) {
 	for _, arch := range allArches {
@@ -25,9 +24,9 @@ func TestMode(t *testing.T) {
 
 func testMode(t *testing.T, arch string) {
 	all := make(map[iset.Insn]bool)
-	for mode := iset.Mode(0); mode < iset.ModeLast; mode++ {
-		for priv := 0; priv < 2; priv++ {
-			for exec := 0; exec < 2; exec++ {
+	for mode := range iset.ModeLast {
+		for priv := range 2 {
+			for exec := range 2 {
 				insns := allInsns(arch, mode, priv != 0, exec != 0)
 				t.Logf("mode=%v priv=%v exec=%v: %v instructions", mode, priv, exec, len(insns))
 				for _, insn := range insns {
@@ -53,15 +52,10 @@ func testDecode(t *testing.T, arch string) {
 	if _, err := insnset.DecodeExt(0, nil); err == nil {
 		xedEnabled = true
 	}
-	seed := time.Now().UnixNano()
-	if os.Getenv("CI") != "" {
-		seed = 0 // required for deterministic coverage reports
-	}
-	t.Logf("seed=%v", seed)
-	r := rand.New(rand.NewSource(seed))
+	r := rand.New(testutil.RandSource(t))
 
-	for repeat := 0; repeat < 10; repeat++ {
-		for mode := iset.Mode(0); mode < iset.ModeLast; mode++ {
+	for range 10 {
+		for mode := range iset.ModeLast {
 			cfg := &iset.Config{
 				Mode: mode,
 				Priv: true,
@@ -117,6 +111,46 @@ func testDecode(t *testing.T, arch string) {
 			}
 			if failed {
 				return
+			}
+		}
+	}
+}
+
+func TestGenerate(t *testing.T) {
+	for _, arch := range allArches {
+		t.Run(arch, func(t *testing.T) {
+			testGenerate(t, arch)
+		})
+	}
+}
+
+func testGenerate(t *testing.T, arch string) {
+	insnset := iset.Arches[arch]
+	r := rand.New(testutil.RandSource(t))
+	for mode := range iset.ModeLast {
+		for repeat := 1; repeat < 10; repeat++ {
+			if len(insnset.GetInsns(mode, iset.TypeUser)) == 0 {
+				continue
+			}
+			cfg := &iset.Config{
+				Arch: arch,
+				Mode: mode,
+				Priv: true,
+				Exec: true,
+				Len:  repeat,
+			}
+			if arch == ArchRiscv64 {
+				cfg.Priv = false
+				cfg.Exec = false
+			}
+			text := Generate(cfg, r)
+			for len(text) != 0 {
+				size, err := insnset.Decode(mode, text)
+				if size == 0 || err != nil {
+					t.Errorf("failed to decode text: % x", text)
+					break
+				}
+				text = text[size:]
 			}
 		}
 	}

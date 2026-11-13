@@ -1,6 +1,9 @@
 // Copyright 2020 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+#ifndef EXECUTOR_COMMON_KVM_PPC64_H
+#define EXECUTOR_COMMON_KVM_PPC64_H
+
 // This file is shared between executor and csource package.
 
 // Implementation of syz_kvm_setup_cpu pseudo-syscall.
@@ -53,40 +56,14 @@
 #define LPCR_UPRT PPC_BIT(41) // Use Process Table
 #define LPCR_EVIRT PPC_BIT(42) // Enhanced Virtualisation
 #define LPCR_HR PPC_BIT(43) // Host Radix
-#ifndef KVM_REG_PPC_LPCR_64
-#define KVM_REG_PPC_LPCR_64 (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xb5)
-#endif
 
 #define PRTB_SIZE_SHIFT 12 // log2((64 << 10) / 16)
 #define PATB_GR (1UL << 63) // guest uses radix; must match HR
 #define PATB_HR (1UL << 63)
 #define PRTB_MASK 0x0ffffffffffff000UL
 
-#define ALIGNUP(p, q) ((void*)(((unsigned long)(p) + (q)-1) & ~((q)-1)))
+#define ALIGNUP(p, q) ((void*)(((unsigned long)(p) + (q) - 1) & ~((q) - 1)))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
-
-#ifndef KVM_REG_PPC_DEC_EXPIRY
-#define KVM_REG_PPC_DEC_EXPIRY (KVM_REG_PPC | KVM_REG_SIZE_U64 | 0xbe)
-#endif
-
-#ifndef KVM_PPC_CONFIGURE_V3_MMU
-// Available with KVM_CAP_PPC_RADIX_MMU or KVM_CAP_PPC_HASH_MMU_V3
-#define KVM_PPC_CONFIGURE_V3_MMU _IOW(KVMIO, 0xaf, struct kvm_ppc_mmuv3_cfg)
-
-// For KVM_PPC_CONFIGURE_V3_MMU
-struct kvm_ppc_mmuv3_cfg {
-	__u64 flags;
-	__u64 process_table; // second doubleword of partition table entry
-};
-
-// Flag values for KVM_PPC_CONFIGURE_V3_MMU
-#define KVM_PPC_MMUV3_RADIX 1 // 1 = radix mode, 0 = HPT
-#define KVM_PPC_MMUV3_GTSE 2 // global translation shootdown enb
-#endif
-
-#ifndef KVM_CAP_PPC_NESTED_HV
-#define KVM_CAP_PPC_NESTED_HV 160
-#endif
 
 struct kvm_text {
 	uintptr_t typ;
@@ -185,7 +162,7 @@ static volatile long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volat
 	if (kvm_vcpu_enable_cap(cpufd, KVM_CAP_PPC_PAPR))
 		return -1;
 
-	if (kvm_vm_enable_cap(vmfd, KVM_CAP_PPC_NESTED_HV, true, 0))
+	if (kvm_vm_enable_cap(vmfd, KVM_CAP_PPC_NESTED_HV, 1, 0))
 		return -1;
 
 	for (uintptr_t i = 0; i < guest_mem_size / page_size; i++) {
@@ -387,8 +364,8 @@ static volatile long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volat
 	if (kvmppc_set_one_reg(cpufd, KVM_REG_PPC_PID, &pid))
 		return -1;
 
-		// Hypercalls need to be enable so we enable them all here to
-		// allow fuzzing
+	// Hypercalls need to be enable so we enable them all here to
+	// allow fuzzing
 #define MAX_HCALL 0x450
 	for (unsigned hcall = 4; hcall < MAX_HCALL; hcall += 4)
 		kvm_vm_enable_cap(vmfd, KVM_CAP_PPC_ENABLE_HCALL, hcall, 1);
@@ -415,3 +392,5 @@ static volatile long syz_kvm_setup_cpu(volatile long a0, volatile long a1, volat
 
 	return 0;
 }
+
+#endif // EXECUTOR_COMMON_KVM_PPC64_H

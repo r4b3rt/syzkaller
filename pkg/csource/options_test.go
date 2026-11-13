@@ -5,6 +5,7 @@ package csource
 
 import (
 	"fmt"
+	"math"
 	"reflect"
 	"testing"
 
@@ -27,14 +28,13 @@ func TestParseOptions(t *testing.T) {
 func TestParseOptionsCanned(t *testing.T) {
 	// Dashboard stores csource options with syzkaller reproducers,
 	// so we need to be able to parse old formats.
-	// nolint: lll, dupl
+	// nolint: lll
 	canned := map[string]Options{
 		`{"threaded":true,"collide":true,"repeat":true,"procs":10,"sandbox":"namespace",
 		"fault":true,"fault_call":1,"fault_nth":2,"tun":true,"tmpdir":true,"cgroups":true,
 		"netdev":true,"resetnet":true,
 		"segv":true,"waitrepeat":true,"debug":true,"repro":true}`: {
 			Threaded:     true,
-			Collide:      true,
 			Repeat:       true,
 			Procs:        10,
 			Slowdown:     1,
@@ -47,8 +47,8 @@ func TestParseOptionsCanned(t *testing.T) {
 			CloseFDs:     true,
 			UseTmpDir:    true,
 			HandleSegv:   true,
-			Repro:        true,
 			LegacyOptions: LegacyOptions{
+				Collide:   true,
 				Fault:     true,
 				FaultCall: 1,
 				FaultNth:  2,
@@ -59,7 +59,6 @@ func TestParseOptionsCanned(t *testing.T) {
 		"netdev":true,"resetnet":true,
 		"segv":true,"waitrepeat":true,"debug":true,"repro":true}`: {
 			Threaded:     true,
-			Collide:      true,
 			Repeat:       true,
 			Procs:        10,
 			Slowdown:     1,
@@ -72,8 +71,33 @@ func TestParseOptionsCanned(t *testing.T) {
 			CloseFDs:     true,
 			UseTmpDir:    true,
 			HandleSegv:   true,
-			Repro:        true,
 			LegacyOptions: LegacyOptions{
+				Collide:   true,
+				Fault:     true,
+				FaultCall: 1,
+				FaultNth:  2,
+			},
+		},
+		`{"threaded":true,"collide":true,"repeat":true,"procs":10,"sandbox":"android",
+		"sandbox_arg":9,"fault":true,"fault_call":1,"fault_nth":2,"tun":true,"tmpdir":true,"cgroups":true,
+		"netdev":true,"resetnet":true,
+		"segv":true,"waitrepeat":true,"debug":true,"repro":true}`: {
+			Threaded:     true,
+			Repeat:       true,
+			Procs:        10,
+			Slowdown:     1,
+			Sandbox:      "android",
+			SandboxArg:   9,
+			NetInjection: true,
+			NetDevices:   true,
+			NetReset:     true,
+			Cgroups:      true,
+			BinfmtMisc:   false,
+			CloseFDs:     true,
+			UseTmpDir:    true,
+			HandleSegv:   true,
+			LegacyOptions: LegacyOptions{
+				Collide:   true,
 				Fault:     true,
 				FaultCall: 1,
 				FaultNth:  2,
@@ -81,7 +105,6 @@ func TestParseOptionsCanned(t *testing.T) {
 		},
 		"{Threaded:true Collide:true Repeat:true Procs:1 Sandbox:none Fault:false FaultCall:-1 FaultNth:0 EnableTun:true UseTmpDir:true HandleSegv:true WaitRepeat:true Debug:false Repro:false}": {
 			Threaded:     true,
-			Collide:      true,
 			Repeat:       true,
 			Procs:        1,
 			Slowdown:     1,
@@ -92,8 +115,8 @@ func TestParseOptionsCanned(t *testing.T) {
 			CloseFDs:     true,
 			UseTmpDir:    true,
 			HandleSegv:   true,
-			Repro:        false,
 			LegacyOptions: LegacyOptions{
+				Collide:   true,
 				Fault:     false,
 				FaultCall: -1,
 				FaultNth:  0,
@@ -101,7 +124,6 @@ func TestParseOptionsCanned(t *testing.T) {
 		},
 		"{Threaded:true Collide:true Repeat:true Procs:1 Sandbox: Fault:false FaultCall:-1 FaultNth:0 EnableTun:true UseTmpDir:true HandleSegv:true WaitRepeat:true Debug:false Repro:false}": {
 			Threaded:     true,
-			Collide:      true,
 			Repeat:       true,
 			Procs:        1,
 			Slowdown:     1,
@@ -112,8 +134,8 @@ func TestParseOptionsCanned(t *testing.T) {
 			CloseFDs:     true,
 			UseTmpDir:    true,
 			HandleSegv:   true,
-			Repro:        false,
 			LegacyOptions: LegacyOptions{
+				Collide:   true,
 				Fault:     false,
 				FaultCall: -1,
 				FaultNth:  0,
@@ -121,7 +143,6 @@ func TestParseOptionsCanned(t *testing.T) {
 		},
 		"{Threaded:false Collide:true Repeat:true Procs:1 Sandbox:namespace Fault:false FaultCall:-1 FaultNth:0 EnableTun:true UseTmpDir:true EnableCgroups:true HandleSegv:true WaitRepeat:true Debug:false Repro:false}": {
 			Threaded:     false,
-			Collide:      true,
 			Repeat:       true,
 			Procs:        1,
 			Slowdown:     1,
@@ -132,8 +153,28 @@ func TestParseOptionsCanned(t *testing.T) {
 			CloseFDs:     true,
 			UseTmpDir:    true,
 			HandleSegv:   true,
-			Repro:        false,
 			LegacyOptions: LegacyOptions{
+				Collide:   true,
+				Fault:     false,
+				FaultCall: -1,
+				FaultNth:  0,
+			},
+		},
+		"{Threaded:false Collide:true Repeat:true Procs:1 Sandbox:namespace SandboxArg:-234 Fault:false FaultCall:-1 FaultNth:0 EnableTun:true UseTmpDir:true EnableCgroups:true HandleSegv:true WaitRepeat:true Debug:false Repro:false}": {
+			Threaded:     false,
+			Repeat:       true,
+			Procs:        1,
+			Slowdown:     1,
+			Sandbox:      "namespace",
+			SandboxArg:   -234,
+			NetInjection: true,
+			Cgroups:      true,
+			BinfmtMisc:   false,
+			CloseFDs:     true,
+			UseTmpDir:    true,
+			HandleSegv:   true,
+			LegacyOptions: LegacyOptions{
+				Collide:   true,
 				Fault:     false,
 				FaultCall: -1,
 				FaultNth:  0,
@@ -153,8 +194,8 @@ func TestParseOptionsCanned(t *testing.T) {
 
 func allOptionsSingle(OS string) []Options {
 	var opts []Options
-	fields := reflect.TypeOf(Options{}).NumField()
-	for i := 0; i < fields; i++ {
+	fields := reflect.TypeFor[Options]().NumField()
+	for i := range fields {
 		// Because of constraints on options, we need some defaults
 		// (e.g. no collide without threaded).
 		opt := Options{
@@ -171,8 +212,8 @@ func allOptionsSingle(OS string) []Options {
 
 func allOptionsPermutations(OS string) []Options {
 	opts := []Options{{}}
-	fields := reflect.TypeOf(Options{}).NumField()
-	for i := 0; i < fields; i++ {
+	fields := reflect.TypeFor[Options]().NumField()
+	for i := range fields {
 		var newOpts []Options
 		for _, opt := range opts {
 			newOpts = append(newOpts, enumerateField(OS, opt, i)...)
@@ -204,6 +245,11 @@ func enumerateField(OS string, opt Options, field int) []Options {
 	if fldName == "Sandbox" {
 		for _, sandbox := range []string{"", "none", "setuid", "namespace", "android"} {
 			fld.SetString(sandbox)
+			opts = append(opts, opt)
+		}
+	} else if fldName == "SandboxArg" {
+		for _, sandboxArg := range []int64{math.MinInt, math.MaxInt} {
+			fld.SetInt(sandboxArg)
 			opts = append(opts, opt)
 		}
 	} else if fldName == "Procs" {
@@ -238,90 +284,4 @@ func enumerateField(OS string, opt Options, field int) []Options {
 		}
 	}
 	return checked
-}
-
-func TestParseFeaturesFlags(t *testing.T) {
-	tests := []struct {
-		Enable   string
-		Disable  string
-		Default  bool
-		Features map[string]bool
-	}{
-		{"none", "none", true, map[string]bool{
-			"tun":         true,
-			"net_dev":     true,
-			"net_reset":   true,
-			"cgroups":     true,
-			"binfmt_misc": true,
-			"close_fds":   true,
-			"devlink_pci": true,
-			"usb":         true,
-			"vhci":        true,
-			"wifi":        true,
-			"ieee802154":  true,
-			"sysctl":      true,
-		}},
-		{"none", "none", false, map[string]bool{}},
-		{"all", "none", true, map[string]bool{
-			"tun":         true,
-			"net_dev":     true,
-			"net_reset":   true,
-			"cgroups":     true,
-			"binfmt_misc": true,
-			"close_fds":   true,
-			"devlink_pci": true,
-			"usb":         true,
-			"vhci":        true,
-			"wifi":        true,
-			"ieee802154":  true,
-			"sysctl":      true,
-		}},
-		{"", "none", true, map[string]bool{}},
-		{"none", "all", true, map[string]bool{}},
-		{"none", "", true, map[string]bool{
-			"tun":         true,
-			"net_dev":     true,
-			"net_reset":   true,
-			"cgroups":     true,
-			"binfmt_misc": true,
-			"close_fds":   true,
-			"devlink_pci": true,
-			"usb":         true,
-			"vhci":        true,
-			"wifi":        true,
-			"ieee802154":  true,
-			"sysctl":      true,
-		}},
-		{"tun,net_dev", "none", true, map[string]bool{
-			"tun":     true,
-			"net_dev": true,
-		}},
-		{"none", "cgroups,net_dev", true, map[string]bool{
-			"tun":         true,
-			"net_reset":   true,
-			"binfmt_misc": true,
-			"close_fds":   true,
-			"devlink_pci": true,
-			"usb":         true,
-			"vhci":        true,
-			"wifi":        true,
-			"ieee802154":  true,
-			"sysctl":      true,
-		}},
-		{"close_fds", "none", true, map[string]bool{
-			"close_fds": true,
-		}},
-	}
-	for i, test := range tests {
-		features, err := ParseFeaturesFlags(test.Enable, test.Disable, test.Default)
-		if err != nil {
-			t.Fatalf("failed to parse features flags: %v", err)
-		}
-		for name, feature := range features {
-			if feature.Enabled != test.Features[name] {
-				t.Fatalf("test #%v: invalid value for feature flag %s: got %v, want %v",
-					i, name, feature.Enabled, test.Features[name])
-			}
-		}
-	}
 }

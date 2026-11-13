@@ -9,19 +9,25 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+
+	"github.com/google/syzkaller/pkg/testutil"
 )
+
+// maxArgCutoff is the threshold of arguments above which we skip the program in tests
+// to prevent quadratic-time slowdowns during validation or minimization.
+const maxArgCutoff = 10000
 
 func TestGeneration(t *testing.T) {
 	target, rs, iters := initTest(t)
 	ct := target.DefaultChoiceTable()
-	for i := 0; i < iters; i++ {
+	for range iters {
 		target.Generate(rs, 20, ct)
 	}
 }
 
 func TestDefault(t *testing.T) {
 	target, _, _ := initTest(t)
-	ForeachType(target.Syscalls, func(typ Type, ctx TypeCtx) {
+	ForeachType(target.Syscalls, func(typ Type, ctx *TypeCtx) {
 		arg := typ.DefaultArg(ctx.Dir)
 		if !isDefault(arg) {
 			t.Errorf("default arg is not default: %s\ntype: %#v\narg: %#v",
@@ -58,7 +64,7 @@ func TestDefaultCallArgs(t *testing.T) {
 func testSerialize(t *testing.T, verbose bool) {
 	target, rs, iters := initTest(t)
 	ct := target.DefaultChoiceTable()
-	for i := 0; i < iters; i++ {
+	for range iters {
 		p := target.Generate(rs, 10, ct)
 		var data []byte
 		mode := NonStrict
@@ -85,7 +91,7 @@ func testSerialize(t *testing.T, verbose bool) {
 			t.Fatalf("different number of calls")
 		}
 		if !bytes.Equal(data, data1) {
-			t.Fatalf("program changed after serialize/deserialize\noriginal:\n%s\n\nnew:\n%s\n", data, data1)
+			t.Fatalf("program changed after serialize/deserialize\noriginal:\n%s\n\nnew:\n%s", data, data1)
 		}
 	}
 }
@@ -104,7 +110,7 @@ func TestVmaType(t *testing.T) {
 	meta := target.SyscallMap["test$vma0"]
 	r := newRand(target, rs)
 	pageSize := target.PageSize
-	for i := 0; i < iters; i++ {
+	for range iters {
 		s := newState(target, ct, nil)
 		calls := r.generateParticularCall(s, meta)
 		c := calls[len(calls)-1]
@@ -138,11 +144,27 @@ func TestVmaType(t *testing.T) {
 	}
 }
 
+func TestFsckAttr(t *testing.T) {
+	target, err := GetTarget("test", "64")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	syscall := target.SyscallMap["test$fsck_attr"]
+	if syscall == nil {
+		t.Fatal("could not find test$fsck_attr in sys/test")
+	}
+
+	if syscall.Attrs.Fsck != "fsck.test -n" {
+		t.Fatalf("unexpected fsck command %s", syscall.Attrs.Fsck)
+	}
+}
+
 // TestCrossTarget ensures that a program serialized for one arch can be
 // deserialized for another arch. This happens when managers exchange
 // programs via hub.
 func TestCrossTarget(t *testing.T) {
-	if raceEnabled {
+	if testutil.RaceEnabled {
 		t.Skip("skipping in race mode, too slow")
 	}
 	t.Parallel()
@@ -178,12 +200,14 @@ func TestCrossTarget(t *testing.T) {
 
 func testCrossTarget(t *testing.T, target *Target, crossTargets []*Target) {
 	ct := target.DefaultChoiceTable()
-	rs := randSource(t)
+	rs := testutil.RandSource(t)
 	iters := 100
 	if testing.Short() {
 		iters /= 10
 	}
-	for i := 0; i < iters; i++ {
+	// The test is de facto O(N^2) for the number of arguments in the program.
+	// Let's filter out particularly large programs to avoid timeouts.
+	for i := 0; i < iters; {
 		p := target.Generate(rs, 20, ct)
 		testCrossArchProg(t, p, crossTargets)
 		p, err := target.Deserialize(p.Serialize(), NonStrict)
@@ -191,9 +215,13 @@ func testCrossTarget(t *testing.T, target *Target, crossTargets []*Target) {
 			t.Fatal(err)
 		}
 		testCrossArchProg(t, p, crossTargets)
-		p.Mutate(rs, 20, ct, nil)
+		p.Mutate(rs, 20, ct, nil, nil)
 		testCrossArchProg(t, p, crossTargets)
-		p, _ = Minimize(p, -1, false, func(*Prog, int) bool {
+		if p.countArgs() > maxArgCutoff {
+			continue
+		}
+		i++
+		p, _ = Minimize(p, -1, MinimizeCorpus, func(*Prog, int) bool {
 			return rs.Int63()%2 == 0
 		})
 		testCrossArchProg(t, p, crossTargets)
@@ -214,13 +242,13 @@ func testCrossArchProg(t *testing.T, p *Prog, crossTargets []*Target) {
 
 func TestSpecialStructs(t *testing.T) {
 	testEachTargetRandom(t, func(t *testing.T, target *Target, rs rand.Source, iters int) {
-		_ = target.GenerateAllSyzProg(rs)
 		ct := target.DefaultChoiceTable()
+		_ = target.GenerateAllSyzProg(rs, ct)
 		for special, gen := range target.SpecialTypes {
 			t.Run(special, func(t *testing.T) {
 				var typ Type
 				for i := 0; i < len(target.Syscalls) && typ == nil; i++ {
-					ForeachCallType(target.Syscalls[i], func(t Type, ctx TypeCtx) {
+					ForeachCallType(target.Syscalls[i], func(t Type, ctx *TypeCtx) {
 						if ctx.Dir == DirOut {
 							return
 						}
@@ -236,9 +264,9 @@ func TestSpecialStructs(t *testing.T) {
 					t.Fatal("can't find struct description")
 				}
 				g := &Gen{newRand(target, rs), newState(target, ct, nil)}
-				for i := 0; i < iters/len(target.SpecialTypes); i++ {
+				for range iters / len(target.SpecialTypes) {
 					var arg Arg
-					for i := 0; i < 2; i++ {
+					for range 2 {
 						arg, _ = gen(g, typ, DirInOut, arg)
 						if arg.Dir() != DirInOut {
 							t.Fatalf("got wrong arg dir %v", arg.Dir())
@@ -292,12 +320,12 @@ fallback$0()
 				{
 					Flags:  CallExecuted,
 					Errno:  0,
-					Signal: make([]uint32, 1),
+					Signal: make([]uint64, 1),
 				},
 				{
 					Flags:  CallExecuted,
 					Errno:  42,
-					Signal: make([]uint32, 1),
+					Signal: make([]uint64, 1),
 				},
 				{},
 			},
@@ -316,32 +344,32 @@ fallback$1(0x0)
 				{
 					Flags:  CallExecuted,
 					Errno:  0,
-					Signal: make([]uint32, 1),
+					Signal: make([]uint64, 1),
 				},
 				{
 					Flags:  CallExecuted,
 					Errno:  1,
-					Signal: make([]uint32, 1),
+					Signal: make([]uint64, 1),
 				},
 				{
 					Flags:  CallExecuted,
 					Errno:  0,
-					Signal: make([]uint32, 2),
+					Signal: make([]uint64, 2),
 				},
 				{
 					Flags:  CallExecuted,
 					Errno:  0,
-					Signal: make([]uint32, 1),
+					Signal: make([]uint64, 1),
 				},
 				{
 					Flags:  CallExecuted,
 					Errno:  0,
-					Signal: make([]uint32, 2),
+					Signal: make([]uint64, 2),
 				},
 				{
 					Flags:  CallExecuted,
 					Errno:  2,
-					Signal: make([]uint32, 1),
+					Signal: make([]uint64, 1),
 				},
 			},
 		},
@@ -360,17 +388,17 @@ fallback$0()
 				{
 					Flags:  CallExecuted,
 					Errno:  0,
-					Signal: make([]uint32, 1),
+					Signal: make([]uint64, 1),
 				},
 				{
 					Flags:  CallExecuted,
 					Errno:  0,
-					Signal: make([]uint32, 1),
+					Signal: make([]uint64, 1),
 				},
 				{
 					Flags:  CallExecuted,
 					Errno:  1,
-					Signal: make([]uint32, 1),
+					Signal: make([]uint64, 1),
 				},
 				{
 					Flags: CallExecuted,
@@ -400,12 +428,12 @@ fallback$0()
 				{
 					Flags:  CallExecuted,
 					Errno:  0,
-					Signal: make([]uint32, 1),
+					Signal: make([]uint64, 1),
 				},
 				{
 					Flags:  CallExecuted,
 					Errno:  1,
-					Signal: make([]uint32, 1),
+					Signal: make([]uint64, 1),
 				},
 				{
 					Flags: CallExecuted,
@@ -461,7 +489,7 @@ fallback$0()
 func TestSanitizeRandom(t *testing.T) {
 	testEachTargetRandom(t, func(t *testing.T, target *Target, rs rand.Source, iters int) {
 		ct := target.DefaultChoiceTable()
-		for i := 0; i < iters; i++ {
+		for range iters {
 			p := target.Generate(rs, 10, ct)
 			s0 := string(p.Serialize())
 			p.sanitizeFix()
@@ -471,4 +499,17 @@ func TestSanitizeRandom(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestPtrRecursion(t *testing.T) {
+	target, rs, _ := initRandomTargetTest(t, "test", "64")
+	call := target.SyscallMap["test$recur_ptr"]
+	if call == nil {
+		t.Fatal("call test$recur_ptr not found")
+	}
+	enabled := map[*Syscall]bool{call: true}
+	ct := target.BuildChoiceTable(nil, enabled)
+	for range 100 {
+		target.Generate(rs, 1, ct)
+	}
 }

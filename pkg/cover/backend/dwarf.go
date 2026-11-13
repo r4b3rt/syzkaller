@@ -6,72 +6,153 @@ package backend
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"debug/dwarf"
 	"debug/elf"
 	"encoding/binary"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"path/filepath"
+	"regexp"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
-	"strings"
 
-	"github.com/google/syzkaller/pkg/host"
+	"github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/symbolizer"
+	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/sys/targets"
 )
 
-type containerFns struct {
-	readSymbols           func(*Module, *symbolInfo) ([]*Symbol, error)
-	readTextData          func(*Module) ([]byte, error)
-	readModuleCoverPoints func(*targets.Target, *Module, *symbolInfo) ([2][]uint64, error)
-	readTextRanges        func(*Module) ([]pcRange, []*CompileUnit, error)
+type dwarfParams struct {
+	target                *targets.Target
+	kernelDirs            *mgrconfig.KernelDirs
+	splitBuildDelimiters  []string
+	moduleObj             []string
+	hostModules           []*vminfo.KernelModule
+	readSymbols           func(*vminfo.KernelModule, *symbolInfo) ([]*Symbol, error)
+	readTextData          func(*vminfo.KernelModule) ([]byte, error)
+	readModuleCoverPoints func(*targets.Target, *vminfo.KernelModule, *symbolInfo) ([2][]uint64, error)
+	readTextRanges        func(*vminfo.KernelModule) ([]pcRange, []*CompileUnit, error)
+	getCompilerVersion    func(string) string
 }
 
 type Arch struct {
+	scanSize      int
 	callLen       int
 	relaOffset    uint64
-	opcodeOffset  int
-	opcodes       [2]byte
 	callRelocType uint64
-	target        func(arch *Arch, insn []byte, pc uint64, opcode byte) uint64
+	isCallInsn    func(arch *Arch, insn []byte) bool
+	callTarget    func(arch *Arch, insn []byte, pc uint64) uint64
 }
 
-var arches = map[string]Arch{
+var arches = map[string]*Arch{
 	targets.AMD64: {
+		scanSize:      1,
 		callLen:       5,
 		relaOffset:    1,
-		opcodes:       [2]byte{0xe8, 0xe8},
 		callRelocType: uint64(elf.R_X86_64_PLT32),
-		target: func(arch *Arch, insn []byte, pc uint64, opcode byte) uint64 {
+		isCallInsn: func(arch *Arch, insn []byte) bool {
+			return insn[0] == 0xe8
+		},
+		callTarget: func(arch *Arch, insn []byte, pc uint64) uint64 {
 			off := uint64(int64(int32(binary.LittleEndian.Uint32(insn[1:]))))
 			return pc + off + uint64(arch.callLen)
 		},
 	},
 	targets.ARM64: {
+		scanSize:      4,
 		callLen:       4,
-		opcodeOffset:  3,
-		opcodes:       [2]byte{0x94, 0x97},
 		callRelocType: uint64(elf.R_AARCH64_CALL26),
-		target: func(arch *Arch, insn []byte, pc uint64, opcode byte) uint64 {
-			off := uint64(binary.LittleEndian.Uint32(insn)) & ((1 << 24) - 1)
-			if opcode == arch.opcodes[1] {
-				off |= 0xffffffffff000000
+		isCallInsn: func(arch *Arch, insn []byte) bool {
+			const mask = uint32(0xfc000000)
+			const opc = uint32(0x94000000)
+			return binary.LittleEndian.Uint32(insn)&mask == opc
+		},
+		callTarget: func(arch *Arch, insn []byte, pc uint64) uint64 {
+			off26 := binary.LittleEndian.Uint32(insn) & 0x3ffffff
+			sign := off26 >> 25
+			off := uint64(off26)
+			// Sign-extend the 26-bit offset stored in the instruction.
+			if sign == 1 {
+				off |= 0xfffffffffc000000
 			}
 			return pc + 4*off
 		},
 	},
+	targets.S390x: {
+		scanSize:      1,
+		callLen:       6,
+		callRelocType: uint64(elf.R_390_PLT32DBL),
+		isCallInsn: func(arch *Arch, insn []byte) bool {
+			return insn[0] == 0xc0 && insn[1] == 0xe5
+		},
+		callTarget: func(arch *Arch, insn []byte, pc uint64) uint64 {
+			off := uint64(int64(int32(binary.BigEndian.Uint32(insn[2:]))))
+			return pc + 2*off
+		},
+	},
 }
 
-func makeDWARF(target *targets.Target, objDir, srcDir, buildDir string,
-	moduleObj []string, hostModules []host.KernelModule, fn *containerFns) (
-	*Impl, error) {
-	modules, err := discoverModules(target, objDir, moduleObj, hostModules)
+func makeDWARF(params *dwarfParams) (impl *Impl, err error) {
+	defer func() {
+		// It turns out that the DWARF-parsing library in Go crashes while parsing DWARF 5 data.
+		// As GCC11 uses DWARF 5 by default, we can expect larger number of problems with
+		// syzkallers compiled using old go versions.
+		// So we just catch the panic and turn it into a meaningful error message.
+		if recErr := recover(); recErr != nil {
+			impl = nil
+			err = fmt.Errorf("panic occurred while parsing DWARF "+
+				"(possible remedy: use go1.16+ which support DWARF 5 debug data): %s", recErr)
+		}
+	}()
+	impl, err = makeDWARFUnsafe(params)
+	return
+}
+
+type Result struct {
+	CoverPoints [2][]uint64
+	Symbols     []*Symbol
+}
+
+func processModule(params *dwarfParams, module *vminfo.KernelModule, info *symbolInfo,
+	target *targets.Target) (*Result, error) {
+	symbols, err := params.readSymbols(module, info)
 	if err != nil {
 		return nil, err
 	}
+
+	var data []byte
+	var coverPoints [2][]uint64
+	if _, ok := arches[target.Arch]; !ok {
+		coverPoints, err = objdump(target, module)
+	} else if module.Name == "" {
+		data, err = params.readTextData(module)
+		if err != nil {
+			return nil, err
+		}
+		coverPoints, err = readCoverPoints(target, info, data)
+	} else {
+		coverPoints, err = params.readModuleCoverPoints(target, module, info)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	result := &Result{
+		Symbols:     symbols,
+		CoverPoints: coverPoints,
+	}
+	return result, nil
+}
+
+func makeDWARFUnsafe(params *dwarfParams) (*Impl, error) {
+	target := params.target
+	kernelDirs := params.kernelDirs
+	splitBuildDelimiters := params.splitBuildDelimiters
+	modules := params.hostModules
 
 	// Here and below index 0 refers to coverage callbacks (__sanitizer_cov_trace_pc(_guard))
 	// and index 1 refers to comparison callbacks (__sanitizer_cov_trace_cmp*).
@@ -79,66 +160,75 @@ func makeDWARF(target *targets.Target, objDir, srcDir, buildDir string,
 	var allSymbols []*Symbol
 	var allRanges []pcRange
 	var allUnits []*CompileUnit
-	var pcBase uint64
+	preciseCoverage := true
+	type binResult struct {
+		symbols     []*Symbol
+		coverPoints [2][]uint64
+		ranges      []pcRange
+		units       []*CompileUnit
+		err         error
+	}
+	binC := make(chan binResult, len(modules))
 	for _, module := range modules {
-		errc := make(chan error, 1)
 		go func() {
 			info := &symbolInfo{
+				tracePC:     make(map[uint64]bool),
 				traceCmp:    make(map[uint64]bool),
 				tracePCIdx:  make(map[int]bool),
 				traceCmpIdx: make(map[int]bool),
 			}
-			symbols, err := fn.readSymbols(module, info)
+			result, err := processModule(params, module, info, target)
 			if err != nil {
-				errc <- err
+				binC <- binResult{err: err}
 				return
 			}
-			allSymbols = append(allSymbols, symbols...)
-			if module.Name == "" {
-				pcBase = info.textAddr
-			}
-			var data []byte
-			var coverPoints [2][]uint64
-			if target.Arch != targets.AMD64 && target.Arch != targets.ARM64 {
-				coverPoints, err = objdump(target, module)
-			} else if module.Name == "" {
-				data, err = fn.readTextData(module)
-				if err != nil {
-					errc <- err
-					return
-				}
-				coverPoints, err = readCoverPoints(target, info, data)
-			} else {
-				coverPoints, err = fn.readModuleCoverPoints(target, module, info)
-			}
-			allCoverPoints[0] = append(allCoverPoints[0], coverPoints[0]...)
-			allCoverPoints[1] = append(allCoverPoints[1], coverPoints[1]...)
-			if err == nil && module.Name == "" && len(coverPoints[0]) == 0 {
+			if module.Name == "" && len(result.CoverPoints[0]) == 0 {
 				err = fmt.Errorf("%v doesn't contain coverage callbacks (set CONFIG_KCOV=y on linux)", module.Path)
+				binC <- binResult{err: err}
+				return
 			}
-			errc <- err
+			ranges, units, err := params.readTextRanges(module)
+			if err != nil {
+				binC <- binResult{err: err}
+				return
+			}
+			binC <- binResult{symbols: result.Symbols, coverPoints: result.CoverPoints, ranges: ranges, units: units}
 		}()
-		ranges, units, err := fn.readTextRanges(module)
-		if err != nil {
-			return nil, err
+		if isKcovBrokenInCompiler(params.getCompilerVersion(module.Path)) {
+			preciseCoverage = false
 		}
-		if err := <-errc; err != nil {
-			return nil, err
-		}
-		allRanges = append(allRanges, ranges...)
-		allUnits = append(allUnits, units...)
 	}
-
-	sort.Slice(allSymbols, func(i, j int) bool {
-		return allSymbols[i].Start < allSymbols[j].Start
+	for range modules {
+		result := <-binC
+		if err := result.err; err != nil {
+			return nil, err
+		}
+		allSymbols = append(allSymbols, result.symbols...)
+		allCoverPoints[0] = append(allCoverPoints[0], result.coverPoints[0]...)
+		allCoverPoints[1] = append(allCoverPoints[1], result.coverPoints[1]...)
+		allRanges = append(allRanges, result.ranges...)
+		allUnits = append(allUnits, result.units...)
+	}
+	log.Logf(1, "discovered %v source files, %v symbols", len(allUnits), len(allSymbols))
+	// TODO: need better way to remove symbols having the same Start
+	uniqSymbs := make(map[uint64]*Symbol)
+	for _, sym := range allSymbols {
+		if _, ok := uniqSymbs[sym.Start]; !ok {
+			uniqSymbs[sym.Start] = sym
+		}
+	}
+	allSymbols = []*Symbol{}
+	for _, sym := range uniqSymbs {
+		allSymbols = append(allSymbols, sym)
+	}
+	slices.SortFunc(allSymbols, func(a, b *Symbol) int {
+		return cmp.Compare(a.Start, b.Start)
 	})
-	sort.Slice(allRanges, func(i, j int) bool {
-		return allRanges[i].start < allRanges[j].start
+	slices.SortFunc(allRanges, func(a, b pcRange) int {
+		return cmp.Compare(a.start, b.start)
 	})
 	for k := range allCoverPoints {
-		sort.Slice(allCoverPoints[k], func(i, j int) bool {
-			return allCoverPoints[k][i] < allCoverPoints[k][j]
-		})
+		slices.Sort(allCoverPoints[k])
 	}
 
 	allSymbols = buildSymbols(allSymbols, allRanges, allCoverPoints)
@@ -148,7 +238,7 @@ func makeDWARF(target *targets.Target, objDir, srcDir, buildDir string,
 			continue // drop the unit
 		}
 		// TODO: objDir won't work for out-of-tree modules.
-		unit.Name, unit.Path = cleanPath(unit.Name, objDir, srcDir, buildDir)
+		unit.Name, unit.Path = CleanPath(unit.Name, kernelDirs, splitBuildDelimiters)
 		allUnits[nunit] = unit
 		nunit++
 	}
@@ -156,19 +246,15 @@ func makeDWARF(target *targets.Target, objDir, srcDir, buildDir string,
 	if len(allSymbols) == 0 || len(allUnits) == 0 {
 		return nil, fmt.Errorf("failed to parse DWARF (set CONFIG_DEBUG_INFO=y on linux)")
 	}
-	if target.OS == targets.FreeBSD {
-		// On FreeBSD .text address in ELF is 0, but .text is actually mapped at 0xffffffff.
-		pcBase = ^uint64(0)
-	}
+	var interner symbolizer.Interner
 	impl := &Impl{
 		Units:   allUnits,
 		Symbols: allSymbols,
-		Symbolize: func(pcs map[*Module][]uint64) ([]Frame, error) {
-			return symbolize(target, objDir, srcDir, buildDir, pcs)
+		Symbolize: func(pcs map[*vminfo.KernelModule][]uint64) ([]*Frame, error) {
+			return symbolize(target, &interner, kernelDirs, splitBuildDelimiters, pcs)
 		},
-		RestorePC: func(pc uint32) uint64 {
-			return PreviousInstructionPC(target, RestorePC(pc, uint32(pcBase>>32)))
-		},
+		CallbackPoints:  allCoverPoints[0],
+		PreciseCoverage: preciseCoverage,
 	}
 	return impl, nil
 }
@@ -183,7 +269,7 @@ func buildSymbols(symbols []*Symbol, ranges []pcRange, coverPoints [2][]uint64) 
 		pcs := coverPoints[pcType]
 		var curSymbol *Symbol
 		firstSymbolPC, symbolIdx := -1, 0
-		for i := 0; i < len(pcs); i++ {
+		for i := range len(pcs) {
 			pc := pcs[i]
 			for ; symbolIdx < len(symbols) && pc >= symbols[symbolIdx].End; symbolIdx++ {
 			}
@@ -233,15 +319,39 @@ func buildSymbols(symbols []*Symbol, ranges []pcRange, coverPoints [2][]uint64) 
 	return symbols
 }
 
+// Regexps to parse compiler version string in isKcovBrokenInCompiler.
+// Some targets (e.g. NetBSD) use g++ instead of gcc.
+var gccRE = regexp.MustCompile(`gcc|GCC|g\+\+`)
+var gccVersionRE = regexp.MustCompile(`(gcc|GCC|g\+\+).* ([0-9]{1,2})\.[0-9]+\.[0-9]+`)
+
+// GCC < 14 incorrectly tail-calls kcov callbacks, which does not let syzkaller
+// verify that collected coverage points have matching callbacks.
+// See https://github.com/google/syzkaller/issues/4447 for more information.
+func isKcovBrokenInCompiler(versionStr string) bool {
+	if !gccRE.MatchString(versionStr) {
+		return false
+	}
+	groups := gccVersionRE.FindStringSubmatch(versionStr)
+	if len(groups) > 0 {
+		version, err := strconv.Atoi(groups[2])
+		if err == nil {
+			return version < 14
+		}
+	}
+	return true
+}
+
 type symbolInfo struct {
-	textAddr    uint64
-	tracePC     uint64
+	textAddr uint64
+	// Set of addresses that correspond to __sanitizer_cov_trace_pc or its trampolines.
+	tracePC     map[uint64]bool
 	traceCmp    map[uint64]bool
 	tracePCIdx  map[int]bool
 	traceCmpIdx map[int]bool
 }
 
 type pcRange struct {
+	// [start; end)
 	start uint64
 	end   uint64
 	unit  *CompileUnit
@@ -249,10 +359,35 @@ type pcRange struct {
 
 type pcFixFn = (func([2]uint64) ([2]uint64, bool))
 
-func readTextRanges(debugInfo *dwarf.Data, module *Module, pcFix pcFixFn) (
+func readTextRanges(debugInfo *dwarf.Data, module *vminfo.KernelModule, pcFix pcFixFn) (
 	[]pcRange, []*CompileUnit, error) {
 	var ranges []pcRange
-	var units []*CompileUnit
+	unitMap := map[string]*CompileUnit{}
+	addRange := func(r [2]uint64, fileName string) {
+		if pcFix != nil {
+			var filtered bool
+			r, filtered = pcFix(r)
+			if filtered {
+				return
+			}
+		}
+		unit, ok := unitMap[fileName]
+		if !ok {
+			unit = &CompileUnit{
+				ObjectUnit: ObjectUnit{
+					Name: fileName,
+				},
+				Module: module,
+			}
+			unitMap[fileName] = unit
+		}
+		if module.Name == "" {
+			ranges = append(ranges, pcRange{r[0], r[1], unit})
+		} else {
+			ranges = append(ranges, pcRange{r[0] + module.Addr, r[1] + module.Addr, unit})
+		}
+	}
+
 	for r := debugInfo.Reader(); ; {
 		ent, err := r.Next()
 		if err != nil {
@@ -264,72 +399,132 @@ func readTextRanges(debugInfo *dwarf.Data, module *Module, pcFix pcFixFn) (
 		if ent.Tag != dwarf.TagCompileUnit {
 			return nil, nil, fmt.Errorf("found unexpected tag %v on top level", ent.Tag)
 		}
-		attrName := ent.Val(dwarf.AttrName)
-		if attrName == nil {
+		attrName, ok := ent.Val(dwarf.AttrName).(string)
+		if !ok {
 			continue
 		}
-		unit := &CompileUnit{
-			ObjectUnit: ObjectUnit{
-				Name: attrName.(string),
-			},
-			Module: module,
-		}
-		units = append(units, unit)
-		ranges1, err := debugInfo.Ranges(ent)
-		if err != nil {
-			return nil, nil, err
-		}
+		attrCompDir, _ := ent.Val(dwarf.AttrCompDir).(string)
 
-		var filtered bool
-		for _, r := range ranges1 {
-			if pcFix != nil {
-				r, filtered = pcFix(r)
-				if filtered {
-					continue
-				}
+		const languageRust = 28
+		if language, ok := ent.Val(dwarf.AttrLanguage).(int64); ok && language == languageRust {
+			rawRanges, err := rustRanges(debugInfo, ent)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to query Rust PC ranges: %w", err)
 			}
-			ranges = append(ranges, pcRange{r[0] + module.Addr, r[1] + module.Addr, unit})
+			for _, r := range rawRanges {
+				addRange([2]uint64{r.start, r.end}, r.file)
+			}
+		} else {
+			// Compile unit names are relative to the compilation dir,
+			// while per-line info isn't.
+			// attrName could be an absolute path for out-of-tree modules.
+			unitName := attrName
+			if !filepath.IsAbs(attrName) {
+				unitName = filepath.Join(attrCompDir, attrName)
+			}
+			ranges1, err := debugInfo.Ranges(ent)
+			if err != nil {
+				return nil, nil, err
+			}
+			for _, r := range ranges1 {
+				addRange(r, unitName)
+			}
 		}
 		r.SkipChildren()
+	}
+	var units []*CompileUnit
+	for _, unit := range unitMap {
+		units = append(units, unit)
 	}
 	return ranges, units, nil
 }
 
-func symbolizeModule(target *targets.Target, objDir, srcDir, buildDir string,
-	mod *Module, pcs []uint64) ([]Frame, error) {
-	procs := runtime.GOMAXPROCS(0) / 2
-	if need := len(pcs) / 1000; procs > need {
-		procs = need
+type rustRange struct {
+	// [start; end)
+	start uint64
+	end   uint64
+	file  string
+}
+
+func rustRanges(debugInfo *dwarf.Data, ent *dwarf.Entry) ([]rustRange, error) {
+	// For Rust, a single compilation unit may comprise all .rs files that belong to the crate.
+	// To properly render the coverage, we need to somehow infer the ranges that belong to
+	// those individual .rs files.
+	// For simplicity, let's create fake ranges by looking at the DWARF line information.
+	var ret []rustRange
+	lr, err := debugInfo.LineReader(ent)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query line reader: %w", err)
 	}
+	var startPC uint64
+	var files []string
+	for {
+		var entry dwarf.LineEntry
+		if err = lr.Next(&entry); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("failed to parse next line entry: %w", err)
+		}
+		if startPC == 0 || entry.Address != startPC {
+			for _, file := range files {
+				ret = append(ret, rustRange{
+					start: startPC,
+					end:   entry.Address,
+					file:  file,
+				})
+			}
+			files = files[:0]
+			startPC = entry.Address
+		}
+		// Keep on collecting file names that are covered by the range.
+		files = append(files, entry.File.Name)
+	}
+	if startPC != 0 {
+		// We don't know the end PC for these, but let's still add them to the ranges.
+		for _, file := range files {
+			ret = append(ret, rustRange{
+				start: startPC,
+				end:   startPC + 1,
+				file:  file,
+			})
+		}
+	}
+	return ret, nil
+}
+
+func symbolizeModule(target *targets.Target, interner *symbolizer.Interner, kernelDirs *mgrconfig.KernelDirs,
+	splitBuildDelimiters []string, mod *vminfo.KernelModule, pcs []uint64) ([]*Frame, error) {
+	procs := min(runtime.GOMAXPROCS(0)/2, len(pcs)/1000)
 	const (
 		minProcs = 1
 		maxProcs = 4
 	)
 	// addr2line on a beefy vmlinux takes up to 1.6GB of RAM, so don't create too many of them.
-	if procs > maxProcs {
-		procs = maxProcs
-	}
-	if procs < minProcs {
-		procs = minProcs
-	}
+	procs = min(procs, maxProcs)
+	procs = max(procs, minProcs)
 	type symbolizerResult struct {
 		frames []symbolizer.Frame
 		err    error
 	}
 	symbolizerC := make(chan symbolizerResult, procs)
 	pcchan := make(chan []uint64, procs)
-	for p := 0; p < procs; p++ {
+	for range procs {
 		go func() {
-			symb := symbolizer.NewSymbolizer(target)
+			symb := symbolizer.Make(target)
 			defer symb.Close()
 			var res symbolizerResult
 			for pcs := range pcchan {
 				for i, pc := range pcs {
-					pcs[i] = pc - mod.Addr
+					if mod.Name == "" {
+						pcs[i] = pc
+					} else {
+						pcs[i] = pc - mod.Addr
+					}
 				}
-				frames, err := symb.SymbolizeArray(mod.Path, pcs)
+				frames, err := symb.Symbolize(mod.Path, pcs...)
 				if err != nil {
-					res.err = fmt.Errorf("failed to symbolize: %v", err)
+					res.err = fmt.Errorf("failed to symbolize: %w", err)
 				}
 				res.frames = append(res.frames, frames...)
 			}
@@ -337,28 +532,31 @@ func symbolizeModule(target *targets.Target, objDir, srcDir, buildDir string,
 		}()
 	}
 	for i := 0; i < len(pcs); {
-		end := i + 100
-		if end > len(pcs) {
-			end = len(pcs)
-		}
+		end := min(i+100, len(pcs))
 		pcchan <- pcs[i:end]
 		i = end
 	}
 	close(pcchan)
 	var err0 error
-	var frames []Frame
-	for p := 0; p < procs; p++ {
+	var frames []*Frame
+	for range procs {
 		res := <-symbolizerC
 		if res.err != nil {
 			err0 = res.err
 		}
 		for _, frame := range res.frames {
-			name, path := cleanPath(frame.File, objDir, srcDir, buildDir)
-			frames = append(frames, Frame{
-				Module: mod,
-				PC:     frame.PC + mod.Addr,
-				Name:   name,
-				Path:   path,
+			name, path := CleanPath(frame.File, kernelDirs, splitBuildDelimiters)
+			pc := frame.PC
+			if mod.Name != "" {
+				pc = frame.PC + mod.Addr
+			}
+			frames = append(frames, &Frame{
+				Module:   mod,
+				PC:       pc,
+				Name:     interner.Do(name),
+				FuncName: frame.Func,
+				Path:     interner.Do(path),
+				Inline:   frame.Inline,
 				Range: Range{
 					StartLine: frame.Line,
 					StartCol:  0,
@@ -374,17 +572,49 @@ func symbolizeModule(target *targets.Target, objDir, srcDir, buildDir string,
 	return frames, nil
 }
 
-func symbolize(target *targets.Target, objDir, srcDir, buildDir string,
-	pcs map[*Module][]uint64) ([]Frame, error) {
-	var frames []Frame
+func symbolize(target *targets.Target, interner *symbolizer.Interner, kernelDirs *mgrconfig.KernelDirs,
+	splitBuildDelimiters []string, pcs map[*vminfo.KernelModule][]uint64) ([]*Frame, error) {
+	var frames []*Frame
+	type frameResult struct {
+		frames []*Frame
+		err    error
+	}
+	frameC := make(chan frameResult, len(pcs))
 	for mod, pcs1 := range pcs {
-		frames1, err := symbolizeModule(target, objDir, srcDir, buildDir, mod, pcs1)
-		if err != nil {
-			return nil, err
+		go func(mod *vminfo.KernelModule, pcs []uint64) {
+			frames, err := symbolizeModule(target, interner, kernelDirs, splitBuildDelimiters, mod, pcs)
+			frameC <- frameResult{frames: frames, err: err}
+		}(mod, pcs1)
+	}
+	for range pcs {
+		res := <-frameC
+		if res.err != nil {
+			return nil, res.err
 		}
-		frames = append(frames, frames1...)
+		frames = append(frames, res.frames...)
 	}
 	return frames, nil
+}
+
+// nextCallTarget finds the next call instruction in data[] starting at *pos and returns that
+// instruction's target and pc.
+func nextCallTarget(arch *Arch, textAddr uint64, data []byte, pos *int) (uint64, uint64) {
+	for *pos < len(data) {
+		i := *pos
+		if i+arch.callLen > len(data) {
+			break
+		}
+		*pos += arch.scanSize
+		insn := data[i : i+arch.callLen]
+		if !arch.isCallInsn(arch, insn) {
+			continue
+		}
+		pc := textAddr + uint64(i)
+		callTarget := arch.callTarget(arch, insn, pc)
+		*pos = i + arch.scanSize
+		return callTarget, pc
+	}
+	return 0, 0
 }
 
 // readCoverPoints finds all coverage points (calls of __sanitizer_cov_trace_*) in the object file.
@@ -392,56 +622,30 @@ func symbolize(target *targets.Target, objDir, srcDir, buildDir string,
 // Running objdump on the whole object file is too slow.
 func readCoverPoints(target *targets.Target, info *symbolInfo, data []byte) ([2][]uint64, error) {
 	var pcs [2][]uint64
-	if info.tracePC == 0 {
+	if len(info.tracePC) == 0 {
 		return pcs, fmt.Errorf("no __sanitizer_cov_trace_pc symbol in the object file")
 	}
 
-	// Loop that's checking each instruction for the current architectures call
-	// opcode. When found, it compares the call target address with those of the
-	// __sanitizer_cov_trace_* functions we previously collected. When found,
-	// we collect the pc as a coverage point.
+	i := 0
 	arch := arches[target.Arch]
-	for i, opcode := range data {
-		if opcode != arch.opcodes[0] && opcode != arch.opcodes[1] {
-			continue
+	for {
+		callTarget, pc := nextCallTarget(arch, info.textAddr, data, &i)
+		if callTarget == 0 {
+			break
 		}
-		i -= arch.opcodeOffset
-		if i < 0 || i+arch.callLen > len(data) {
-			continue
-		}
-		pc := info.textAddr + uint64(i)
-		target := arch.target(&arch, data[i:], pc, opcode)
-		if target == info.tracePC {
+		if info.tracePC[callTarget] {
 			pcs[0] = append(pcs[0], pc)
-		} else if info.traceCmp[target] {
+		} else if info.traceCmp[callTarget] {
 			pcs[1] = append(pcs[1], pc)
 		}
 	}
 	return pcs, nil
 }
 
-func cleanPath(path, objDir, srcDir, buildDir string) (string, string) {
-	filename := ""
-	switch {
-	case strings.HasPrefix(path, objDir):
-		// Assume the file was built there.
-		path = strings.TrimPrefix(path, objDir)
-		filename = filepath.Join(objDir, path)
-	case strings.HasPrefix(path, buildDir):
-		// Assume the file was moved from buildDir to srcDir.
-		path = strings.TrimPrefix(path, buildDir)
-		filename = filepath.Join(srcDir, path)
-	default:
-		// Assume this is relative path.
-		filename = filepath.Join(srcDir, path)
-	}
-	return strings.TrimLeft(filepath.Clean(path), "/\\"), filename
-}
-
 // objdump is an old, slow way of finding coverage points.
 // amd64 uses faster option of parsing binary directly (readCoverPoints).
 // TODO: use the faster approach for all other arches and drop this.
-func objdump(target *targets.Target, mod *Module) ([2][]uint64, error) {
+func objdump(target *targets.Target, mod *vminfo.KernelModule) ([2][]uint64, error) {
 	var pcs [2][]uint64
 	cmd := osutil.Command(target.Objdump, "-d", "--no-show-raw-insn", mod.Path)
 	stdout, err := cmd.StdoutPipe()
@@ -455,7 +659,7 @@ func objdump(target *targets.Target, mod *Module) ([2][]uint64, error) {
 	}
 	defer stderr.Close()
 	if err := cmd.Start(); err != nil {
-		return pcs, fmt.Errorf("failed to run objdump on %v: %v", mod.Path, err)
+		return pcs, fmt.Errorf("failed to run objdump on %v: %w", mod.Path, err)
 	}
 	defer func() {
 		cmd.Process.Kill()
@@ -465,15 +669,18 @@ func objdump(target *targets.Target, mod *Module) ([2][]uint64, error) {
 	callInsns, traceFuncs := archCallInsn(target)
 	for s.Scan() {
 		if pc := parseLine(callInsns, traceFuncs, s.Bytes()); pc != 0 {
-			pcs[0] = append(pcs[0], pc+mod.Addr)
+			if mod.Name != "" {
+				pc = pc + mod.Addr
+			}
+			pcs[0] = append(pcs[0], pc)
 		}
 	}
-	stderrOut, _ := ioutil.ReadAll(stderr)
+	stderrOut, _ := io.ReadAll(stderr)
 	if err := cmd.Wait(); err != nil {
-		return pcs, fmt.Errorf("failed to run objdump on %v: %v\n%s", mod.Path, err, stderrOut)
+		return pcs, fmt.Errorf("failed to run objdump on %v: %w\n%s", mod.Path, err, stderrOut)
 	}
 	if err := s.Err(); err != nil {
-		return pcs, fmt.Errorf("failed to run objdump on %v: %v\n%s", mod.Path, err, stderrOut)
+		return pcs, fmt.Errorf("failed to run objdump on %v: %w\n%s", mod.Path, err, stderrOut)
 	}
 	return pcs, nil
 }
@@ -500,11 +707,11 @@ func parseLine(callInsns, traceFuncs [][]byte, ln []byte) uint64 {
 	for len(ln) != 0 && ln[0] == ' ' {
 		ln = ln[1:]
 	}
-	colon := bytes.IndexByte(ln, ':')
-	if colon == -1 {
+	before, _, ok := bytes.Cut(ln, []byte{':'})
+	if !ok {
 		return 0
 	}
-	pc, err := strconv.ParseUint(string(ln[:colon]), 16, 64)
+	pc, err := strconv.ParseUint(string(before), 16, 64)
 	if err != nil {
 		return 0
 	}
@@ -519,7 +726,11 @@ func archCallInsn(target *targets.Target) ([][]byte, [][]byte) {
 		return [][]byte{[]byte("\tcall ")}, callName
 	case targets.ARM64:
 		// ffff0000080d9cc0:       bl      ffff00000820f478 <__sanitizer_cov_trace_pc>
-		return [][]byte{[]byte("\tbl\t")}, callName
+		return [][]byte{[]byte("\tbl ")}, [][]byte{
+			[]byte("<__sanitizer_cov_trace_pc>"),
+			[]byte("<____sanitizer_cov_trace_pc_veneer>"),
+		}
+
 	case targets.ARM:
 		// 8010252c:       bl      801c3280 <__sanitizer_cov_trace_pc>
 		return [][]byte{[]byte("\tbl\t")}, callName
@@ -546,6 +757,9 @@ func archCallInsn(target *targets.Target) ([][]byte, [][]byte) {
 		// ffffffe000200018:       jal     ra,ffffffe0002935b0 <__sanitizer_cov_trace_pc>
 		// ffffffe0000010da:       jalr    1242(ra) # ffffffe0002935b0 <__sanitizer_cov_trace_pc>
 		return [][]byte{[]byte("\tjal\t"), []byte("\tjalr\t")}, callName
+	case targets.Loong64:
+		// 900000000001234:       bl      900000000005678 <__sanitizer_cov_trace_pc>
+		return [][]byte{[]byte("\tbl\t"), []byte("\tbl ")}, callName
 	default:
 		panic(fmt.Sprintf("unknown arch %q", target.Arch))
 	}

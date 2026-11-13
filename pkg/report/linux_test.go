@@ -6,7 +6,7 @@ package report
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -16,7 +16,9 @@ import (
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/symbolizer"
+	"github.com/google/syzkaller/pkg/vminfo"
 	"github.com/google/syzkaller/sys/targets"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestLinuxIgnores(t *testing.T) {
@@ -79,6 +81,57 @@ func TestLinuxIgnores(t *testing.T) {
 	}
 }
 
+func TestExtractFaultInjectionInfo(t *testing.T) {
+	reporter, _ := prepareLinuxReporter(t, targets.AMD64)
+	log := `
+[  602.265237][T27130] FAULT_INJECTION: forcing a failure.
+[  602.265237][T27130] name failslab, interval 1, probability 0, space 0, times 0
+[  602.267142][T27130] CPU: 1 PID: 27130 Comm: syz-executor2 Not tainted
+[  602.269685][T27130] Call Trace:
+[  602.270155][T27130]  dump_stack+0x1db/0x2d0
+[  602.272981][T27130]  should_fail.cold+0xa/0x14
+[  602.277933][T27130]  __should_failslab+0x121/0x190
+[  560.713151][T27130] WARNING: CPU: 2 PID: 1194 at net/xfrm/xfrm_state.c:2381 xfrm_state_fini+0x440/0x5c0
+`
+	want := `FAULT_INJECTION: forcing a failure.
+name failslab, interval 1, probability 0, space 0, times 0
+Call Trace:
+ dump_stack+0x1db/0x2d0
+ should_fail.cold+0xa/0x14
+ __should_failslab+0x121/0x190`
+	got, err := reporter.ExtractFaultInjectionInfo([]byte(log))
+	assert.NoError(t, err)
+	assert.Equal(t, want, got)
+}
+
+func TestExtractFaultInjectionInfoDeduplicates(t *testing.T) {
+	reporter, _ := prepareLinuxReporter(t, targets.AMD64)
+	log := `
+[  602.265237][T1] FAULT_INJECTION: forcing a failure.
+[  602.265237][T1] name failslab, interval 1, probability 0, space 0, times 0
+[  602.267142][T2] some unrelated line
+[  602.269685][T1] Call Trace:
+[  602.270155][T1]  dump_stack+0x1db/0x2d0
+[  602.272981][T1]  should_fail.cold+0xa/0x14
+[  560.713151][T1] WARNING: CPU: 2 PID: 1194 at net/xfrm/xfrm_state.c:2381 xfrm_state_fini+0x440/0x5c0
+[  603.265237][T2] FAULT_INJECTION: forcing a failure.
+[  603.265237][T2] name failslab, interval 1, probability 0, space 0, times 0
+[  603.267142][T2] CPU: 1 PID: 40000 Comm: syz-executor0 Not tainted
+[  603.269685][T2] Call Trace:
+[  603.270155][T2]  dump_stack+0x1db/0x2d0
+[  603.272981][T2]  should_fail.cold+0xa/0x14
+[  561.713151][T2] WARNING: CPU: 2 PID: 1194 at net/xfrm/xfrm_state.c:2381 xfrm_state_fini+0x440/0x5c0
+`
+	want := `FAULT_INJECTION: forcing a failure.
+name failslab, interval 1, probability 0, space 0, times 0
+Call Trace:
+ dump_stack+0x1db/0x2d0
+ should_fail.cold+0xa/0x14`
+	got, err := reporter.ExtractFaultInjectionInfo([]byte(log))
+	assert.NoError(t, err)
+	assert.Equal(t, want, got)
+}
+
 func TestLinuxSymbolizeLine(t *testing.T) {
 	tests := []struct {
 		line   string
@@ -136,30 +189,77 @@ func TestLinuxSymbolizeLine(t *testing.T) {
 		// Inlined frames.
 		{
 			"    [<ffffffff84e5bea0>] foo+0x141/0x185\n",
-			"    [<ffffffff84e5bea0>] inlined1 net.c:111 [inline]\n" +
-				"    [<ffffffff84e5bea0>] inlined2 mm.c:222 [inline]\n" +
-				"    [<ffffffff84e5bea0>] foo+0x141/0x185 kasan.c:333\n",
+			`    [<ffffffff84e5bea0>] inlined1 net.c:111 [inline]
+    [<ffffffff84e5bea0>] inlined2 mm.c:222 [inline]
+    [<ffffffff84e5bea0>] foo+0x141/0x185 kasan.c:333
+`,
 		},
 		// Several symbols with the same name.
 		{
 			"[<ffffffff82d1b1d9>] baz+0x101/0x200\n",
 			"[<ffffffff82d1b1d9>] baz+0x101/0x200 baz.c:100\n",
 		},
+		// Frame format with module+offset.
+		{
+			"[   50.419727][ T3822] baz+0x101/0x200 [beep]\n",
+			"[   50.419727][ T3822] baz+0x101/0x200 baz.c:100 [beep]\n",
+		},
+		// Frame format with module+offset and stracktrace_build_id.
+		{
+			"[   50.419727][ T3822] baz+0x101/0x200 [beep b31b29679ab712c360bddd861f655ab24898b4db]\n",
+			"[   50.419727][ T3822] baz+0x101/0x200 baz.c:100 [beep]\n",
+		},
+
+		// Frame format with module+offset for invalid module.
+		{
+			"[   50.419727][ T3822] baz+0x101/0x200 [invalid_module]\n",
+			"[   50.419727][ T3822] baz+0x101/0x200 [invalid_module]\n",
+		},
+		// Frame format with module+offset for missing symbol.
+		{
+			"[   50.419727][ T3822] missing_symbol+0x101/0x200 [beep]\n",
+			"[   50.419727][ T3822] missing_symbol+0x101/0x200 [beep]\n",
+		},
+		// Frame format with module+offset for invalid offset.
+		{
+			"[   50.419727][ T3822] baz+0x300/0x200 [beep]\n",
+			"[   50.419727][ T3822] baz+0x300/0x200 [beep]\n",
+		},
 	}
-	symbols := map[string][]symbolizer.Symbol{
-		"foo": {
-			{Addr: 0x1000000, Size: 0x190},
+	symbols := map[string]map[string][]symbolizer.Symbol{
+		"": {
+			"foo": {
+				{Addr: 0x1000000, Size: 0x190},
+			},
+			"do_ipv6_setsockopt.isra.7.part.3": {
+				{Addr: 0x2000000, Size: 0x2830},
+			},
+			"baz": {
+				{Addr: 0x3000000, Size: 0x100},
+				{Addr: 0x4000000, Size: 0x200},
+				{Addr: 0x5000000, Size: 0x300},
+			},
 		},
-		"do_ipv6_setsockopt.isra.7.part.3": {
-			{Addr: 0x2000000, Size: 0x2830},
-		},
-		"baz": {
-			{Addr: 0x3000000, Size: 0x100},
-			{Addr: 0x4000000, Size: 0x200},
-			{Addr: 0x5000000, Size: 0x300},
+		"beep": {
+			"baz": {
+				{Addr: 0x4000000, Size: 0x200},
+			},
 		},
 	}
 	symb := func(bin string, pc uint64) ([]symbolizer.Frame, error) {
+		if bin == "beep" {
+			switch pc {
+			case 0x4000100:
+				return []symbolizer.Frame{
+					{
+						File: "/linux/baz.c",
+						Line: 100,
+					},
+				}, nil
+			default:
+				return nil, fmt.Errorf("unknown pc 0x%x", pc)
+			}
+		}
 		if bin != "vmlinux" {
 			return nil, fmt.Errorf("unknown pc 0x%x", pc)
 		}
@@ -228,25 +328,53 @@ func TestLinuxSymbolizeLine(t *testing.T) {
 			return nil, fmt.Errorf("unknown pc 0x%x", pc)
 		}
 	}
+	modules := []*vminfo.KernelModule{
+		{
+			Name: "",
+			Path: "vmlinux",
+		},
+		{
+			Name: "beep",
+			Path: "beep",
+		},
+	}
+
+	cfg := &config{
+		kernelDirs: mgrconfig.KernelDirs{
+			Obj: "/linux",
+		},
+		kernelModules: modules,
+	}
+	ctx := &linux{
+		config:  cfg,
+		vmlinux: "vmlinux",
+		symbols: symbols,
+	}
 	for i, test := range tests {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
-			result := symbolizeLine(symb, symbols, "vmlinux", "/linux", []byte(test.line))
-			if test.result != string(result) {
-				t.Errorf("want %q\n\t     get %q", test.result, string(result))
+			rep := &Report{
+				Report: []byte(test.line),
 			}
+			err := ctx.symbolize(rep, symb)
+			assert.NoError(t, err)
+			assert.Equal(t, test.result, string(rep.Report))
 		})
 	}
 }
 
-func prepareLinuxReporter(t *testing.T, arch string) *linux {
-	config := &config{
-		target: targets.Get(targets.Linux, arch),
+func prepareLinuxReporter(t *testing.T, arch string) (*Reporter, *linux) {
+	cfg := &mgrconfig.Config{
+		Derived: mgrconfig.Derived{
+			TargetOS:   targets.Linux,
+			TargetArch: arch,
+			SysTarget:  targets.Get(targets.Linux, arch),
+		},
 	}
-	reporter, _, err := ctorLinux(config)
+	reporter, err := NewReporter(cfg)
 	if err != nil {
-		t.Errorf("Failed to create a reporter instance %#v", arch)
+		t.Errorf("failed to create a reporter instance for %#v: %v", arch, err)
 	}
-	return reporter.(*linux)
+	return reporter, reporter.impl.(*linux)
 }
 
 func TestParseLinuxOpcodes(t *testing.T) {
@@ -359,17 +487,16 @@ func TestParseLinuxOpcodes(t *testing.T) {
 	}
 
 	for idx, test := range tests {
-		test := test // Capturing the value.
 		t.Run(fmt.Sprintf("%s/%v", test.arch, idx), func(t *testing.T) {
 			t.Parallel()
-			reporter := prepareLinuxReporter(t, test.arch)
-			ret, err := reporter.parseOpcodes(test.input)
+			_, linuxReporter := prepareLinuxReporter(t, test.arch)
+			ret, err := linuxReporter.parseOpcodes(test.input)
 			if test.output == nil && err == nil {
-				t.Errorf("Expected an error on input %#v", test)
+				t.Errorf("expected an error on input %#v", test)
 			} else if test.output != nil && err != nil {
-				t.Errorf("Unexpected error %v on input %#v", err, test.input)
+				t.Errorf("unexpected error %v on input %#v", err, test.input)
 			} else if test.output != nil && !reflect.DeepEqual(ret, *test.output) {
-				t.Errorf("Expected: %#v, got: %#v", test.output, ret)
+				t.Errorf("expected: %#v, got: %#v", test.output, ret)
 			}
 		})
 	}
@@ -381,7 +508,7 @@ func TestDisassemblyInReports(t *testing.T) {
 	}
 
 	archPath := filepath.Join("testdata", "linux", "decompile")
-	subFolders, err := ioutil.ReadDir(archPath)
+	subFolders, err := os.ReadDir(archPath)
 	if err != nil {
 		t.Fatalf("disassembly reports failed: %v", err)
 	}
@@ -390,14 +517,13 @@ func TestDisassemblyInReports(t *testing.T) {
 		if !obj.IsDir() {
 			continue
 		}
-		reporter := prepareLinuxReporter(t, obj.Name())
-
-		if reporter.target.BrokenCompiler != "" {
-			t.Skip("skipping the test due to broken cross-compiler:\n" + reporter.target.BrokenCompiler)
+		reporter, linuxReporter := prepareLinuxReporter(t, obj.Name())
+		if linuxReporter.target.BrokenCompiler != "" {
+			t.Skip("skipping the test due to broken cross-compiler:\n" + linuxReporter.target.BrokenCompiler)
 		}
 
 		testPath := filepath.Join(archPath, obj.Name())
-		testFiles, err := ioutil.ReadDir(testPath)
+		testFiles, err := os.ReadDir(testPath)
 		if err != nil {
 			t.Fatalf("failed to list tests for %v: %v", obj.Name(), err)
 		}
@@ -408,31 +534,36 @@ func TestDisassemblyInReports(t *testing.T) {
 			}
 			filePath := filepath.Join(testPath, strings.TrimSuffix(file.Name(), ".in"))
 			t.Run(obj.Name()+"/"+file.Name(), func(t *testing.T) {
-				testDisassembly(t, reporter, filePath)
+				testDisassembly(t, reporter, linuxReporter, filePath)
 			})
 		}
 	}
 }
 
-func testDisassembly(t *testing.T, reporter *linux, testFilePrefix string) {
+func testDisassembly(t *testing.T, reporter *Reporter, linuxReporter *linux, testFilePrefix string) {
 	t.Parallel()
 
-	input, err := ioutil.ReadFile(testFilePrefix + ".in")
+	input, err := os.ReadFile(testFilePrefix + ".in")
 	if err != nil {
 		t.Fatalf("failed to read input file: %v", err)
 	}
 
-	result := reporter.decompileReportOpcodes(input)
+	report := reporter.Parse(input)
+	if report == nil {
+		t.Fatalf("no bug report was found")
+	}
+
+	result := linuxReporter.decompileOpcodes(input, report)
 	if *flagUpdate {
 		osutil.WriteFile(testFilePrefix+".out", result)
 	}
 
-	output, err := ioutil.ReadFile(testFilePrefix + ".out")
+	output, err := os.ReadFile(testFilePrefix + ".out")
 	if err != nil {
 		t.Fatalf("failed to read output file: %v", err)
 	}
 
 	if !bytes.Equal(output, result) {
-		t.Fatalf("Expected:\n%s\nGot:\n%s\n", output, result)
+		t.Fatalf("expected:\n%s\ngot:\n%s", output, result)
 	}
 }

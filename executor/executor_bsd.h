@@ -15,6 +15,11 @@
 #include <sys/sysctl.h>
 #endif
 
+#if GOOS_freebsd
+#include <sys/procctl.h>
+#include <sys/wait.h>
+#endif
+
 static void os_init(int argc, char** argv, void* data, size_t data_size)
 {
 #if GOOS_openbsd
@@ -27,26 +32,80 @@ static void os_init(int argc, char** argv, void* data, size_t data_size)
 	int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
 #endif
 
-	int flags = MAP_ANON | MAP_PRIVATE | MAP_FIXED;
+	int flags = MAP_ANON | MAP_PRIVATE | MAP_FIXED_EXCLUSIVE;
 #if GOOS_freebsd
 	// Fail closed if the chosen data offset conflicts with an existing mapping.
 	flags |= MAP_EXCL;
 #endif
 
-	if (mmap(data, data_size, prot, flags, -1, 0) != data)
-		fail("mmap of data segment failed");
+	void* got = mmap(data, data_size, prot, flags, -1, 0);
+	if (data != got)
+		failmsg("mmap of data segment failed", "want %p, got %p", data, got);
 
 	// Makes sure the file descriptor limit is sufficient to map control pipes.
 	struct rlimit rlim;
 	rlim.rlim_cur = rlim.rlim_max = kMaxFd;
 	setrlimit(RLIMIT_NOFILE, &rlim);
+
+	// A SIGCHLD handler makes sleep in loop exit immediately return with EINTR with a child exits.
+	struct sigaction act = {};
+	act.sa_handler = [](int) {};
+	sigaction(SIGCHLD, &act, nullptr);
+}
+
+// Test programs run as root and BSDs don't have pid namespaces, so a single kill(-1, ...)
+// (or one of its equivalents) kills sshd, the executor runner and other system processes,
+// and we lose the connection to the VM. Restrict signals to the program's own process group
+// (which contains only the executor processes of this proc and the processes they created).
+static bool in_own_process_group(int pid)
+{
+	return pid > 0 && getpgid(pid) == getpgrp();
+}
+
+static bool signals_foreign_processes(const call_t* c, intptr_t a[kMaxArgs])
+{
+	if (strcmp(c->name, "kill") == 0) {
+		int pid = (int)a[0];
+		if (pid == 0)
+			return false; // own process group
+		if (pid < 0)
+			return pid == -1 || -pid != getpgrp();
+		return !in_own_process_group(pid);
+	}
+	if (strcmp(c->name, "sigqueue") == 0)
+		return !in_own_process_group((int)a[0]);
+#if GOOS_freebsd
+	if (strcmp(c->name, "procctl$PROC_REAP_KILL") == 0) {
+		// The signal is delivered to descendants of the target process' reaper, which is init
+		// unless the target has acquired the reaper status itself. So only allow this
+		// for the program process itself, and only if it is a reaper.
+		if ((idtype_t)a[0] != P_PID)
+			return false; // rejected by the kernel
+		int pid = (int)a[1];
+		if (pid != 0 && pid != getpid())
+			return true;
+		struct procctl_reaper_status rs = {};
+		if (procctl(P_PID, getpid(), PROC_REAP_STATUS, &rs))
+			return true;
+		return !(rs.rs_flags & REAPER_STATUS_OWNED);
+	}
+#endif
+	return false;
 }
 
 static intptr_t execute_syscall(const call_t* c, intptr_t a[kMaxArgs])
 {
+	if (signals_foreign_processes(c, a)) {
+		errno = EPERM;
+		return -1;
+	}
 	if (c->call)
 		return c->call(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+#if GOOS_openbsd
+	failmsg("no call", "missing target for %s", c->name);
+#else
 	return __syscall(c->sys_nr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+#endif
 }
 
 static void cover_open(cover_t* cov, bool extra)
@@ -61,7 +120,7 @@ static void cover_open(cover_t* cov, bool extra)
 #if GOOS_freebsd
 	if (ioctl(cov->fd, KIOSETBUFSIZE, kCoverSize))
 		fail("ioctl init trace write failed");
-	size_t mmap_alloc_size = kCoverSize * KCOV_ENTRY_SIZE;
+	cov->data_size = kCoverSize * KCOV_ENTRY_SIZE;
 #elif GOOS_openbsd
 	unsigned long cover_size = kCoverSize;
 	if (ioctl(cov->fd, KIOSETBUFSIZE, &cover_size))
@@ -73,7 +132,7 @@ static void cover_open(cover_t* cov, bool extra)
 		if (ioctl(cov->fd, KIOREMOTEATTACH, &args))
 			fail("ioctl remote attach failed");
 	}
-	size_t mmap_alloc_size = kCoverSize * (is_kernel_64_bit ? 8 : 4);
+	cov->data_size = kCoverSize * (is_kernel_64_bit ? 8 : 4);
 #elif GOOS_netbsd
 	uint64_t cover_size;
 	if (extra) {
@@ -90,26 +149,38 @@ static void cover_open(cover_t* cov, bool extra)
 		if (ioctl(cov->fd, KCOV_IOC_SETBUFSIZE, &cover_size))
 			fail("ioctl init trace write failed");
 	}
-	size_t mmap_alloc_size = cover_size * KCOV_ENTRY_SIZE;
+	cov->data_size = cover_size * KCOV_ENTRY_SIZE;
 #endif
+}
 
-	void* mmap_ptr = mmap(NULL, mmap_alloc_size, PROT_READ | PROT_WRITE,
+static void cover_mmap(cover_t* cov)
+{
+	if (cov->mmap_alloc_ptr != NULL)
+		fail("cover_mmap invoked on an already mmapped cover_t object");
+	cov->mmap_alloc_size = cov->data_size;
+	void* mmap_ptr = mmap(NULL, cov->mmap_alloc_size, PROT_READ | PROT_WRITE,
 			      MAP_SHARED, cov->fd, 0);
 	if (mmap_ptr == MAP_FAILED)
 		fail("cover mmap failed");
+	cov->mmap_alloc_ptr = (char*)mmap_ptr;
 	cov->data = (char*)mmap_ptr;
-	cov->data_end = cov->data + mmap_alloc_size;
+	cov->data_end = cov->data + cov->mmap_alloc_size;
 	cov->data_offset = is_kernel_64_bit ? sizeof(uint64_t) : sizeof(uint32_t);
 	cov->pc_offset = 0;
 }
 
 static void cover_protect(cover_t* cov)
 {
+	// Threads created for requests that don't collect coverage may have no kcov buffer mmapped
+	// (with delayed kcov mmap), but write_output() still protects/unprotects their cover_t.
+	// There is nothing to protect in that case.
+	if (cov->mmap_alloc_ptr == NULL)
+		return;
 #if GOOS_freebsd
 	size_t mmap_alloc_size = kCoverSize * KCOV_ENTRY_SIZE;
 	long page_size = sysconf(_SC_PAGESIZE);
 	if (page_size > 0)
-		mprotect(cov->data + page_size, mmap_alloc_size - page_size,
+		mprotect(cov->mmap_alloc_ptr + page_size, mmap_alloc_size - page_size,
 			 PROT_READ);
 #elif GOOS_openbsd
 	int mib[2], page_size;
@@ -118,18 +189,22 @@ static void cover_protect(cover_t* cov)
 	mib[1] = HW_PAGESIZE;
 	size_t len = sizeof(page_size);
 	if (sysctl(mib, ARRAY_SIZE(mib), &page_size, &len, NULL, 0) != -1)
-		mprotect(cov->data + page_size, mmap_alloc_size - page_size, PROT_READ);
+		mprotect(cov->mmap_alloc_ptr + page_size, mmap_alloc_size - page_size, PROT_READ);
 #endif
 }
 
 static void cover_unprotect(cover_t* cov)
 {
+	if (cov == nullptr)
+		fail("cover_unprotect invoked without cover_t");
+	if (cov->mmap_alloc_ptr == NULL)
+		return; // See the comment in cover_protect().
 #if GOOS_freebsd
 	size_t mmap_alloc_size = kCoverSize * KCOV_ENTRY_SIZE;
-	mprotect(cov->data, mmap_alloc_size, PROT_READ | PROT_WRITE);
+	mprotect(cov->mmap_alloc_ptr, mmap_alloc_size, PROT_READ | PROT_WRITE);
 #elif GOOS_openbsd
 	size_t mmap_alloc_size = kCoverSize * sizeof(uintptr_t);
-	mprotect(cov->data, mmap_alloc_size, PROT_READ | PROT_WRITE);
+	mprotect(cov->mmap_alloc_ptr, mmap_alloc_size, PROT_READ | PROT_WRITE);
 #endif
 }
 
@@ -164,19 +239,18 @@ static void cover_collect(cover_t* cov)
 	cov->size = *(uint64*)cov->data;
 }
 
-static bool use_cover_edges(uint64 pc)
-{
-	return true;
-}
-
 #if GOOS_netbsd
 #define SYZ_HAVE_FEATURES 1
 static feature_t features[] = {
-    {"usb", setup_usb},
-    {"fault", setup_fault},
+    {rpc::Feature::USBEmulation, setup_usb},
+    {rpc::Feature::Fault, setup_fault},
 };
 
 static void setup_sysctl(void)
+{
+}
+
+static void setup_cgroups(void)
 {
 }
 #endif

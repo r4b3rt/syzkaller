@@ -1,17 +1,17 @@
 # Copyright 2020 syzkaller project authors. All rights reserved.
 # Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-kernel:
- repo: https://github.com/google/kmsan.git
- tag: kmsan-v5.12-rc6
+compiler: /usr/bin/clang
 
 config:
  - KMSAN
+ - KMSAN_CHECK_PARAM_RETVAL
  # Crash the kernel after the first KMSAN report.
- - CMDLINE: [append, "panic_on_kmsan=1"]
+ - CMDLINE: [append, "kmsan.panic=1"]
 
  # Avoid reboot loop in instrumented kernel:
- - PREEMPT_NONE
+ # Since v6.19 PREEMPT_NONE depends on ARCH_NO_PREEMPT. And KMSAN just works w/o PREEMPT_NONE.
+ - PREEMPT_NONE: [-v6.19]
  - PREEMPT: [n, weak]
  - HYPERV: [n, weak]
 
@@ -23,13 +23,15 @@ config:
  - HARDENED_USERCOPY: [n, weak]
  - HARDENED_USERCOPY_FALLBACK: [n, weak]
 
+ # Stack protector is broken in Clang before version 17.
+ # See https://github.com/ClangBuiltLinux/linux/issues/1815 for details.
+ - STACKPROTECTOR: n
+
  # KMSAN doesn't support ORC unwinder (https://github.com/google/kmsan/issues/48).
  - UNWINDER_FRAME_POINTER
 
- - HYPERVISOR_GUEST: n
- - PARAVIRT: n
  - PARAVIRT_SPINLOCKS: [n, weak]
- - PARAVIRT_DEBUG: [n, weak]
+ - PARAVIRT_DEBUG: [n, weak, -v6.19]
  - CPU_IDLE_GOV_HALTPOLL: [n, weak]
  - BPF_JIT: [n, weak]
  - MTD_BLOCK: [n, weak]
@@ -63,8 +65,9 @@ config:
  - UBIFS_FS_ZSTD: [n, weak]
  - UBIFS_FS_SECURITY: [n, weak]
  - CRYPTO_AEGIS128_AESNI_SSE2: [n, weak]
- - CRYPTO_NHPOLY1305_SSE2: [n, weak]
- - CRYPTO_NHPOLY1305_AVX2: [n, weak]
+ # CRYPTO_NHPOLY1305_* removed by "lib/crypto: x86/nh: Migrate optimized code into library"
+ - CRYPTO_NHPOLY1305_SSE2: [n, weak, -v6.19]
+ - CRYPTO_NHPOLY1305_AVX2: [n, weak, -v6.19]
  - CRYPTO_CRC32C_INTEL: [n, weak]
  - CRYPTO_CRC32_PCLMUL: [n, weak]
  - CRYPTO_CRCT10DIF_PCLMUL: [n, weak]

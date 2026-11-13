@@ -6,9 +6,11 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/google/syzkaller/pkg/kconfig"
 	"github.com/google/syzkaller/pkg/vcs"
@@ -18,6 +20,8 @@ import (
 type Instance struct {
 	Name      string
 	Kernel    Kernel
+	Compiler  string
+	Linker    string
 	Verbatim  []byte
 	Shell     []Shell
 	Features  Features
@@ -60,12 +64,7 @@ func (features Features) Match(constraints []string) bool {
 }
 
 func constraintsInclude(constraints []string, what string) bool {
-	for _, feat := range constraints {
-		if feat == what {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(constraints, what)
 }
 
 type rawMain struct {
@@ -78,21 +77,23 @@ type rawFile struct {
 		Repo string
 		Tag  string
 	}
+	Compiler string
+	Linker   string
 	Shell    []yaml.Node
 	Verbatim string
 	Config   []yaml.Node
 }
 
 func parseMainSpec(file string) ([]*Instance, []string, error) {
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read config file: %v", err)
+		return nil, nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	raw := new(rawMain)
 	if err := dec.Decode(raw); err != nil {
-		return nil, nil, fmt.Errorf("failed to parse %v: %v", file, err)
+		return nil, nil, fmt.Errorf("failed to parse %v: %w", file, err)
 	}
 	var unusedFeatures []string
 	var instances []*Instance
@@ -104,13 +105,11 @@ func parseMainSpec(file string) ([]*Instance, []string, error) {
 			}
 			inst, err := parseInstance(name, filepath.Dir(file), features, raw.Includes)
 			if err != nil {
-				return nil, nil, fmt.Errorf("%v: %v", name, err)
+				return nil, nil, fmt.Errorf("%v: %w", name, err)
 			}
 			instances = append(instances, inst)
-			if constraintsInclude(features, featBaseline) {
-				continue
-			}
-			inst, err = parseInstance(name+"-base", filepath.Dir(file), append(features, featBaseline), raw.Includes)
+			inst, err = parseInstance(name+"-base", filepath.Dir(file),
+				append(features, featBaseline, featBaseConfig), raw.Includes)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -154,15 +153,15 @@ func parseInstance(name, configDir string, features []string, includes []map[str
 }
 
 func parseFile(file string) (*rawFile, error) {
-	data, err := ioutil.ReadFile(file)
+	data, err := os.ReadFile(file)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read %v: %v", file, err)
+		return nil, fmt.Errorf("failed to read %v: %w", file, err)
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	raw := new(rawFile)
 	if err := dec.Decode(raw); err != nil {
-		return nil, fmt.Errorf("failed to parse %v: %v", file, err)
+		return nil, fmt.Errorf("failed to parse %v: %w", file, err)
 	}
 	return raw, nil
 }
@@ -180,17 +179,33 @@ func mergeFile(inst *Instance, raw *rawFile, file string, errs *Errors) {
 		}
 		inst.Kernel = raw.Kernel
 	}
+	if raw.Compiler != "" {
+		if inst.Compiler != "" {
+			errs.push("%v: compiler is set twice", file)
+		}
+		inst.Compiler = raw.Compiler
+	}
+	if raw.Linker != "" {
+		if inst.Linker != "" {
+			errs.push("%v: linker is set twice", file)
+		}
+		inst.Linker = raw.Linker
+	}
+	prependShell := []Shell{}
 	for _, node := range raw.Shell {
 		cmd, _, constraints, err := parseNode(node)
 		if err != nil {
 			errs.push("%v:%v: %v", file, node.Line, err)
 		}
-		inst.Shell = append(inst.Shell, Shell{
+		prependShell = append(prependShell, Shell{
 			Cmd:         cmd,
 			Constraints: constraints,
 		})
 	}
-	inst.Verbatim = append(append(inst.Verbatim, raw.Verbatim...), '\n')
+	inst.Shell = append(prependShell, inst.Shell...)
+	if raw.Verbatim != "" {
+		inst.Verbatim = append(append(inst.Verbatim, strings.TrimSpace(raw.Verbatim)...), '\n')
+	}
 	for _, node := range raw.Config {
 		mergeConfig(inst, file, node, false, errs)
 	}
@@ -301,6 +316,8 @@ func parseNode(node yaml.Node) (name, val string, constraints []string, err erro
 			val = `"` + prop + `"`
 		} else if prop == "n" {
 			val = kconfig.No
+		} else if prop == "y" {
+			val = kconfig.Yes
 		} else if intVal, err := strconv.ParseUint(prop, 0, 64); err == nil {
 			val = fmt.Sprint(intVal)
 		} else {
@@ -312,7 +329,7 @@ func parseNode(node yaml.Node) (name, val string, constraints []string, err erro
 
 type Errors []byte
 
-func (errs *Errors) push(msg string, args ...interface{}) {
+func (errs *Errors) push(msg string, args ...any) {
 	*errs = append(*errs, fmt.Sprintf(msg+"\n", args...)...)
 }
 

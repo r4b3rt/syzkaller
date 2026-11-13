@@ -8,11 +8,11 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 `syzkaller` (`[siːzˈkɔːlə]`) is an unsupervised coverage-guided kernel fuzzer.\
-Supported OSes: `Akaros`, `FreeBSD`, `Fuchsia`, `gVisor`, `Linux`, `NetBSD`, `OpenBSD`, `Windows`.
+Supported OSes: `FreeBSD`, `Fuchsia`, `gVisor`, `Linux`, `NetBSD`, `OpenBSD`, `Windows`.
 
 Mailing list: [syzkaller@googlegroups.com](https://groups.google.com/forum/#!forum/syzkaller) (join on [web](https://groups.google.com/forum/#!forum/syzkaller) or by [email](mailto:syzkaller+subscribe@googlegroups.com)).
 
-Found bugs: [Akaros](docs/akaros/found_bugs.md), [Darwin/XNU](docs/darwin/README.md), [FreeBSD](docs/freebsd/found_bugs.md), [Linux](docs/linux/found_bugs.md), [NetBSD](docs/netbsd/found_bugs.md), [OpenBSD](docs/openbsd/found_bugs.md), [Windows](docs/windows/README.md).
+Found bugs: [Darwin/XNU](docs/darwin/README.md), [FreeBSD](docs/freebsd/found_bugs.md), [Linux](docs/linux/found_bugs.md), [NetBSD](docs/netbsd/found_bugs.md), [OpenBSD](docs/openbsd/found_bugs.md), [Windows](docs/windows/README.md).
 
 ## Documentation
 
@@ -20,18 +20,20 @@ Initially, syzkaller was developed with Linux kernel fuzzing in mind, but now
 it's being extended to support other OS kernels as well.
 Most of the documentation at this moment is related to the [Linux](docs/linux/setup.md) kernel.
 For other OS kernels check:
-[Akaros](docs/akaros/README.md),
 [Darwin/XNU](docs/darwin/README.md),
 [FreeBSD](docs/freebsd/README.md),
 [Fuchsia](docs/fuchsia/README.md),
 [NetBSD](docs/netbsd/README.md),
 [OpenBSD](docs/openbsd/setup.md),
+[Starnix](docs/starnix/README.md),
 [Windows](docs/windows/README.md),
-[gVisor](docs/gvisor/README.md).
+[gVisor](docs/gvisor/README.md),
+[Akaros](docs/akaros/README.md).
 
 - [How to install syzkaller](docs/setup.md)
 - [How to use syzkaller](docs/usage.md)
 - [How syzkaller works](docs/internals.md)
+- [How to install syzbot](docs/setup_syzbot.md)
 - [How to contribute to syzkaller](docs/contributing.md)
 - [How to report Linux kernel bugs](docs/linux/reporting_kernel_bugs.md)
 - [Tech talks and articles](docs/talks.md)

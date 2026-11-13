@@ -4,12 +4,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
+	"path/filepath"
 
 	"github.com/google/syzkaller/pkg/csource"
+	"github.com/google/syzkaller/pkg/flatrpc"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/osutil"
@@ -22,6 +24,10 @@ var (
 	flagConfig = flag.String("config", "", "manager configuration file (manager.cfg)")
 	flagCount  = flag.Int("count", 0, "number of VMs to use (overrides config count param)")
 	flagDebug  = flag.Bool("debug", false, "print debug output")
+	flagOutput = flag.String("output", filepath.Join(".", "repro.txt"), "output syz repro file (repro.txt)")
+	flagCRepro = flag.String("crepro", filepath.Join(".", "repro.c"), "output c file (repro.c)")
+	flagTitle  = flag.String("title", "", "where to save the title of the reproduced bug")
+	flagStrace = flag.String("strace", "", "output strace log (strace_bin must be set)")
 )
 
 func main() {
@@ -35,7 +41,7 @@ func main() {
 		log.Fatalf("%v: %v", *flagConfig, err)
 	}
 	logFile := flag.Args()[0]
-	data, err := ioutil.ReadFile(logFile)
+	data, err := os.ReadFile(logFile)
 	if err != nil {
 		log.Fatalf("failed to open log file %v: %v", logFile, err)
 	}
@@ -43,48 +49,105 @@ func main() {
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
-	vmCount := vmPool.Count()
-	if *flagCount > 0 && *flagCount < vmCount {
-		vmCount = *flagCount
-	}
-	if vmCount > 4 {
-		vmCount = 4
-	}
-	vmIndexes := make([]int, vmCount)
-	for i := range vmIndexes {
-		vmIndexes[i] = i
-	}
+	defer vmPool.Close()
 	reporter, err := report.NewReporter(cfg)
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
 	osutil.HandleInterrupts(vm.Shutdown)
 
-	res, stats, err := repro.Run(data, cfg, nil, reporter, vmPool, vmIndexes)
+	count := vmPool.Count()
+	if *flagCount > 0 {
+		count = *flagCount
+	}
+	pool := vm.NewDispatcher(vmPool, nil)
+	pool.ReserveForRun(count)
+
+	ctx, done := context.WithCancel(context.Background())
+	go func() {
+		defer done()
+
+		res, stats, err := repro.Run(ctx, data, repro.Environment{
+			Config:   cfg,
+			Features: flatrpc.AllFeatures,
+			Reporter: reporter,
+			Pool:     pool,
+		})
+		if err != nil {
+			log.Logf(0, "reproduction failed: %v", err)
+		}
+		if stats != nil {
+			fmt.Printf("extracting prog: %v\n", stats.ExtractProgTime)
+			fmt.Printf("minimizing prog: %v\n", stats.MinimizeProgTime)
+			fmt.Printf("simplifying prog options: %v\n", stats.SimplifyProgTime)
+			fmt.Printf("extracting C: %v\n", stats.ExtractCTime)
+			fmt.Printf("simplifying C: %v\n", stats.SimplifyCTime)
+		}
+		if res == nil {
+			return
+		}
+
+		fmt.Printf("opts: %+v crepro: %v\n\n", res.Opts, res.CRepro)
+		progSerialized := res.Prog.Serialize()
+		fmt.Printf("%s\n", progSerialized)
+		if err = osutil.WriteFile(*flagOutput, progSerialized); err == nil {
+			fmt.Printf("program saved to %s\n", *flagOutput)
+		} else {
+			log.Logf(0, "failed to write prog to file: %v", err)
+		}
+
+		if res.Report != nil && *flagTitle != "" {
+			recordTitle(res, *flagTitle)
+		}
+		if res.CRepro {
+			recordCRepro(res, *flagCRepro)
+		}
+		if *flagStrace != "" {
+			result := repro.RunStrace(res, cfg, reporter, pool)
+			recordStraceResult(result, *flagStrace)
+		}
+	}()
+	pool.Loop(ctx)
+}
+
+func recordTitle(res *repro.Result, fileName string) {
+	if err := osutil.WriteFile(fileName, []byte(res.Report.Title)); err == nil {
+		fmt.Printf("bug title saved to %s\n", *flagTitle)
+	} else {
+		log.Logf(0, "failed to write bug title to file: %v", err)
+	}
+}
+
+func recordCRepro(res *repro.Result, fileName string) {
+	src, err := csource.Write(res.Prog, res.Opts)
 	if err != nil {
-		log.Logf(0, "reproduction failed: %v", err)
+		log.Fatalf("failed to generate C repro: %v", err)
 	}
-	if stats != nil {
-		fmt.Printf("extracting prog: %v\n", stats.ExtractProgTime)
-		fmt.Printf("minimizing prog: %v\n", stats.MinimizeProgTime)
-		fmt.Printf("simplifying prog options: %v\n", stats.SimplifyProgTime)
-		fmt.Printf("extracting C: %v\n", stats.ExtractCTime)
-		fmt.Printf("simplifying C: %v\n", stats.SimplifyCTime)
+	if formatted, err := csource.Format(src); err == nil {
+		src = formatted
 	}
-	if res == nil {
+	fmt.Printf("%s\n", src)
+
+	if err := osutil.WriteFile(fileName, src); err == nil {
+		fmt.Printf("C file saved to %s\n", *flagCRepro)
+	} else {
+		log.Logf(0, "failed to write C repro to file: %v", err)
+	}
+}
+
+func recordStraceResult(result *repro.StraceResult, fileName string) {
+	if result.Error != nil {
+		log.Logf(0, "failed to run strace: %v", result.Error)
 		return
 	}
-
-	fmt.Printf("opts: %+v crepro: %v\n\n", res.Opts, res.CRepro)
-	fmt.Printf("%s\n", res.Prog.Serialize())
-	if res.CRepro {
-		src, err := csource.Write(res.Prog, res.Opts)
-		if err != nil {
-			log.Fatalf("failed to generate C repro: %v", err)
-		}
-		if formatted, err := csource.Format(src); err == nil {
-			src = formatted
-		}
-		fmt.Printf("%s\n", src)
+	if result.Report != nil {
+		log.Logf(0, "under strace repro crashed with title: %s", result.Report.Title)
+	} else {
+		log.Logf(0, "repro didn't crash under strace")
+	}
+	if err := osutil.WriteFile(fileName, result.Output); err == nil {
+		fmt.Printf("C file saved to %s\n", *flagStrace)
+	} else {
+		log.Logf(0, "failed to write strace output to file: %v", err)
 	}
 }

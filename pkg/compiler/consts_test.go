@@ -4,10 +4,10 @@
 package compiler
 
 import (
-	"io/ioutil"
+	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
+	"slices"
 	"testing"
 
 	"github.com/google/syzkaller/pkg/ast"
@@ -15,7 +15,7 @@ import (
 )
 
 func TestExtractConsts(t *testing.T) {
-	data, err := ioutil.ReadFile(filepath.Join("testdata", "consts.txt"))
+	data, err := os.ReadFile(filepath.Join("testdata", "consts.txt"))
 	if err != nil {
 		t.Fatalf("failed to read input file: %v", err)
 	}
@@ -38,11 +38,15 @@ func TestExtractConsts(t *testing.T) {
 		"CONST11", "CONST12", "CONST13", "CONST14", "CONST15",
 		"CONST16", "CONST17", "CONST18", "CONST19", "CONST20",
 		"CONST21", "CONST22", "CONST23", "CONST24", "CONST25",
-		"CONST26",
+		"CONST26", "CONST27",
 	}
-	sort.Strings(wantConsts)
-	if !reflect.DeepEqual(info.Consts, wantConsts) {
-		t.Fatalf("got consts:\n%q\nwant:\n%q", info.Consts, wantConsts)
+	slices.Sort(wantConsts)
+	var constNames []string
+	for _, def := range info.Consts {
+		constNames = append(constNames, def.Name)
+	}
+	if !reflect.DeepEqual(constNames, wantConsts) {
+		t.Fatalf("got consts:\n%q\nwant:\n%q", constNames, wantConsts)
 	}
 	wantIncludes := []string{"foo/bar.h", "bar/foo.h"}
 	if !reflect.DeepEqual(info.Includes, wantIncludes) {

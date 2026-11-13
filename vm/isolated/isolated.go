@@ -1,13 +1,14 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package isolated implements host management for target machines accessed directly.
 package isolated
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,13 +19,16 @@ import (
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
+	"github.com/google/syzkaller/sys/targets"
 	"github.com/google/syzkaller/vm/vmimpl"
 )
 
 const pstoreConsoleFile = "/sys/fs/pstore/console-ramoops-0"
 
 func init() {
-	vmimpl.Register("isolated", ctor, false)
+	vmimpl.Register("isolated", vmimpl.Type{
+		Ctor: ctor,
+	})
 }
 
 type Config struct {
@@ -35,6 +39,7 @@ type Config struct {
 	USBDevNums    []string `json:"usb_device_num"` // /sys/bus/usb/devices/
 	StartupScript string   `json:"startup_script"` // script to execute after each startup
 	Pstore        bool     `json:"pstore"`         // use crashlogs from pstore
+	SystemSSHCfg  bool     `json:"system_ssh_cfg"` // whether to allow system-wide SSH configuration
 }
 
 type Pool struct {
@@ -43,16 +48,14 @@ type Pool struct {
 }
 
 type instance struct {
-	cfg         *Config
+	cfg *Config
+	vmimpl.SSHOptions
 	os          string
-	targetAddr  string
-	targetPort  int
 	index       int
 	closed      chan bool
 	debug       bool
-	sshUser     string
-	sshKey      string
 	forwardPort int
+	timeouts    targets.Timeouts
 }
 
 func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
@@ -71,19 +74,12 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	}
 	for _, target := range cfg.Targets {
 		if _, _, err := splitTargetPort(target); err != nil {
-			return nil, fmt.Errorf("bad target %q: %v", target, err)
+			return nil, fmt.Errorf("bad target %q: %w", target, err)
 		}
 	}
 	if len(cfg.USBDevNums) > 0 {
 		if len(cfg.USBDevNums) != len(cfg.Targets) {
 			return nil, fmt.Errorf("the number of Targets and the number of USBDevNums should be same")
-		}
-	}
-	if env.Debug && len(cfg.Targets) > 1 {
-		log.Logf(0, "limiting number of targets from %v to 1 in debug mode", len(cfg.Targets))
-		cfg.Targets = cfg.Targets[:1]
-		if len(cfg.USBDevNums) > 1 {
-			cfg.USBDevNums = cfg.USBDevNums[:1]
 		}
 	}
 	pool := &Pool{
@@ -97,18 +93,21 @@ func (pool *Pool) Count() int {
 	return len(pool.cfg.Targets)
 }
 
-func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
+func (pool *Pool) Create(_ context.Context, workdir string, index int) (vmimpl.Instance, error) {
 	targetAddr, targetPort, _ := splitTargetPort(pool.cfg.Targets[index])
 	inst := &instance{
-		cfg:        pool.cfg,
-		os:         pool.env.OS,
-		targetAddr: targetAddr,
-		targetPort: targetPort,
-		index:      index,
-		closed:     make(chan bool),
-		debug:      pool.env.Debug,
-		sshUser:    pool.env.SSHUser,
-		sshKey:     pool.env.SSHKey,
+		cfg: pool.cfg,
+		os:  pool.env.OS,
+		SSHOptions: vmimpl.SSHOptions{
+			Addr: targetAddr,
+			Port: targetPort,
+			User: pool.env.SSHUser,
+			Key:  pool.env.SSHKey,
+		},
+		index:    index,
+		closed:   make(chan bool),
+		debug:    pool.env.Debug,
+		timeouts: pool.env.Timeouts,
 	}
 	closeInst := inst
 	defer func() {
@@ -117,7 +116,7 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 		}
 	}()
 	if err := inst.repair(); err != nil {
-		return nil, fmt.Errorf("repair failed: %v", err)
+		return nil, fmt.Errorf("repair failed: %w", err)
 	}
 
 	// Remount to writable.
@@ -160,8 +159,8 @@ func (inst *instance) ssh(command string) error {
 	}
 	// TODO(dvyukov): who is closing rpipe?
 
-	args := append(vmimpl.SSHArgs(inst.debug, inst.sshKey, inst.targetPort),
-		inst.sshUser+"@"+inst.targetAddr, command)
+	args := append(vmimpl.SSHArgs(inst.debug, inst.Key, inst.Port, inst.cfg.SystemSSHCfg),
+		inst.User+"@"+inst.Addr, command)
 	if inst.debug {
 		log.Logf(0, "running command: ssh %#v", args)
 	}
@@ -187,11 +186,11 @@ func (inst *instance) ssh(command string) error {
 	}()
 	if err := cmd.Wait(); err != nil {
 		close(done)
-		out, _ := ioutil.ReadAll(rpipe)
+		out, _ := io.ReadAll(rpipe)
 		if inst.debug {
 			log.Logf(0, "ssh failed: %v\n%s", err, out)
 		}
-		return fmt.Errorf("ssh %+v failed: %v\n%s", args, err, out)
+		return fmt.Errorf("ssh %+v failed: %w\n%s", args, err, out)
 	}
 	close(done)
 	if inst.debug {
@@ -224,11 +223,11 @@ func (inst *instance) repair() error {
 		if len(inst.cfg.USBDevNums) > 0 {
 			log.Logf(2, "isolated: trying to reboot by USB authorization")
 			usbAuth := fmt.Sprintf("%s%s%s", "/sys/bus/usb/devices/", inst.cfg.USBDevNums[inst.index], "/authorized")
-			if err := ioutil.WriteFile(usbAuth, []byte("0"), 0); err != nil {
+			if err := os.WriteFile(usbAuth, []byte("0"), 0); err != nil {
 				log.Logf(2, "isolated: failed to turn off the device")
 				return err
 			}
-			if err := ioutil.WriteFile(usbAuth, []byte("1"), 0); err != nil {
+			if err := os.WriteFile(usbAuth, []byte("1"), 0); err != nil {
 				log.Logf(2, "isolated: failed to turn on the device")
 				return err
 			}
@@ -236,20 +235,20 @@ func (inst *instance) repair() error {
 			log.Logf(2, "isolated: ssh succeeded, trying to reboot by ssh")
 			inst.ssh("reboot") // reboot will return an error, ignore it
 			if err := inst.waitRebootAndSSH(5*60, 30*time.Minute); err != nil {
-				return fmt.Errorf("waitRebootAndSSH failed: %v", err)
+				return fmt.Errorf("waitRebootAndSSH failed: %w", err)
 			}
 		}
 	}
 	if inst.cfg.StartupScript != "" {
 		log.Logf(2, "isolated: executing startup_script")
 		// Execute the contents of the StartupScript on the DUT.
-		contents, err := ioutil.ReadFile(inst.cfg.StartupScript)
+		contents, err := os.ReadFile(inst.cfg.StartupScript)
 		if err != nil {
-			return fmt.Errorf("unable to read startup_script: %v", err)
+			return fmt.Errorf("unable to read startup_script: %w", err)
 		}
 		c := string(contents)
 		if err := inst.ssh(fmt.Sprintf("bash -c \"%v\"", vmimpl.EscapeDoubleQuotes(c))); err != nil {
-			return fmt.Errorf("failed to execute startup_script: %v", err)
+			return fmt.Errorf("failed to execute startup_script: %w", err)
 		}
 		log.Logf(2, "isolated: done executing startup_script")
 	}
@@ -257,8 +256,7 @@ func (inst *instance) repair() error {
 }
 
 func (inst *instance) waitForSSH(timeout time.Duration) error {
-	return vmimpl.WaitForSSH(inst.debug, timeout, inst.targetAddr, inst.sshKey, inst.sshUser,
-		inst.os, inst.targetPort, nil)
+	return vmimpl.WaitForSSH(timeout, inst.SSHOptions, inst.os, nil, inst.cfg.SystemSSHCfg, inst.debug)
 }
 
 func (inst *instance) waitForReboot(timeout int) error {
@@ -279,44 +277,34 @@ func (inst *instance) waitForReboot(timeout int) error {
 	return fmt.Errorf("isolated: the machine did not reboot on repair")
 }
 
-func (inst *instance) Close() {
+func (inst *instance) Close() error {
 	close(inst.closed)
+	return nil
 }
 
 func (inst *instance) Copy(hostSrc string) (string, error) {
 	baseName := filepath.Base(hostSrc)
 	vmDst := filepath.Join(inst.cfg.TargetDir, baseName)
 	inst.ssh("pkill -9 '" + baseName + "'; rm -f '" + vmDst + "'")
-	args := append(vmimpl.SCPArgs(inst.debug, inst.sshKey, inst.targetPort),
-		hostSrc, inst.sshUser+"@"+inst.targetAddr+":"+vmDst)
-	cmd := osutil.Command("scp", args...)
-	if inst.debug {
-		log.Logf(0, "running command: scp %#v", args)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stdout
-	}
-	if err := cmd.Start(); err != nil {
-		return "", err
-	}
-	done := make(chan bool)
-	go func() {
-		select {
-		case <-time.After(3 * time.Minute):
-			cmd.Process.Kill()
-		case <-done:
-		}
-	}()
-	err := cmd.Wait()
-	close(done)
+	err := vmimpl.SCP(hostSrc, vmDst, vmimpl.SCPOptions{
+		Debug:        inst.debug,
+		Key:          inst.Key,
+		Port:         inst.Port,
+		SystemSSHCfg: inst.cfg.SystemSSHCfg,
+		User:         inst.User,
+		Addr:         inst.Addr,
+		Timeout:      3 * time.Minute,
+	})
 	if err != nil {
 		return "", err
 	}
 	return vmDst, nil
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
-	<-chan []byte, <-chan error, error) {
-	args := append(vmimpl.SSHArgs(inst.debug, inst.sshKey, inst.targetPort), inst.sshUser+"@"+inst.targetAddr)
+func (inst *instance) Run(ctx context.Context, command string) (
+	<-chan vmimpl.Chunk, <-chan error, error) {
+	args := append(vmimpl.SSHArgs(inst.debug, inst.Key, inst.Port, inst.cfg.SystemSSHCfg),
+		inst.User+"@"+inst.Addr)
 	dmesg, err := vmimpl.OpenRemoteConsole("ssh", args...)
 	if err != nil {
 		return nil, nil, err
@@ -327,42 +315,58 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 		dmesg.Close()
 		return nil, nil, err
 	}
-
-	args = vmimpl.SSHArgsForward(inst.debug, inst.sshKey, inst.targetPort, inst.forwardPort)
-	if inst.cfg.Pstore {
-		args = append(args, "-o", "ServerAliveInterval=6")
-		args = append(args, "-o", "ServerAliveCountMax=5")
-	}
-	args = append(args, inst.sshUser+"@"+inst.targetAddr, "cd "+inst.cfg.TargetDir+" && exec "+command)
-	if inst.debug {
-		log.Logf(0, "running command: ssh %#v", args)
-	}
-	cmd := osutil.Command("ssh", args...)
-	cmd.Stdout = wpipe
-	cmd.Stderr = wpipe
-	if err := cmd.Start(); err != nil {
+	rpipeErr, wpipeErr, err := osutil.LongPipe()
+	if err != nil {
 		dmesg.Close()
 		rpipe.Close()
 		wpipe.Close()
 		return nil, nil, err
 	}
+
+	args = vmimpl.SSHArgsForward(inst.debug, inst.Key, inst.Port, inst.forwardPort, inst.cfg.SystemSSHCfg)
+	if inst.cfg.Pstore {
+		args = append(args, "-o", "ServerAliveInterval=6")
+		args = append(args, "-o", "ServerAliveCountMax=5")
+	}
+	args = append(args, inst.User+"@"+inst.Addr, "cd "+inst.cfg.TargetDir+" && exec "+command)
+	if inst.debug {
+		log.Logf(0, "running command: ssh %#v", args)
+	}
+	cmd := osutil.Command("ssh", args...)
+	cmd.Stdout = wpipe
+	cmd.Stderr = wpipeErr
+	if err := cmd.Start(); err != nil {
+		dmesg.Close()
+		rpipe.Close()
+		wpipe.Close()
+		rpipeErr.Close()
+		wpipeErr.Close()
+		return nil, nil, err
+	}
 	wpipe.Close()
+	wpipeErr.Close()
 
 	var tee io.Writer
 	if inst.debug {
 		tee = os.Stdout
 	}
 	merger := vmimpl.NewOutputMerger(tee)
-	merger.Add("dmesg", dmesg)
-	merger.Add("ssh", rpipe)
+	merger.Add("dmesg", vmimpl.OutputConsole, dmesg)
+	merger.Add("ssh", vmimpl.OutputStdout, rpipe)
+	merger.Add("ssh-err", vmimpl.OutputStderr, rpipeErr)
 
-	return vmimpl.Multiplex(cmd, merger, dmesg, timeout, stop, inst.closed, inst.debug)
+	return vmimpl.Multiplex(ctx, cmd, merger, vmimpl.MultiplexConfig{
+		Console: dmesg,
+		Close:   inst.closed,
+		Debug:   inst.debug,
+		Scale:   inst.timeouts.Scale,
+	})
 }
 
 func (inst *instance) readPstoreContents() ([]byte, error) {
 	log.Logf(0, "reading pstore contents")
-	args := append(vmimpl.SSHArgs(inst.debug, inst.sshKey, inst.targetPort),
-		inst.sshUser+"@"+inst.targetAddr, "cat "+pstoreConsoleFile+" && rm "+pstoreConsoleFile)
+	args := append(vmimpl.SSHArgs(inst.debug, inst.Key, inst.Port, inst.cfg.SystemSSHCfg),
+		inst.User+"@"+inst.Addr, "cat "+pstoreConsoleFile+" && rm "+pstoreConsoleFile)
 	if inst.debug {
 		log.Logf(0, "running command: ssh %#v", args)
 	}
@@ -371,7 +375,7 @@ func (inst *instance) readPstoreContents() ([]byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("unable to read pstore file: %v: %v", err, stderr.String())
+		return nil, fmt.Errorf("unable to read pstore file: %w: %v", err, stderr.String())
 	}
 	return stdout.Bytes(), nil
 }
@@ -395,18 +399,19 @@ func (inst *instance) Diagnose(rep *report.Report) ([]byte, bool) {
 }
 
 func splitTargetPort(addr string) (string, int, error) {
-	target := addr
-	port := 22
-	if colonPos := strings.Index(addr, ":"); colonPos != -1 {
-		p, err := strconv.ParseUint(addr[colonPos+1:], 10, 16)
-		if err != nil {
-			return "", 0, err
+	target, portStr, ok := strings.Cut(addr, ":")
+	if !ok {
+		if addr == "" {
+			return "", 0, fmt.Errorf("target is empty")
 		}
-		target = addr[:colonPos]
-		port = int(p)
+		return addr, 22, nil
+	}
+	p, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return "", 0, err
 	}
 	if target == "" {
 		return "", 0, fmt.Errorf("target is empty")
 	}
-	return target, port, nil
+	return target, int(p), nil
 }

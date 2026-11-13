@@ -2,7 +2,6 @@
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
 //go:build linux
-// +build linux
 
 package linux
 
@@ -198,12 +197,8 @@ func testAlg(t *testing.T, typ, name string) (ok, skip bool) {
 		len(name) >= int(unsafe.Sizeof(addr.name)) {
 		return false, true
 	}
-	for i := 0; i < len(typ); i++ {
-		addr.typ[i] = typ[i]
-	}
-	for i := 0; i < len(name); i++ {
-		addr.name[i] = name[i]
-	}
+	copy(addr.typ[:], typ)
+	copy(addr.name[:], name)
 	sock, err := syscall.Socket(AF_ALG, syscall.SOCK_SEQPACKET, 0)
 	if err != nil {
 		t.Fatalf("failed to create AF_ALG socket: %v", err)

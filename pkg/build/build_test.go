@@ -4,16 +4,151 @@
 package build
 
 import (
+	"bytes"
 	"fmt"
+	"io/fs"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/google/syzkaller/pkg/debugtracer"
+	"github.com/google/syzkaller/pkg/osutil"
+	"github.com/google/syzkaller/pkg/vcs"
+	"github.com/google/syzkaller/sys/targets"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestLinuxBuildSandbox(t *testing.T) {
+	osutil.RequireSandbox(t)
+	dir := osutil.SandboxTempDir(t)
+	secret := filepath.Join(dir, "secret")
+	require.NoError(t, os.WriteFile(secret, []byte("secret"), 0600))
+	t.Setenv("SYZ_TEST_FORBIDDEN", secret)
+
+	params := makeLinuxBuildParams(t, dir)
+	details, err := Image(params)
+	require.NoError(t, err)
+	require.Equal(t, "fake compiler", details.CompilerID)
+	require.NotEmpty(t, details.Signature)
+	require.FileExists(t, filepath.Join(params.OutputDir, "kernel"))
+	require.FileExists(t, filepath.Join(params.OutputDir, "image"))
+	require.FileExists(t, filepath.Join(params.OutputDir, "obj", "vmlinux"))
+	assert.False(t, osutil.IsSandboxOwned(t, filepath.Join(params.OutputDir, "obj", "vmlinux")))
+	require.NoError(t, Clean(params))
+
+	t.Run("disabled", func(t *testing.T) {
+		t.Setenv("SYZ_DISABLE_SANDBOXING", "yes")
+		params.Tracer = &debugtracer.TestTracer{T: t}
+		_, err := Image(params)
+		require.Error(t, err)
+		for _, msg := range []string{
+			"user is root, want syzkaller",
+			"able to read " + secret,
+			"able to write " + secret,
+			"able to write to " + dir,
+			"able to connect to local TCP port",
+		} {
+			assert.ErrorContains(t, err, msg)
+		}
+	})
+}
+
+// TestLinuxBuildSymlinks checks that a malicious kernel build can't trick us into
+// leaking or overwriting files that the sandboxed build itself can't access.
+func TestLinuxBuildSymlinks(t *testing.T) {
+	osutil.RequireSandbox(t)
+	// The secret also looks like compile.h, so that it could leak via the compiler ID.
+	const secret = `#define LINUX_COMPILER "secret"`
+	for _, test := range []struct {
+		symlink string // "target file": the build replaces file with a symlink after the make target
+		wantErr bool
+	}{
+		// Files that we write: symlinks must be replaced.
+		{"distclean .config", false},
+		{"oldconfig certs/signing_key.pem", false},
+		{"oldconfig scripts/gcc-plugins/randomize_layout_seed.h", false},
+		// Escaping directory symlinks on the write path must fail.
+		{"oldconfig certs", true},
+		// Files that we read: symlinks must not be followed.
+		{"oldconfig .config", true},
+		{"bzImage include/generated/compile.h", true},
+		{"bzImage arch/x86/boot/bzImage", true},
+		{"bzImage vmlinux", true},
+	} {
+		t.Run(test.symlink, func(t *testing.T) {
+			params := makeLinuxBuildParams(t, osutil.SandboxTempDir(t))
+			secretFile := filepath.Join(t.TempDir(), "secret")
+			require.NoError(t, os.WriteFile(secretFile, []byte(secret), 0600))
+			t.Setenv("SYZ_TEST_SYMLINK", test.symlink+" "+secretFile)
+			// Clean the kernel before the build similarly to bisection.
+			require.NoError(t, Clean(params))
+			details, err := Image(params)
+			require.Equal(t, test.wantErr, err != nil, "error: %v", err)
+			assert.NotContains(t, details.CompilerID, "secret")
+			data, err := os.ReadFile(secretFile)
+			require.NoError(t, err)
+			assert.Equal(t, secret, string(data))
+			// Note: ReadFile follows symlinks, so symlinks to the secret are detected as well.
+			err = filepath.WalkDir(params.OutputDir, func(path string, d fs.DirEntry, err error) error {
+				if err != nil || d.IsDir() {
+					return err
+				}
+				data, err := os.ReadFile(path)
+				assert.NotContains(t, string(data), secret, path)
+				return err
+			})
+			require.NoError(t, err)
+		})
+	}
+}
+
+// TestLinuxBuildVmlinuxImage checks the build on the arches where vmlinux itself is the kernel image.
+func TestLinuxBuildVmlinuxImage(t *testing.T) {
+	osutil.RequireSandbox(t)
+	params := makeLinuxBuildParams(t, osutil.SandboxTempDir(t))
+	params.TargetArch = targets.MIPS64LE
+	require.Equal(t, "vmlinux", LinuxKernelImage(params.TargetArch))
+	details, err := Image(params)
+	require.NoError(t, err)
+	assert.NotEmpty(t, details.Signature)
+	vmlinux, err := os.ReadFile(filepath.Join(params.OutputDir, "obj", "vmlinux"))
+	require.NoError(t, err)
+	kernel, err := os.ReadFile(filepath.Join(params.OutputDir, "kernel"))
+	require.NoError(t, err)
+	assert.NotEmpty(t, kernel)
+	assert.True(t, bytes.Equal(vmlinux, kernel), "kernel image differs from vmlinux")
+	// The original vmlinux must be moved rather than copied to the output dir.
+	assert.NoFileExists(t, filepath.Join(params.KernelDir, "vmlinux"))
+}
+
+// makeLinuxBuildParams checks out the fake test kernel into dir and returns build params for it.
+func makeLinuxBuildParams(t *testing.T, dir string) Params {
+	remote, _ := MakeTestKernelRepo(t, filepath.Join(dir, "remote"))
+	kernelDir := filepath.Join(dir, "kernel")
+	repo, err := vcs.NewRepo(targets.Linux, "", kernelDir)
+	require.NoError(t, err)
+	_, err = repo.Poll(remote.Dir, "master")
+	require.NoError(t, err)
+	image := filepath.Join(dir, "image")
+	require.NoError(t, osutil.WriteFile(image, nil))
+	return Params{
+		TargetOS:     targets.Linux,
+		TargetArch:   targets.AMD64,
+		VMType:       "qemu",
+		KernelDir:    kernelDir,
+		OutputDir:    filepath.Join(dir, "out"),
+		UserspaceDir: image,
+		Config:       []byte("CONFIG_FOO=y\n"),
+		Tracer:       &debugtracer.TestTracer{T: t},
+	}
+}
 
 func TestCompilerIdentity(t *testing.T) {
 	t.Parallel()
 	for _, compiler := range []string{"gcc", "clang", "bazel"} {
-		compiler := compiler
 		t.Run(compiler, func(t *testing.T) {
 			t.Parallel()
 			if _, err := exec.LookPath(compiler); err != nil {
@@ -36,9 +171,8 @@ func TestCompilerIdentity(t *testing.T) {
 	}
 }
 
-func TestExtractRootCause(t *testing.T) {
+func TestExtractCauseInner(t *testing.T) {
 	for i, test := range rootCauseTests {
-		test := test
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
 			reason, file := extractCauseInner([]byte(test.e), test.src)
 			if test.reason != string(reason) {
@@ -46,6 +180,36 @@ func TestExtractRootCause(t *testing.T) {
 			}
 			if test.file != file {
 				t.Errorf("expected file: %q, got: %q", test.file, file)
+			}
+		})
+	}
+}
+
+func TestExtractRootCause(t *testing.T) {
+	targetOs := targets.TestOS
+	for i, test := range rootCauseTests {
+		var expected error
+		err := &osutil.VerboseError{Output: []byte(test.e)}
+		if test.reason == "" {
+			continue
+		} else if test.reason == "Killed" {
+			err.ExitCode = 137
+			targetOs = targets.Linux
+			expected = &InfraError{
+				Title:  test.reason,
+				Output: err.Output,
+			}
+		} else {
+			expected = &KernelError{
+				Report:     []byte(test.reason),
+				Output:     err.Output,
+				guiltyFile: test.file,
+			}
+		}
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			got := ExtractRootCause(err, targetOs, test.src)
+			if got != nil {
+				assert.Equal(t, expected, got)
 			}
 		})
 	}
@@ -125,8 +289,7 @@ INFO: 0 processes.
 FAILED: Build did NOT complete successfully (189 packages loaded)
 `,
 		`ERROR: /kernel/vdso/BUILD:13:1: no such target '@bazel_tools//tools/cpp:cc_flags': target 'cc_flags' not declared in package 'tools/cpp' defined by /syzkaller/home/.cache/bazel/_bazel_root/e1c9d86bae2b34f90e83d224bc900958/external/bazel_tools/tools/cpp/BUILD and referenced by '//vdso:vdso'
-ERROR: Analysis of target '//runsc:runsc' failed; build aborted: Analysis failed
-FAILED: Build did NOT complete successfully (189 packages loaded)`,
+ERROR: Analysis of target '//runsc:runsc' failed; build aborted: Analysis failed`,
 		"",
 		"",
 	},
@@ -529,6 +692,74 @@ make: *** No rule to make target 'include/config/auto.conf', needed by 'include/
 make: *** Waiting for unfinished jobs....
 `,
 		"make: *** No rule to make target 'include/config/auto.conf', needed by 'include/config/kernel.release'.  Stop.",
+		"",
+		"",
+	},
+	{`
+sh: 1: column: not found
+FAILED: host_x64/obj/tools/docsgen/clidoc_out.tar.gz
+../../build/rbe/output-scanner.sh --label //tools/docsgen:invoke_clidoc\(//build/toolchain:host_x64\) host_x64/obj/tools/docsgen/clidoc_out.tar.gz -- ../../build/gn_run_binary.sh ../../prebuilt/third_party/clang/linux-x64/bin host_x64/clidoc -o host_x64/gen/tools/docsgen/sdk-docs --quiet --tarball-dir host_x64/obj/tools/docsgen/clidoc_out.tar.gz --depfile host_x64/obj/tools/docsgen/invoke_clidoc.d
+Error: Unable to write generate doc for "/syzkaller/managers/main/kernel/out/x64/host_x64/fpublish" to "host_x64/gen/tools/docsgen/sdk-docs"
+Caused by:
+    Error running help: Unexpected non-zero error code with tool "/syzkaller/managers/main/kernel/out/x64/host_x64/fpublish"
+                and subcommands [].
+ninja: build stopped: subcommand failed.
+`,
+		`Error: Unable to write generate doc for "/syzkaller/managers/main/kernel/out/x64/host_x64/fpublish" to "host_x64/gen/tools/docsgen/sdk-docs"`,
+		"",
+		"",
+	},
+	{`
+  AR      built-in.a
+  AR      vmlinux.a
+  LD      vmlinux.o
+Killed
+make[1]: *** [scripts/Makefile.vmlinux_o:61: vmlinux.o] Error 137
+make[1]: *** Deleting file 'vmlinux.o'
+make: *** [Makefile:1231: vmlinux_o] Error 2
+`,
+		"Killed",
+		"",
+		"",
+	},
+	{`
+  RUSTC L rust/kernel.o
+error[E0599]: no method named ` + "`data`" + ` found for struct ` + "`core::pin::Pin<kbox::Box<T, Kmalloc>>`" +
+		` in the current scope
+  --> rust/kernel/usb.rs:92:34
+   |
+92 |         T::disconnect(intf, data.data());
+   |                                  ^^^^ method not found in ` + "`Pin<Box<T, Kmalloc>>`" + `
+
+error: aborting due to 1 previous error
+
+For more information about this error, try ` + "`rustc --explain E0599`" + `.
+make[2]: *** [rust/Makefile:553: rust/kernel.o] Error 1
+make[1]: *** [/syzkaller/managers/ci-upstream-rust-kasan-gce/kernel/Makefile:1308: prepare] Error 2
+make: *** [Makefile:248: __sub-make] Error 2
+`,
+		"error[E0599]: no method named `data` found for struct `core::pin::Pin<kbox::Box<T, Kmalloc>>` in the current scope",
+		"",
+		"",
+	},
+	{`
+  CC      kernel/trace/bpf_trace.o
+error: unknown warning option '-Wno-suggest-attribute=format'; did you mean '-Wno-property-attribute-mismatch'? [-Werror,-Wunknown-warning-option]
+make[4]: *** [scripts/Makefile.build:287: kernel/trace/bpf_trace.o] Error 1
+`,
+		`error: unknown warning option '-Wno-suggest-attribute=format'; did you mean '-Wno-property-attribute-mismatch'? [-Werror,-Wunknown-warning-option]`,
+		"",
+		"",
+	},
+	{`
+  REMOVE  arch/x86/include/generated/asm/.tmp_cpufeaturemasks.h
+  UPD     arch/x86/include/generated/asm/cpufeaturemasks.h
+mv: cannot stat 'arch/x86/include/generated/asm/.tmp_cpufeaturemasks.h': No such file or directory
+make[1]: *** [arch/x86/Makefile:269: arch/x86/include/generated/asm/cpufeaturemasks.h] Error 1
+make[1]: *** Waiting for unfinished jobs....
+make: *** [Makefile:248: __sub-make] Error 2
+`,
+		"mv: cannot stat 'arch/x86/include/generated/asm/.tmp_cpufeaturemasks.h': No such file or directory",
 		"",
 		"",
 	},

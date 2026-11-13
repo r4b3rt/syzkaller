@@ -35,6 +35,21 @@ Google Inc.
  Patrick Meyer
  Zi Fan Tan
  Christian Resell
+ Hrutvik Kanabar
+ Zachary O'Keefe
+ Etienne Perot
+ Hidenori Kobayashi
+ Florent Revest
+ Gabe Kirkpatrick
+ Kevin Krakauer
+ Pimyn Girgis
+ Ethan Graham
+ Yulong Zhang
+ Tamas Koczka
+ Marcel Busch
+ Teja Vojjala
+ Chuyang Wang
+ Rob Glew
 Baozeng Ding
 Lorenzo Stoakes
 Jeremy Huang
@@ -62,8 +77,14 @@ Kamil Rytarowski
 Siddharth Muralee
 Dan Robertson
 Mark Johnston
-Mellanox Technologies
+ShengYi Hung
+Intel Corporation
+ Pengfei Xu
+ Yanting Jiang
+ Igor Chervatyuk
+NVIDIA Corporation & Affiliates
  Noa Osherovich
+ Jason Gunthorpe
 Cody Holliday
 JinWoo Lee
 Andrew Turner
@@ -72,12 +93,14 @@ Christoph Paasch
 Collabora
  André Almeida
  Ricardo Cañuelo
+ Muhammad Usama Anjum
 Dipanjan Das
 Daimeng Wang
 Jukka Kaartinen
 Alexander Egorenkov
 Matthew Halchyshak
 Heyuan Shi
+kiwigitops
 Marijo Simunovic
 Jouni Högander
 VMware
@@ -97,3 +120,56 @@ ANSSI
 Desmond Cheong Zhi Xi
 Chuck Silvers
 Pavel Skripkin
+Linaro
+ Lee Jones
+ Tudor Ambarus
+Sabyrzhan Tasbolatov
+Adam Goska
+Kouame Behouba Manassé
+Junquan Zhou
+Liz Prucka
+George Kennedy
+Arm Ltd
+ Andrew Turner
+h0wdy
+Dylan Yudaken
+Marius Fleischer
+Piotr Siminski
+Purdue University
+ Sungwoo Kim
+Krzysztof Pawlaczyk
+Simone Weiß
+Amazon
+ Bjoern Doebel
+Viacheslav Sablin
+Davide Ornaghi
+Ramneet Singh
+Ji Hyeon Jeong
+Rivos Inc.
+ Alexandre Ghiti
+Jeongjun Park
+Nikita Zhandarovich
+Jiacheng Xu
+Kuzey Arda Bulut
+International Business Machines Corporation
+ Andrew Donnellan
+ Alexander Egorenkov
+ Alexey Kardashevskiy
+Yuan Tan
+Institute of Software Chinese Academy of Sciences
+ Jiakai Xu
+Berk Cem Goksel
+Nikolay Ivchenko
+Oleg Kulachenko
+Daniel Bransky
+Matan Kalina
+Xianjun Zeng
+Peiyang He
+Alhuda Khan
+Felix Hoffmann
+manchangfengxu
+Roshan Kumar
+Pavel Nikulshin
+MPIRIC PVT LIMITED
+ Shardul Bankar
+Ethan Aldrich

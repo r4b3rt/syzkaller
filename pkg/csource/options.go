@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/google/syzkaller/pkg/mgrconfig"
@@ -19,12 +18,12 @@ import (
 // Dashboard also provides serialized Options along with syzkaller reproducers.
 type Options struct {
 	Threaded    bool   `json:"threaded,omitempty"`
-	Collide     bool   `json:"collide,omitempty"`
 	Repeat      bool   `json:"repeat,omitempty"`
 	RepeatTimes int    `json:"repeat_times,omitempty"` // if non-0, repeat that many times
 	Procs       int    `json:"procs"`
 	Slowdown    int    `json:"slowdown"`
 	Sandbox     string `json:"sandbox"`
+	SandboxArg  int    `json:"sandbox_arg"`
 
 	Leak bool `json:"leak,omitempty"` // do leak checking
 
@@ -37,24 +36,27 @@ type Options struct {
 	CloseFDs      bool `json:"close_fds"`
 	KCSAN         bool `json:"kcsan,omitempty"`
 	DevlinkPCI    bool `json:"devlinkpci,omitempty"`
+	NicVF         bool `json:"nicvf,omitempty"`
 	USB           bool `json:"usb,omitempty"`
 	VhciInjection bool `json:"vhci,omitempty"`
 	Wifi          bool `json:"wifi,omitempty"`
 	IEEE802154    bool `json:"ieee802154,omitempty"`
 	Sysctl        bool `json:"sysctl,omitempty"`
+	Swap          bool `json:"swap,omitempty"`
 
 	UseTmpDir  bool `json:"tmpdir,omitempty"`
 	HandleSegv bool `json:"segv,omitempty"`
 
-	// Generate code for use with repro package to prints log messages,
-	// which allows to detect hangs.
-	Repro bool `json:"repro,omitempty"`
 	Trace bool `json:"trace,omitempty"`
+
+	CallComments bool `json:"callcomments,omitempty"`
+
 	LegacyOptions
 }
 
-// These are legacy options, they remain only for the sake of backward compatibility.
+// LegacyOptions are legacy options that remain only for the sake of backward compatibility.
 type LegacyOptions struct {
+	Collide   bool `json:"collide,omitempty"`
 	Fault     bool `json:"fault,omitempty"`
 	FaultCall int  `json:"fault_call,omitempty"`
 	FaultNth  int  `json:"fault_nth,omitempty"`
@@ -124,11 +126,11 @@ func (opts Options) checkLinuxOnly(OS string) error {
 	if OS == targets.Linux {
 		return nil
 	}
-	if opts.NetInjection && !(OS == targets.OpenBSD || OS == targets.FreeBSD || OS == targets.NetBSD) {
+	if opts.NetInjection && OS != targets.OpenBSD && OS != targets.FreeBSD && OS != targets.NetBSD {
 		return fmt.Errorf("option NetInjection is not supported on %v", OS)
 	}
 	if opts.Sandbox == sandboxNamespace ||
-		(opts.Sandbox == sandboxSetuid && !(OS == targets.OpenBSD || OS == targets.FreeBSD || OS == targets.NetBSD)) ||
+		(opts.Sandbox == sandboxSetuid && OS != targets.OpenBSD && OS != targets.FreeBSD && OS != targets.NetBSD) ||
 		opts.Sandbox == sandboxAndroid {
 		return fmt.Errorf("option Sandbox=%v is not supported on %v", opts.Sandbox, OS)
 	}
@@ -140,6 +142,7 @@ func (opts Options) checkLinuxOnly(OS string) error {
 		"CloseFDs":      &opts.CloseFDs,
 		"KCSAN":         &opts.KCSAN,
 		"DevlinkPCI":    &opts.DevlinkPCI,
+		"NicVF":         &opts.NicVF,
 		"USB":           &opts.USB,
 		"VhciInjection": &opts.VhciInjection,
 		"Wifi":          &opts.Wifi,
@@ -147,6 +150,7 @@ func (opts Options) checkLinuxOnly(OS string) error {
 		"Fault":         &opts.Fault,
 		"Leak":          &opts.Leak,
 		"Sysctl":        &opts.Sysctl,
+		"Swap":          &opts.Swap,
 	} {
 		if *opt {
 			return fmt.Errorf("option %v is not supported on %v", name, OS)
@@ -157,15 +161,14 @@ func (opts Options) checkLinuxOnly(OS string) error {
 
 func DefaultOpts(cfg *mgrconfig.Config) Options {
 	opts := Options{
-		Threaded:   true,
-		Collide:    true,
-		Repeat:     true,
-		Procs:      cfg.Procs,
-		Slowdown:   cfg.Timeouts.Slowdown,
-		Sandbox:    cfg.Sandbox,
-		UseTmpDir:  true,
-		HandleSegv: true,
-		Repro:      true,
+		Threaded:     true,
+		Repeat:       true,
+		Procs:        cfg.Procs,
+		Slowdown:     cfg.Timeouts.Slowdown,
+		Sandbox:      cfg.Sandbox,
+		UseTmpDir:    true,
+		HandleSegv:   true,
+		CallComments: true,
 	}
 	if cfg.TargetOS == targets.Linux {
 		opts.NetInjection = true
@@ -175,11 +178,13 @@ func DefaultOpts(cfg *mgrconfig.Config) Options {
 		opts.BinfmtMisc = true
 		opts.CloseFDs = true
 		opts.DevlinkPCI = true
+		opts.NicVF = true
 		opts.USB = true
 		opts.VhciInjection = true
 		opts.Wifi = true
 		opts.IEEE802154 = true
 		opts.Sysctl = true
+		opts.Swap = true
 	}
 	if cfg.Sandbox == "" || cfg.Sandbox == "setuid" {
 		opts.NetReset = false
@@ -198,6 +203,72 @@ func (opts Options) Serialize() []byte {
 	return data
 }
 
+func deserializeLegacyOptions(data string, opts *Options) (int, error) {
+	ignoreBool := true
+	keyToTarget := map[string]any{
+		"Threaded":      &opts.Threaded,
+		"Collide":       &opts.Collide,
+		"Repeat":        &opts.Repeat,
+		"Procs":         &opts.Procs,
+		"Sandbox":       &opts.Sandbox,
+		"SandboxArg":    &opts.SandboxArg,
+		"Fault":         &opts.Fault,
+		"FaultCall":     &opts.FaultCall,
+		"FaultNth":      &opts.FaultNth,
+		"EnableTun":     &opts.NetInjection,
+		"UseTmpDir":     &opts.UseTmpDir,
+		"EnableCgroups": &opts.Cgroups,
+		"HandleSegv":    &opts.HandleSegv,
+		"WaitRepeat":    &ignoreBool,
+		"Debug":         &ignoreBool,
+		"Repro":         &ignoreBool,
+	}
+
+	data = strings.TrimSpace(data)
+	data = strings.TrimPrefix(data, "{")
+	data = strings.TrimSuffix(data, "}")
+	totalRead := 0
+	for token := range strings.FieldsSeq(data) {
+		key, value, keyValueFound := strings.Cut(token, ":")
+		if !keyValueFound {
+			return totalRead, fmt.Errorf("error splitting options token %v", token)
+		}
+		if _, ok := keyToTarget[key]; !ok {
+			return totalRead, fmt.Errorf("error, unexpected option key %v", key)
+		}
+		dest := keyToTarget[key]
+		n, err := fmt.Sscanf(value, "%v", dest)
+		if err != nil {
+			return totalRead, fmt.Errorf("failed to read %v", value)
+		}
+		totalRead += n
+		delete(keyToTarget, key)
+	}
+
+	return totalRead, nil
+}
+
+// Support for legacy formats.
+func deserializeLegacyFormats(data []byte, opts *Options) error {
+	data = bytes.ReplaceAll(data, []byte("Sandbox: "), []byte("Sandbox:empty "))
+	strData := string(data)
+
+	// We can distinguish between legacy formats by the number
+	// of fields. The formats we support have 14, 15 and 16 fields.
+	fieldsFound, err := deserializeLegacyOptions(strData, opts)
+	if err != nil {
+		return fmt.Errorf("failed to parse '%v': %w", strData, err)
+	}
+	if fieldsFound < 14 || fieldsFound > 16 {
+		return fmt.Errorf("%v params found, expected 14 <= x <= 16", fieldsFound)
+	}
+
+	if opts.Sandbox == "empty" {
+		opts.Sandbox = ""
+	}
+	return err
+}
+
 func DeserializeOptions(data []byte) (Options, error) {
 	opts := Options{
 		Slowdown: 1,
@@ -207,126 +278,16 @@ func DeserializeOptions(data []byte) (Options, error) {
 	if err := json.Unmarshal(data, &opts); err == nil {
 		return opts, nil
 	}
-	// Support for legacy formats.
-	data = bytes.Replace(data, []byte("Sandbox: "), []byte("Sandbox:empty "), -1)
-	waitRepeat, debug := false, false
-	n, err := fmt.Sscanf(string(data),
-		"{Threaded:%t Collide:%t Repeat:%t Procs:%d Sandbox:%s"+
-			" Fault:%t FaultCall:%d FaultNth:%d EnableTun:%t UseTmpDir:%t"+
-			" HandleSegv:%t WaitRepeat:%t Debug:%t Repro:%t}",
-		&opts.Threaded, &opts.Collide, &opts.Repeat, &opts.Procs, &opts.Sandbox,
-		&opts.Fault, &opts.FaultCall, &opts.FaultNth, &opts.NetInjection, &opts.UseTmpDir,
-		&opts.HandleSegv, &waitRepeat, &debug, &opts.Repro)
-	if err == nil {
-		if want := 14; n != want {
-			return opts, fmt.Errorf("failed to parse repro options: got %v fields, want %v", n, want)
-		}
-		if opts.Sandbox == "empty" {
-			opts.Sandbox = ""
-		}
-		return opts, nil
-	}
-	n, err = fmt.Sscanf(string(data),
-		"{Threaded:%t Collide:%t Repeat:%t Procs:%d Sandbox:%s"+
-			" Fault:%t FaultCall:%d FaultNth:%d EnableTun:%t UseTmpDir:%t"+
-			" EnableCgroups:%t HandleSegv:%t WaitRepeat:%t Debug:%t Repro:%t}",
-		&opts.Threaded, &opts.Collide, &opts.Repeat, &opts.Procs, &opts.Sandbox,
-		&opts.Fault, &opts.FaultCall, &opts.FaultNth, &opts.NetInjection, &opts.UseTmpDir,
-		&opts.Cgroups, &opts.HandleSegv, &waitRepeat, &debug, &opts.Repro)
-	if err == nil {
-		if want := 15; n != want {
-			return opts, fmt.Errorf("failed to parse repro options: got %v fields, want %v", n, want)
-		}
-		if opts.Sandbox == "empty" {
-			opts.Sandbox = ""
-		}
-		return opts, nil
-	}
+	err := deserializeLegacyFormats(data, &opts)
 	return opts, err
 }
 
-type Feature struct {
-	Description string
-	Enabled     bool
-}
-
-type Features map[string]Feature
-
-func defaultFeatures(value bool) Features {
-	return map[string]Feature{
-		"tun":         {"setup and use /dev/tun for packet injection", value},
-		"net_dev":     {"setup more network devices for testing", value},
-		"net_reset":   {"reset network namespace between programs", value},
-		"cgroups":     {"setup cgroups for testing", value},
-		"binfmt_misc": {"setup binfmt_misc for testing", value},
-		"close_fds":   {"close fds after each program", value},
-		"devlink_pci": {"setup devlink PCI device", value},
-		"usb":         {"setup and use /dev/raw-gadget for USB emulation", value},
-		"vhci":        {"setup and use /dev/vhci for hci packet injection", value},
-		"wifi":        {"setup and use mac80211_hwsim for wifi emulation", value},
-		"ieee802154":  {"setup and use mac802154_hwsim for emulation", value},
-		"sysctl":      {"setup sysctl's for fuzzing", value},
-	}
-}
-
-func ParseFeaturesFlags(enable, disable string, defaultValue bool) (Features, error) {
-	const (
-		none = "none"
-		all  = "all"
-	)
-	if enable == none && disable == none {
-		return defaultFeatures(defaultValue), nil
-	}
-	if enable != none && disable != none {
-		return nil, fmt.Errorf("can't use -enable and -disable flags at the same time")
-	}
-	if enable == all || disable == "" {
-		return defaultFeatures(true), nil
-	}
-	if disable == all || enable == "" {
-		return defaultFeatures(false), nil
-	}
-	var items []string
-	var features Features
-	if enable != none {
-		items = strings.Split(enable, ",")
-		features = defaultFeatures(false)
-	} else {
-		items = strings.Split(disable, ",")
-		features = defaultFeatures(true)
-	}
-	for _, item := range items {
-		if _, ok := features[item]; !ok {
-			return nil, fmt.Errorf("unknown feature specified: %s", item)
-		}
-		feature := features[item]
-		feature.Enabled = enable != none
-		features[item] = feature
-	}
-	return features, nil
-}
-
-func PrintAvailableFeaturesFlags() {
-	fmt.Printf("available features for -enable and -disable:\n")
-	features := defaultFeatures(false)
-	var names []string
-	for name := range features {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		fmt.Printf("  %s - %s\n", name, features[name].Description)
-	}
-}
-
-// This is the main configuration used by executor, only for testing.
+// ExecutorOpts is the main configuration used by executor, only for testing.
 var ExecutorOpts = Options{
 	Threaded:  true,
-	Collide:   true,
 	Repeat:    true,
 	Procs:     2,
 	Slowdown:  1,
 	Sandbox:   "none",
-	Repro:     true,
 	UseTmpDir: true,
 }

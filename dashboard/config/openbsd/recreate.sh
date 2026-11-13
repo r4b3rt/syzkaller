@@ -16,24 +16,31 @@
 #  User syzkaller
 #  IdentityFile ~/.ssh/id_syzkaller
 
+# Before running first time do:
+# sudo apt-get install genisoimage growisofs qemu qemu-kvm qemu-system-x86-64 expect
+
+# The script does not require any arguments/env vars, run just as:
+# $GOPATH/src/github.com/google/syzkaller/dashboard/config/openbsd/recreate.sh
+
 set -eux
 
-TODAY=jul30
+TODAY=$(date -u +%Y-%m-%d)
 
 SYZ_DIR="$(cd "$(dirname "${0}")"/../../..; pwd -P)"
 [[ -d "${SYZ_DIR}/tools" ]] || { echo "Requires syzkaller dir $SYZ_DIR" ; exit 1; }
 
-ZONE=us-central1-c
+ZONE=us-central1-b
 INSTANCE=ci-openbsd
+HOST="${HOST:-${INSTANCE}}"
 IP=$(gcloud compute instances describe "${INSTANCE}" --zone="${ZONE}" --project=syzkaller '--format=text(networkInterfaces[].accessConfigs[].natIP)' | cut -f2 -d' ')
 SERVICE_ACCOUNT=$(gcloud compute instances describe "${INSTANCE}" --zone="${ZONE}" --project=syzkaller  '--format=text(serviceAccounts[].email)' | cut -d' ' -f2)
 IMAGE="${INSTANCE}"-"${TODAY}"-root
 
 "${SYZ_DIR}"/tools/create-openbsd-gce-ci.sh
 
-gsutil -u syzkaller cp -a public-read openbsd-amd64-snapshot-gce.tar.gz gs://syzkaller/openbsd-amd64-"${TODAY}"-gce.tar.gz
+gcloud storage cp --billing-project=syzkaller --predefined-acl=publicRead openbsd-amd64-snapshot-gce.tar.gz gs://syzkaller/openbsd-amd64-"${TODAY}"-gce.tar.gz
 
-ssh root@"${INSTANCE}" halt -p || true
+ssh root@"${HOST}" halt -p || true
 
 yes | gcloud compute --project=syzkaller images delete "${IMAGE}" || true
 gcloud compute --project=syzkaller images create "${IMAGE}" --source-uri gs://syzkaller/"openbsd-amd64-${TODAY}-gce.tar.gz"
@@ -64,10 +71,9 @@ mv  ~/.ssh/known_hosts{.new,}
 
 "${SYZ_DIR}"/tools/create-openbsd-vmm-worker.sh
 
-ssh syzkaller@"${INSTANCE}" mkdir -p /syzkaller/userspace
-ssh syzkaller@"${INSTANCE}" ln -sf /syzkaller/{gopath/src/github.com/google/syzkaller/dashboard/,}config
-scp "${SYZ_DIR}"/dashboard/config/openbsd/config.ci "${INSTANCE}":/syzkaller/config-openbsd.ci
-scp worker_key syzkaller@"${INSTANCE}":/syzkaller/userspace/key
-scp -C worker_disk.raw syzkaller@"${INSTANCE}":/syzkaller/userspace/image
-ssh syzkaller@"${INSTANCE}" 'D=/syzkaller/userspace-multicore && mkdir -p $D && ln -sf ../userspace/{image,key} $D && ln -sf ../config/openbsd/overlays/ci-openbsd-multicore $D/overlay'
-ssh root@"${INSTANCE}" reboot
+ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no syzkaller@"${HOST}" mkdir -p /syzkaller/userspace
+ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no syzkaller@"${HOST}" ln -sf /syzkaller/{gopath/src/github.com/google/syzkaller/dashboard/,}config
+scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no worker_key syzkaller@"${HOST}":/syzkaller/userspace/key
+scp -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -C worker_disk.raw syzkaller@"${HOST}":/syzkaller/userspace/image
+ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no syzkaller@"${HOST}" 'D=/syzkaller/userspace-multicore && mkdir -p $D && ln -sf ../userspace/{image,key} $D && ln -sf ../config/openbsd/overlays/ci-openbsd-multicore $D/overlay'
+ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no root@"${HOST}" reboot

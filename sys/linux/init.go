@@ -1,10 +1,15 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
+// Package linux contains target initialization, argument generation, and syscall neutralization logic.
 package linux
 
 import (
-	"runtime"
+	"bytes"
+	"path"
+	"regexp"
+	"slices"
+	"strings"
 
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/sys/targets"
@@ -25,9 +30,6 @@ func InitTarget(target *prog.Target) {
 		FITHAW:                      target.GetConst("FITHAW"),
 		SNAPSHOT_FREEZE:             target.GetConst("SNAPSHOT_FREEZE"),
 		SNAPSHOT_POWER_OFF:          target.GetConst("SNAPSHOT_POWER_OFF"),
-		EXT4_IOC_SHUTDOWN:           target.GetConst("EXT4_IOC_SHUTDOWN"),
-		EXT4_IOC_RESIZE_FS:          target.GetConst("EXT4_IOC_RESIZE_FS"),
-		EXT4_IOC_MIGRATE:            target.GetConst("EXT4_IOC_MIGRATE"),
 		FAN_OPEN_PERM:               target.GetConst("FAN_OPEN_PERM"),
 		FAN_ACCESS_PERM:             target.GetConst("FAN_ACCESS_PERM"),
 		FAN_OPEN_EXEC_PERM:          target.GetConst("FAN_OPEN_EXEC_PERM"),
@@ -44,9 +46,11 @@ func InitTarget(target *prog.Target) {
 		AF_NETLINK:                  target.GetConst("AF_NETLINK"),
 		SOCK_RAW:                    target.GetConst("SOCK_RAW"),
 		NETLINK_GENERIC:             target.GetConst("NETLINK_GENERIC"),
-		USB_MAJOR:                   target.GetConst("USB_MAJOR"),
 		TIOCSSERIAL:                 target.GetConst("TIOCSSERIAL"),
 		TIOCGSERIAL:                 target.GetConst("TIOCGSERIAL"),
+		EXT4_IOC_SET_TUNE_SB_PARAM:  target.GetConst("EXT4_IOC_SET_TUNE_SB_PARAM"),
+		EXT4_IOC_GET_TUNE_SB_PARAM:  target.GetConst("EXT4_IOC_GET_TUNE_SB_PARAM"),
+		O_CREAT:                     target.GetConst("O_CREAT"),
 		// These are not present on all arches.
 		ARCH_SET_FS: target.ConstMap["ARCH_SET_FS"],
 		ARCH_SET_GS: target.ConstMap["ARCH_SET_GS"],
@@ -54,21 +58,26 @@ func InitTarget(target *prog.Target) {
 
 	target.MakeDataMmap = targets.MakePosixMmap(target, true, true)
 	target.Neutralize = arch.neutralize
+	target.AllowFilePath = AllowFilePath
 	target.SpecialTypes = map[string]func(g *prog.Gen, typ prog.Type, dir prog.Dir, old prog.Arg) (
 		prog.Arg, []*prog.Call){
-		"timespec":                  arch.generateTimespec,
-		"timeval":                   arch.generateTimespec,
-		"sockaddr_alg":              arch.generateSockaddrAlg,
-		"alg_name":                  arch.generateAlgName,
-		"alg_aead_name":             arch.generateAlgAeadName,
-		"alg_hash_name":             arch.generateAlgHashName,
-		"alg_skcipher_name":         arch.generateAlgSkcipherhName,
-		"ipt_replace":               arch.generateIptables,
-		"ip6t_replace":              arch.generateIptables,
-		"arpt_replace":              arch.generateArptables,
-		"ebt_replace":               arch.generateEbtables,
-		"usb_device_descriptor":     arch.generateUsbDeviceDescriptor,
-		"usb_device_descriptor_hid": arch.generateUsbHidDeviceDescriptor,
+		"timespec":                      arch.generateTimespec,
+		"timeval":                       arch.generateTimespec,
+		"sockaddr_alg":                  arch.generateSockaddrAlg,
+		"alg_name":                      arch.generateAlgName,
+		"alg_hash_name":                 arch.generateAlgHashName,
+		"alg_skcipher_name":             arch.generateAlgSkcipherhName,
+		"ipt_replace":                   arch.generateIptables,
+		"ip6t_replace":                  arch.generateIptables,
+		"arpt_replace":                  arch.generateArptables,
+		"ebt_replace":                   arch.generateEbtables,
+		"usb_device_descriptor":         arch.generateUsbDeviceDescriptor,
+		"usb_device_descriptor_printer": arch.generateUsbPrinterDeviceDescriptor,
+		"usb_device_descriptor_hid":     arch.generateUsbHidDeviceDescriptor,
+		"usb_device_descriptor_uac1":    arch.generateAudioDeviceDescriptor,
+		"usb_device_descriptor_uac2":    arch.generateAudioDeviceDescriptor,
+		"usb_device_descriptor_uac3":    arch.generateAudioDeviceDescriptor,
+		"usb_device_descriptor_midi":    arch.generateAudioDeviceDescriptor,
 	}
 
 	target.AuxResources = map[string]bool{
@@ -93,30 +102,23 @@ func InitTarget(target *prog.Target) {
 			0xffffffe000000000, // PAGE_OFFSET
 			0xffffff0000000000, // somewhere in VMEMMAP range
 		}
-	case targets.I386, targets.ARM64, targets.ARM, targets.PPC64LE, targets.MIPS64LE, targets.S390x:
+	case targets.I386, targets.ARM64, targets.ARM, targets.PPC64LE, targets.MIPS64LE, targets.S390x, targets.Loong64:
 	default:
 		panic("unknown arch")
 	}
 
-	if target.Arch == runtime.GOARCH {
-		KCOV_INIT_TRACE = uintptr(target.GetConst("KCOV_INIT_TRACE"))
-		KCOV_ENABLE = uintptr(target.GetConst("KCOV_ENABLE"))
-		KCOV_REMOTE_ENABLE = uintptr(target.GetConst("KCOV_REMOTE_ENABLE"))
-		KCOV_DISABLE = uintptr(target.GetConst("KCOV_DISABLE"))
-		KCOV_TRACE_PC = uintptr(target.GetConst("KCOV_TRACE_PC"))
-		KCOV_TRACE_CMP = uintptr(target.GetConst("KCOV_TRACE_CMP"))
+	target.SpecialFileLengths = []int{
+		int(target.GetConst("PATH_MAX")),
+		int(target.GetConst("UNIX_PATH_MAX")),
+		int(target.GetConst("NAME_MAX")),
+		int(target.GetConst("BTRFS_INO_LOOKUP_PATH_MAX")),
+		int(target.GetConst("BTRFS_INO_LOOKUP_USER_PATH_MAX")),
+		int(target.GetConst("SMB_PATH_MAX")),
+		int(target.GetConst("XT_CGROUP_PATH_MAX")),
+		int(target.GetConst("XENSTORE_REL_PATH_MAX")),
+		1 << 16, // gVisor's MaxFilenameLen
 	}
 }
-
-var (
-	// This should not be here, but for now we expose this for syz-fuzzer.
-	KCOV_INIT_TRACE    uintptr
-	KCOV_ENABLE        uintptr
-	KCOV_REMOTE_ENABLE uintptr
-	KCOV_DISABLE       uintptr
-	KCOV_TRACE_PC      uintptr
-	KCOV_TRACE_CMP     uintptr
-)
 
 type arch struct {
 	unix *targets.UnixNeutralizer
@@ -134,9 +136,6 @@ type arch struct {
 	FITHAW                      uint64
 	SNAPSHOT_FREEZE             uint64
 	SNAPSHOT_POWER_OFF          uint64
-	EXT4_IOC_SHUTDOWN           uint64
-	EXT4_IOC_RESIZE_FS          uint64
-	EXT4_IOC_MIGRATE            uint64
 	FAN_OPEN_PERM               uint64
 	FAN_ACCESS_PERM             uint64
 	FAN_OPEN_EXEC_PERM          uint64
@@ -155,13 +154,18 @@ type arch struct {
 	AF_NETLINK                  uint64
 	SOCK_RAW                    uint64
 	NETLINK_GENERIC             uint64
-	USB_MAJOR                   uint64
 	TIOCSSERIAL                 uint64
 	TIOCGSERIAL                 uint64
+	EXT4_IOC_SET_TUNE_SB_PARAM  uint64
+	EXT4_IOC_GET_TUNE_SB_PARAM  uint64
+	O_CREAT                     uint64
 }
 
-func (arch *arch) neutralize(c *prog.Call) {
-	arch.unix.Neutralize(c)
+func (arch *arch) neutralize(c *prog.Call, fixStructure bool) error {
+	err := arch.unix.Neutralize(c, fixStructure)
+	if err != nil {
+		return err
+	}
 	switch c.Meta.CallName {
 	case "mremap":
 		// Add MREMAP_FIXED flag, otherwise it produces non-deterministic results.
@@ -226,12 +230,262 @@ func (arch *arch) neutralize(c *prog.Call) {
 		enforceIntArg(c.Args[0])
 		enforceIntArg(c.Args[1])
 		enforceIntArg(c.Args[2])
+	case "sched_setattr":
+		// Enabling a SCHED_FIFO or a SCHED_RR policy may lead to false positive stall-related crashes.
+		neutralizeSchedAttr(c.Args[1])
 	}
+	arch.neutralizePaths(c)
+	arch.neutralizeVariant(c)
+	return nil
+}
 
+// neutralizePaths rewrites forbidden file paths (see isForbiddenPath) in path-accepting syscalls.
+func (arch *arch) neutralizePaths(c *prog.Call) {
+	switch c.Meta.CallName {
+	case "open", "creat", "chdir", "chroot":
+		arch.neutralizePathArg(c.Args[0])
+	case "openat", "openat2", "open_tree", "open_tree_attr", "name_to_handle_at":
+		arch.neutralizePathArg(c.Args[1])
+	case "symlink", "link", "mount":
+		arch.neutralizePathArg(c.Args[0])
+		arch.neutralizePathArg(c.Args[1])
+	case "symlinkat":
+		arch.neutralizePathArg(c.Args[0])
+		arch.neutralizePathArg(c.Args[2])
+	case "linkat", "move_mount":
+		arch.neutralizePathArg(c.Args[1])
+		arch.neutralizePathArg(c.Args[3])
+	}
+}
+
+// neutralizeVariant handles specific syscall variants (by full name, e.g. "ioctl$DM_DEV_SUSPEND").
+func (arch *arch) neutralizeVariant(c *prog.Call) {
 	switch c.Meta.Name {
 	case "setsockopt$EBT_SO_SET_ENTRIES":
 		arch.neutralizeEbtables(c)
+	case "ioctl$DM_DEV_SUSPEND":
+		neutralizeDmSuspend(c.Args[2])
+	case "openat$dm_dev":
+		// The node may not exist yet (it is created by mknodat$dm), so O_CREAT would create
+		// a regular file in its place.
+		arch.clearOpenCreat(c.Args[2])
+	case "openat$md", "openat$md_node":
+		// /dev/mdN does not exist until the array is allocated (./mdN until mknodat$md),
+		// and a regular file created by O_CREAT in /dev would persist and break the array.
+		arch.clearOpenCreat(c.Args[2])
+	case "ioctl$ADD_NEW_DISK":
+		neutralizeMdAddNewDisk(c)
 	}
+}
+
+func (arch *arch) clearOpenCreat(a prog.Arg) {
+	if flags, ok := a.(*prog.ConstArg); ok {
+		flags.Val &^= arch.O_CREAT
+	}
+}
+
+func (arch *arch) neutralizePathArg(arg prog.Arg) {
+	prog.ForeachSubArg(arg, func(sub prog.Arg, ctx *prog.ArgCtx) {
+		dataArg, ok := sub.(*prog.DataArg)
+		if !ok || dataArg.Dir() == prog.DirOut {
+			return
+		}
+		bufType := dataArg.Type().(*prog.BufferType)
+		// If the argument has a fixed set of allowed values, rewriting to ./file0
+		// would break serialization and deserialization validation.
+		if len(bufType.Values) > 0 {
+			return
+		}
+		raw := dataArg.Data()
+		cstr, _, _ := bytes.Cut(raw, []byte{0})
+		if len(cstr) == 0 || !isForbiddenPath(string(cstr)) && !isPCIDevDirRef(string(cstr)) {
+			return
+		}
+		// Never grow the buffer: fixed-size buffers must keep their size, and a longer
+		// string may not fit into the data region anymore.
+		safe := []byte("./file0\x00")
+		if !bufType.Varlen() || len(raw) < len(safe) {
+			safe = make([]byte, len(raw))
+			copy(safe, "./file0")
+			if len(cstr) < len(raw) {
+				// The original string was NUL-terminated, keep it that way.
+				safe[len(safe)-1] = 0
+			}
+		}
+		dataArg.SetData(safe)
+	})
+}
+
+// AllowFilePath reports whether a discovered Linux target path (e.g. from runtime globs
+// or interface probing) is safe to expose to fuzzing.
+func AllowFilePath(file string) bool {
+	file, _, _ = strings.Cut(file, "\x00")
+	if file == "" {
+		return false
+	}
+	return !isForbiddenPath(file)
+}
+
+var (
+	// Sysfs PCI device directories: "%04x:%02x:%02x.%d" (the domain may be 32-bit).
+	pciBDFRe = regexp.MustCompile(`^[0-9a-f]{4,8}:[0-9a-f]{2}:[01][0-9a-f]\.[0-7]$`)
+	// Procfs PCI config space files: "%02x.%x" (see drivers/pci/proc.c).
+	pciDevFnRe = regexp.MustCompile(`^[01][0-9a-f]\.[0-7]$`)
+	// Procfs PCI bus directories: "%02x" or "%04x:%02x". The pattern does not match
+	// sysfs /sys/bus/pci/{devices,drivers,slots,rescan} or the read-only /proc/bus/pci/devices.
+	procBusPCIDirRe = regexp.MustCompile(`/bus/pci/([0-9a-f]{4,8}:)?[0-9a-f]{2}(/|$)`)
+)
+
+// isForbiddenPath reports whether the path refers to a sysfs/procfs endpoint that must not
+// be fuzzed. Only the trailing path components are checked, so that accesses split across
+// openat$dir + openat are caught as well. The matching is textual and is not a security
+// boundary: programs deliberately laid out to defeat it (a path split across buffers or left
+// in memory by another call, io_uring) are not caught.
+func isForbiddenPath(raw string) bool {
+	clean := path.Clean(raw)
+	base := path.Base(clean)
+	switch base {
+	case "bind", "unbind", "driver_override", "drivers_probe", "new_id", "remove_id":
+		// Manually binding/unbinding drivers, forcing driver_override, or adding dynamic
+		// driver IDs attaches drivers to incompatible devices or unbinds core platform
+		// hardware, triggering nonsensical crashes that maintainers reject.
+		// See the discussions at:
+		// https://lore.kernel.org/all/6a88012e.dbb3a75c.13dd47.0007.GAE@google.com/T/
+		// https://lore.kernel.org/all/6a88066b.ae6ddae5.3da009.002d.GAE@google.com/T/
+		return true
+	case "rom", "legacy_io", "legacy_io_sparse", "legacy_mem", "legacy_mem_sparse", "reset_subordinate":
+		// Raw PCI ROM/legacy I/O and memory windows. Writing or mmapping them reprograms
+		// live virtual devices and, without an IOMMU, causes silent DMA corruption.
+		// Also the secondary bus reset, an attribute name that only PCI bridges have.
+		return true
+	case "config", "reset", "remove":
+		// PCI config space and device reset/removal controls (e.g. removing the root
+		// disk controller). These names are also used by many non-PCI interfaces
+		// (/proc/net/vlan/config, zram's reset, USB device remove), so only block them
+		// inside a PCI device directory.
+		return isPCIDevAttr(raw, clean)
+	case "power":
+		// PCI hotplug slots (/sys/bus/pci/slots/N/power): writing 0 unplugs the device.
+		return path.Base(path.Dir(path.Dir(clean))) == "slots"
+	}
+	// Raw PCI BARs: resourceN, resourceN_wc, resourceN_resize.
+	if isPCIResourceAttr(base) {
+		return true
+	}
+	// Procfs PCI config space: /proc/bus/pci/NN/DD.F (and its bus directories).
+	// The path is anchored to catch relative paths like ../bus/pci/00/00.0.
+	return pciDevFnRe.MatchString(base) || procBusPCIDirRe.MatchString(path.Join("/", clean))
+}
+
+// isPCIDevAttr reports whether the path may refer to an attribute of a PCI device directory:
+// the parent is such a directory or a "device" symlink of a class device. The parent is also
+// treated as unknown when the path starts at the root ("/config") or contains "..": the kernel
+// resolves ".." after symlinks, so e.g. /sys/bus/virtio/devices/virtio0/../config is the PCI
+// device's config. Names relative to the cwd or a directory fd ("./config") are not matched:
+// programs use them for other things (e.g. a configfs mount), and isPCIDevDirRef keeps PCI
+// device directories out of their reach.
+func isPCIDevAttr(raw, clean string) bool {
+	parent := path.Base(path.Dir(clean))
+	return parent == "/" || parent == "device" || pciBDFRe.MatchString(parent) ||
+		slices.Contains(strings.Split(raw, "/"), "..")
+}
+
+// isPCIDevDirRef reports whether a path passed to a syscall may itself refer to a PCI device
+// directory, which programs must not obtain as the cwd, a directory fd, a bind mount or
+// a symlink target. The last component is not taken from path.Clean() as it folds
+// "virtio0/..", while the kernel follows the virtio0 symlink first.
+func isPCIDevDirRef(raw string) bool {
+	last := ""
+	for elem := range strings.SplitSeq(raw, "/") {
+		if elem != "" && elem != "." {
+			last = elem
+		}
+	}
+	return last == ".." || pciBDFRe.MatchString(last)
+}
+
+func isPCIResourceAttr(base string) bool {
+	rest, ok := strings.CutPrefix(base, "resource")
+	return ok && rest != "" && rest[0] >= '0' && rest[0] <= '9'
+}
+
+func neutralizeSchedAttr(a prog.Arg) {
+	switch attr := a.(type) {
+	case *prog.PointerArg:
+		if attr.Res == nil {
+			// If it's just a pointer to somewhere, still set it to NULL as there's a risk that
+			// it points to the valid memory and it can be interpreted as a sched_attr struct.
+			attr.Address = 0
+			return
+		}
+		groupArg, ok := attr.Res.(*prog.GroupArg)
+		if !ok || len(groupArg.Inner) == 0 {
+			return
+		}
+		if unionArg, ok := groupArg.Inner[0].(*prog.UnionArg); ok {
+			dataArg, ok := unionArg.Option.(*prog.DataArg)
+			if !ok {
+				return
+			}
+			if dataArg.Dir() == prog.DirOut {
+				return
+			}
+			// Clear the first 16 bytes to prevent overcoming the limitation by squashing the struct.
+			data := slices.Clone(dataArg.Data())
+			for i := 0; i < 16 && i < len(data); i++ {
+				data[i] = 0
+			}
+			dataArg.SetData(data)
+		}
+
+		// Most likely it's the intended sched_attr structure.
+		if len(groupArg.Inner) > 1 {
+			policyField, ok := groupArg.Inner[1].(*prog.ConstArg)
+			if !ok {
+				return
+			}
+			const SCHED_FIFO = 0x1
+			const SCHED_RR = 0x2
+			if policyField.Val == SCHED_FIFO || policyField.Val == SCHED_RR {
+				policyField.Val = 0
+			}
+		}
+	case *prog.ConstArg:
+		attr.Val = 0
+	}
+}
+
+// neutralizeDmSuspend clears DM_SUSPEND_FLAG in ioctl$DM_DEV_SUSPEND: leaving a DM device
+// suspended queues all I/O and makes close() hang in sync_blockdev().
+func neutralizeDmSuspend(a prog.Arg) {
+	const (
+		dmIoctlFlagsField = 7      // index of the flags field in dm_ioctl_t (struct dm_ioctl)
+		dmSuspendFlag     = 1 << 1 // DM_SUSPEND_FLAG in include/uapi/linux/dm-ioctl.h
+	)
+	ptr, ok := a.(*prog.PointerArg)
+	if !ok || ptr.Res == nil {
+		return
+	}
+	group, ok := ptr.Res.(*prog.GroupArg)
+	if !ok || len(group.Inner) <= dmIoctlFlagsField {
+		return
+	}
+	if flags, ok := group.Inner[dmIoctlFlagsField].(*prog.ConstArg); ok {
+		flags.Val &^= dmSuspendFlag
+	}
+}
+
+// neutralizeMdAddNewDisk resets all const fields of ioctl$ADD_NEW_DISK to their declared values.
+// Hints may mutate const fields wider than 8 bits; this notably keeps md_member_dev.major
+// at RAMDISK_MAJOR, so that the root disk is never added to an md array.
+func neutralizeMdAddNewDisk(c *prog.Call) {
+	prog.ForeachArg(c, func(arg prog.Arg, _ *prog.ArgCtx) {
+		if constArg, ok := arg.(*prog.ConstArg); ok {
+			if typ, ok := constArg.Type().(*prog.ConstType); ok {
+				constArg.Val = typ.Val
+			}
+		}
+	})
 }
 
 func enforceIntArg(a prog.Arg) {
@@ -264,16 +518,6 @@ func (arch *arch) neutralizeIoctl(c *prog.Call) {
 	case arch.SNAPSHOT_POWER_OFF:
 		// SNAPSHOT_POWER_OFF shuts down the machine.
 		cmd.Val = arch.FITHAW
-	case arch.EXT4_IOC_SHUTDOWN:
-		// EXT4_IOC_SHUTDOWN on root fs effectively brings the machine down in weird ways.
-		// Fortunately, the value does not conflict with any other ioctl commands for now.
-		cmd.Val = arch.EXT4_IOC_MIGRATE
-	case arch.EXT4_IOC_RESIZE_FS:
-		// EXT4_IOC_RESIZE_FS on root fs can shrink it to 0 (or whatever is the minimum size)
-		// and then creation of new temp dirs for tests will fail.
-		// TODO: not necessary for sandbox=namespace as it tests in a tmpfs
-		// and/or if we mount tmpfs for sandbox=none (#971).
-		cmd.Val = arch.EXT4_IOC_MIGRATE
 	case arch.TIOCSSERIAL:
 		// TIOCSSERIAL can do nasty things under root, like causing writes to random memory
 		// pretty much like /dev/mem, but this is also working as intended.
@@ -284,7 +528,49 @@ func (arch *arch) neutralizeIoctl(c *prog.Call) {
 		// and would be nice to test, if/when we can neutralize based on sandbox value
 		// we could prohibit it only under sandbox=none.
 		cmd.Val = arch.TIOCGSERIAL
+	case arch.EXT4_IOC_SET_TUNE_SB_PARAM:
+		arch.neutralizeExt4TuneSb(c)
 	}
+}
+
+// neutralizeExt4TuneSb prevents EXT4_IOC_SET_TUNE_SB_PARAM from setting s_errors to
+// EXT4_ERRORS_PANIC, which triggers false-positive kernel panics if the loop image is
+// later mounted without errors=continue (e.g. via fsopen/fsmount).
+func (arch *arch) neutralizeExt4TuneSb(c *prog.Call) {
+	if !neutralizeExt4TuneSbArg(c) {
+		c.Args[1].(*prog.ConstArg).Val = arch.EXT4_IOC_GET_TUNE_SB_PARAM
+	}
+}
+
+func neutralizeExt4TuneSbArg(c *prog.Call) bool {
+	const (
+		errorsBehaviorField = 2 // index of errors_behavior in ext4_tune_sb_params
+		ext4ErrorsContinue  = 1 // EXT4_ERRORS_CONTINUE in fs/ext4/ext4.h
+		ext4ErrorsPanic     = 3 // EXT4_ERRORS_PANIC in fs/ext4/ext4.h
+	)
+	if len(c.Args) < 3 {
+		return false
+	}
+	ptr, ok := c.Args[2].(*prog.PointerArg)
+	if !ok {
+		return false
+	}
+	if ptr.Res == nil && c.Meta.Name == "ioctl$EXT4_IOC_SET_TUNE_SB_PARAM" {
+		ptr.Address = 0
+		return true
+	}
+	group, ok := ptr.Res.(*prog.GroupArg)
+	if !ok || group.Type().Name() != "ext4_tune_sb_params" || len(group.Inner) <= errorsBehaviorField {
+		return false
+	}
+	behavior, ok := group.Inner[errorsBehaviorField].(*prog.ConstArg)
+	if !ok {
+		return false
+	}
+	if uint16(behavior.Val) == ext4ErrorsPanic {
+		behavior.Val = ext4ErrorsContinue
+	}
+	return true
 }
 
 func (arch *arch) generateTimespec(g *prog.Gen, typ0 prog.Type, dir prog.Dir, old prog.Arg) (
